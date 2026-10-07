@@ -4,6 +4,6 @@
 """
 
 from mini_code_agent.tools.base import Tool, ToolResult
-from mini_code_agent.tools.registry import ToolRegistry
+from mini_code_agent.tools.registry import ToolRegistry, default_tools
 
-__all__ = ["Tool", "ToolRegistry", "ToolResult"]
+__all__ = ["Tool", "ToolRegistry", "ToolResult", "default_tools"]

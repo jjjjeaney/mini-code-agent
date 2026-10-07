@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from mini_code_agent.providers.base import Provider, ToolCall
-from mini_code_agent.tools import ToolRegistry, ToolResult
+from mini_code_agent.tools import ToolRegistry, ToolResult, default_tools
 
 
 @dataclass
@@ -45,8 +45,9 @@ def runagent(
     max_steps 限制模型调用次数，用满还没等到纯文本回复时 final 为 None。
     trace 是一串渲染好的文本，按发生顺序记下每次工具调用、它的结果、以及最后那条回复，
     专门用来打印给人看。
+    不传 registry 就用 default_tools() 装好的那套内置工具。
     """
-    registry = registry if registry is not None else ToolRegistry()
+    registry = registry if registry is not None else default_tools()
     tools = registry.schemas()
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     trace: list[str] = []

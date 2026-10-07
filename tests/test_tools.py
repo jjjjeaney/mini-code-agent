@@ -7,7 +7,8 @@ import json
 import pytest
 
 from mini_code_agent.providers.base import ToolCall
-from mini_code_agent.tools import Tool, ToolRegistry, ToolResult
+from mini_code_agent.tools import Tool, ToolRegistry, ToolResult, default_tools
+from mini_code_agent.tools.builtin import echo as builtin_echo
 
 ADD_SCHEMA = {
     "type": "object",
@@ -140,3 +141,30 @@ class TestToolRegistry:
 
         assert result.is_error is True
         assert "KeyError" in result.result
+
+
+class TestBuiltinEcho:
+    def test_prints_the_text_and_returns_a_confirmation(self, capsys):
+        result = builtin_echo("你好")
+
+        assert capsys.readouterr().out == "你好\n"
+        assert "你好" in result
+
+
+class TestDefaultTools:
+    def test_registers_the_echo_tool(self):
+        assert [tool.name for tool in default_tools().list()] == ["echo"]
+
+    def test_echo_schema_requires_text(self):
+        schema = default_tools().schemas()[0]
+
+        assert schema["name"] == "echo"
+        assert schema["input_schema"]["required"] == ["text"]
+
+    def test_each_call_returns_a_fresh_registry(self):
+        assert default_tools() is not default_tools()
+
+    def test_echo_runs_through_the_registry(self, capsys):
+        default_tools().run("echo", {"text": "hi"})
+
+        assert capsys.readouterr().out == "hi\n"

@@ -6,7 +6,7 @@ import pytest
 
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.providers.base import ModelResponse, ToolCall
-from mini_code_agent.tools import Tool, ToolRegistry
+from mini_code_agent.tools import Tool, ToolRegistry, default_tools
 
 ADD_SCHEMA = {
     "type": "object",
@@ -137,12 +137,12 @@ def test_system_prompt_is_forwarded_on_every_step(registry):
     assert [call["system"] for call in provider.calls] == ["你是一个计算器。"] * 2
 
 
-def test_without_a_registry_no_tools_are_sent():
+def test_without_a_registry_the_default_tools_are_used():
     provider = ScriptedProvider([text_turn("你好")])
 
     runagent("你好", provider)
 
-    assert not provider.calls[0]["tools"]
+    assert provider.calls[0]["tools"] == default_tools().schemas()
 
 
 def test_multiple_tool_rounds_interleave_calls_and_results(registry):

@@ -7,6 +7,7 @@ from typing import Any
 
 from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools.base import Tool, ToolResult
+from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
 
 
 class ToolRegistry:
@@ -53,3 +54,22 @@ class ToolRegistry:
                 is_error=True,
             )
         return ToolResult(id=call.id, name=call.name, result=result)
+
+
+def default_tools() -> ToolRegistry:
+    """装配一份可以直接用的工具集。
+
+    每次调用都返回新实例：调用方想往自己的那份里再注册工具时，
+    不会污染到别人手里那份。
+    """
+    return ToolRegistry(
+        [
+            Tool(
+                name="echo",
+                description="把一段文本打印到终端。需要让用户看到某段内容时用它。",
+                fn=echo,
+                params=ECHO_SCHEMA,
+            ),
+        ]
+    )
+
