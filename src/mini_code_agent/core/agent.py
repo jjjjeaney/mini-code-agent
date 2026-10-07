@@ -69,8 +69,10 @@ def runagent(
         for call in response.tool_calls:
             # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
             trace.append(_render_call(call))
+            print(_render_call(call))
             result = registry.dispatch(call)
             trace.append(_render_result(result))
+            print(_render_result(result))
             results.append(result)
 
         # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
