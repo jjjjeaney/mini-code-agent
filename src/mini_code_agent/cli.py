@@ -11,18 +11,41 @@ app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
 
 
 @app.command()
-def main_command(prompt: str = typer.Argument(..., help="要交给 agent 的指令")) -> None:
+def main_command(prompt: str = typer.Argument("", help="Prompt to send to the agent.")) -> None:
     """把指令交给 agent，把最终回复打印到标准输出。"""
-    result = runagent(prompt, AnthropicProvider())
-
-    if result.final is None:
-        typer.echo(
-            f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
-            err=True,
-        )
-        raise typer.Exit(code=1)
-
-    typer.echo(result.final)
+    prompt=prompt.strip()
+    if prompt:
+        result = runagent(prompt, AnthropicProvider())
+        if result.final is None:
+            typer.echo(
+                f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        typer.echo(result.final)
+        return
+    else:
+        try:
+            while True:
+                line = typer.prompt("> ").strip()
+                if not line:
+                    continue
+                if line == "/exit":
+                    break
+                result = runagent(line, AnthropicProvider())
+                if result.final is None:
+                    typer.echo(
+                        f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
+                        err=True,
+                    )
+                    raise typer.Exit(code=1)
+                typer.echo(result.final)
+        except (typer.Abort, EOFError, KeyboardInterrupt):
+            # Ctrl+C / Ctrl+D 都当正常退出。打断时提示符后面没有换行，先补一个，
+            # 免得 bye 紧跟在 "^C" 后面。
+            typer.echo()
+        print("bye")
+        
 
 
 if __name__ == "__main__":
