@@ -1,0 +1,31 @@
+# 环境变量与密钥，绝不能提交
+.env
+.env.*
+!.env.example
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# 测试与覆盖率
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# 本地试验文件，不入库
+/main.py
+/notebook/
