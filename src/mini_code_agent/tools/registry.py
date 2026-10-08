@@ -8,6 +8,7 @@ from typing import Any
 from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
 from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
+from mini_code_agent.tools.files import LIST_FILES_SCHEMA, list_files
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
 
@@ -81,6 +82,15 @@ def default_tools() -> ToolRegistry:
                 description="把一段文本打印到终端。需要让用户看到某段内容时用它。",
                 fn=echo,
                 params=ECHO_SCHEMA,
+            ),
+            Tool(
+                name="list_files",
+                description=(
+                    "列出目录下的所有文件和目录，含子目录。想知道项目里有什么文件时用它。"
+                    "返回的路径可以直接拿去读。"
+                ),
+                fn=list_files,
+                params=LIST_FILES_SCHEMA,
             ),
             Tool(
                 name="web_search",

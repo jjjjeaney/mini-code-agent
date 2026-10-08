@@ -15,9 +15,11 @@ class ToolContext:
 
     工具需要的外部信息都从这里拿，而不是去读全局状态——比如 cwd，
     路径校验就拿它当围栏的边界。
+
+    cwd 是必填的：让工具在缺省时回落到进程当前目录，等于悄悄换了沙箱的边界。
     """
 
-    cwd: Path | None = None
+    cwd: Path
 
 
 @dataclass
