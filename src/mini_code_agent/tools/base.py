@@ -5,7 +5,19 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+
+@dataclass
+class ToolContext:
+    """调用工具时的运行环境。
+
+    工具需要的外部信息都从这里拿，而不是去读全局状态——比如 cwd，
+    路径校验就拿它当围栏的边界。
+    """
+
+    cwd: Path | None = None
 
 
 @dataclass
@@ -13,11 +25,12 @@ class Tool:
     """一个可以被模型调用的工具。
 
     params 是 JSON Schema，会原样成为请求里的 input_schema，留空表示这个工具不收参数。
-    fn 收到的是模型给出的关键字参数，返回值由 ToolRegistry 包成 ToolResult 交回模型。
+    fn 收到两样东西：模型给的参数字典，和一个 ToolContext。返回值由 ToolRegistry
+    包成 ToolResult 交回模型。
     """
 
     name: str
-    fn: Callable[..., Any]
+    fn: Callable[[dict[str, Any], ToolContext], Any]
     description: str | None = None
     params: dict[str, Any] = field(default_factory=dict)
 

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_code_agent.providers.base import Provider, ToolCall
-from mini_code_agent.tools import ToolRegistry, ToolResult, default_tools
+from mini_code_agent.tools import ToolContext, ToolRegistry, ToolResult, default_tools
 
 
 @dataclass
@@ -54,7 +54,7 @@ def runagent(
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     trace: list[str] = []
     final: str | None = None
-
+    ctx = ToolContext(cwd or Path.cwd())
     for _ in range(max_steps):
         response = provider.complete(messages, tools=tools, system=system)
 
@@ -72,7 +72,7 @@ def runagent(
             # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
             trace.append(_render_call(call))
             print(_render_call(call))
-            result = registry.dispatch(call)
+            result = registry.dispatch(ctx, call)
             trace.append(_render_result(result))
             print(_render_result(result))
             results.append(result)

@@ -3,7 +3,7 @@
 只依赖标准库和 providers.base 里的中立类型，不 import cli / commands，也不碰 agent 的内部状态。
 """
 
-from mini_code_agent.tools.base import Tool, ToolResult
+from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
 from mini_code_agent.tools.registry import ToolRegistry, default_tools
 
-__all__ = ["Tool", "ToolRegistry", "ToolResult", "default_tools"]
+__all__ = ["Tool", "ToolContext", "ToolRegistry", "ToolResult", "default_tools"]

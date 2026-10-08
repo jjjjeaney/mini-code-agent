@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from mini_code_agent.providers.base import ToolCall
-from mini_code_agent.tools.base import Tool, ToolResult
+from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
 from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
@@ -28,25 +28,36 @@ class ToolRegistry:
         """按注册顺序列出所有工具。"""
         return list(self.tools.values())
 
-    def run(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
-        """按名字调用一个工具，工具自身的异常照常往上抛。"""
+    def run(
+        self, ctx: ToolContext, name: str, arguments: dict[str, Any] | None = None
+    ) -> Any:
+        """按名字调用一个工具。工具自身的异常、以及缺了必填参数，都照常往上抛。"""
         tool = self.tools.get(name)
         if tool is None:
             raise KeyError(f"没有注册名为 {name!r} 的工具")
-        return tool.fn(**(arguments or {}))
+
+        # 按工具自己的 schema 校验必填参数——校验的就是发给模型的那份契约。
+        # 少了参数在这里就拦住，别让工具拿着 None 悄悄跑完：那样模型会以为成功了，
+        # 而它本来能收到一句"你少传了 text"然后自己改对。
+        args = arguments or {}
+        missing = [key for key in tool.params.get("required", []) if key not in args]
+        if missing:
+            raise ValueError(f"调用 {tool.name} 缺少必填参数：{'、'.join(missing)}")
+
+        return tool.fn(args, ctx)
 
     def schemas(self) -> list[dict[str, Any]]:
         """传给 provider.complete(tools=...) 的列表。"""
         return [tool.to_anthropic_schema() for tool in self.tools.values()]
 
-    def dispatch(self, call: ToolCall) -> ToolResult:
+    def dispatch(self, ctx: ToolContext, call: ToolCall) -> ToolResult:
         """执行一次模型发起的调用，返回可以直接回填进对话的 ToolResult。
 
         和 run 的区别是这里不往外抛异常：工具失败要作为结果交回模型让它自己改，
         否则一次工具报错就会终结整轮对话。
         """
         try:
-            result = self.run(call.name, call.arguments)
+            result = self.run(ctx, call.name, call.arguments)
         except Exception as exc:
             return ToolResult(
                 id=call.id,

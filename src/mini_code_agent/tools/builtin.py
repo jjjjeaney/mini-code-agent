@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from mini_code_agent.tools.base import ToolContext
+
 ECHO_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {"text": {"type": "string", "description": "要打印到终端的文本"}},
@@ -15,7 +17,8 @@ ECHO_SCHEMA: dict[str, Any] = {
 }
 
 
-def echo(text: str) -> str:
+def echo(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """把文本打到终端，并回一句确认给模型。"""
+    text = kwargs["text"]
     print(text)
     return f"已在终端打印：{text}"
