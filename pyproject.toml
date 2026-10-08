@@ -8,6 +8,7 @@ dependencies = [
     "anthropic>=1.11.0",
     "ipykernel>=7.4.0",
     "python-dotenv>=1.2.4",
+    "tavily>=1.1.0",
     "typer>=0.27.3",
 ]
 
@@ -37,3 +38,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer 的参数默认值本来就该这么写，B008 在这里是误报
+extend-immutable-calls = ["typer.Option", "typer.Argument"]

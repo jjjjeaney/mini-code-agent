@@ -8,6 +8,7 @@ from typing import Any
 from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools.base import Tool, ToolResult
 from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
+from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
 
 class ToolRegistry:
@@ -69,6 +70,15 @@ def default_tools() -> ToolRegistry:
                 description="把一段文本打印到终端。需要让用户看到某段内容时用它。",
                 fn=echo,
                 params=ECHO_SCHEMA,
+            ),
+            Tool(
+                name="web_search",
+                description=(
+                    "联网搜索。遇到你不确定、可能已过时、或需要查证的事实时用它，"
+                    "比如近期新闻、最新版本号、人物近况。返回若干条结果的标题、链接和摘要。"
+                ),
+                fn=web_search,
+                params=WEB_SEARCH_SCHEMA,
             ),
         ]
     )
