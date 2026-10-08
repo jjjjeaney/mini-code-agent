@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from mini_code_agent.providers.base import Provider, ToolCall
@@ -39,6 +40,7 @@ def runagent(
     registry: ToolRegistry | None = None,
     system: str | None = None,
     max_steps: int = 8,
+    cwd: Path | None = None,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
