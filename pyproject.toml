@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mini-code-agent = "mini_code_agent.cli:app"
+mca = "mini_code_agent.cli:app"
 
 [dependency-groups]
 dev = [
