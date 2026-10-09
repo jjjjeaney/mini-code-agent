@@ -189,6 +189,7 @@ class TestDefaultTools:
             "project_tree",
             "read_file",
             "write_file",
+            "edit_file",
             "glob",
             "grep",
             "web_search",

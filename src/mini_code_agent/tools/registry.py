@@ -9,12 +9,14 @@ from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
 from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
 from mini_code_agent.tools.files import (
+    EDIT_FILE_SCHEMA,
     GLOB_SCHEMA,
     GREP_SCHEMA,
     LIST_FILES_SCHEMA,
     PROJECT_TREE_SCHEMA,
     READ_FILE_SCHEMA,
     WRITE_FILE_SCHEMA,
+    edit_file,
     glob,
     grep,
     list_files,
@@ -132,6 +134,16 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=write_file,
                 params=WRITE_FILE_SCHEMA,
+            ),
+            Tool(
+                name="edit_file",
+                description=(
+                    "把文件里的一段文本换成另一段，局部改动用它。"
+                    "old_string 必须和原文一模一样，所以改之前得先读过这个文件。"
+                    "整篇重写用 write_file。"
+                ),
+                fn=edit_file,
+                params=EDIT_FILE_SCHEMA,
             ),
             Tool(
                 name="glob",

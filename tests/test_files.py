@@ -18,6 +18,7 @@ from mini_code_agent.tools.base import (
 )
 from mini_code_agent.tools.files import (
     MAX_GREP_MATCHES,
+    edit_file,
     glob,
     grep,
     list_files,
@@ -735,6 +736,164 @@ class TestWriteFile:
         with pytest.raises(StaleReadError, match="被改过了"):
             write_file({"path": "a.txt", "content": "new\n"}, ctx)
         assert target.read_bytes() == b"old\n"
+        assert [p.name for p in project.iterdir() if p.suffix == ".tmp"] == []
+
+
+class TestEditFile:
+    def test_replaces_the_matched_text(self, project, ctx):
+        (project / "a.py").write_bytes(b"def f():\n    return 1\n")
+        read_file({"path": "a.py"}, ctx)
+
+        message = edit_file(
+            {"path": "a.py", "old_string": "return 1", "new_string": "return 2"}, ctx
+        )
+
+        assert (project / "a.py").read_bytes() == b"def f():\n    return 2\n"
+        assert "替换 1 处" in message
+
+    def test_matching_includes_indentation_and_whitespace(self, project, ctx):
+        (project / "a.py").write_bytes(b"    return 1\n")
+        read_file({"path": "a.py"}, ctx)
+
+        edit_file({"path": "a.py", "old_string": "    return 1", "new_string": "    return 2"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"    return 2\n"
+
+    def test_a_near_miss_does_not_match(self, project, ctx):
+        """差一个空格就是另一个字符串——匹配是逐字符的，不是"看着差不多"。
+
+        （注意匹配是子串匹配，所以缩进不必包含在 old_string 里；要的是一个字节不差。）
+        """
+        (project / "a.py").write_bytes(b"    return  1\n")
+        read_file({"path": "a.py"}, ctx)
+
+        with pytest.raises(ValueError, match="找不到 old_string"):
+            edit_file({"path": "a.py", "old_string": "return 1", "new_string": "x"}, ctx)
+
+    def test_only_the_first_occurrence_is_replaced_by_default(self, project, ctx):
+        (project / "a.py").write_bytes(b"x\nx\nx\n")
+        read_file({"path": "a.py"}, ctx)
+
+        message = edit_file({"path": "a.py", "old_string": "x", "new_string": "y"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"y\nx\nx\n"
+        assert "出现了 3 次" in message
+        assert "只替换了第一处" in message
+
+    def test_replace_all_replaces_every_occurrence(self, project, ctx):
+        (project / "a.py").write_bytes(b"x\nx\nx\n")
+        read_file({"path": "a.py"}, ctx)
+
+        message = edit_file(
+            {"path": "a.py", "old_string": "x", "new_string": "y", "replace_all": True}, ctx
+        )
+
+        assert (project / "a.py").read_bytes() == b"y\ny\ny\n"
+        assert "替换 3 处" in message
+
+    def test_deleting_text_works(self, project, ctx):
+        (project / "a.py").write_bytes(b"keep\ngo away\n")
+        read_file({"path": "a.py"}, ctx)
+
+        edit_file({"path": "a.py", "old_string": "go away\n", "new_string": ""}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"keep\n"
+
+    def test_it_must_have_been_read_first(self, project, ctx):
+        (project / "a.py").write_bytes(b"x\n")
+
+        with pytest.raises(StaleReadError, match="还没读过"):
+            edit_file({"path": "a.py", "old_string": "x", "new_string": "y"}, ctx)
+
+    def test_refuses_if_the_file_changed_after_it_was_read(self, project, ctx):
+        target = project / "a.py"
+        target.write_bytes(b"x\n")
+        read_file({"path": "a.py"}, ctx)
+
+        bumped = target.stat().st_mtime_ns + 1_000_000_000
+        os.utime(target, ns=(bumped, bumped))
+
+        with pytest.raises(StaleReadError, match="被改过了"):
+            edit_file({"path": "a.py", "old_string": "x", "new_string": "y"}, ctx)
+        assert target.read_bytes() == b"x\n"
+
+    def test_it_backs_up_the_previous_content(self, project, ctx):
+        (project / "a.py").write_bytes(b"old\n")
+        read_file({"path": "a.py"}, ctx)
+
+        edit_file({"path": "a.py", "old_string": "old", "new_string": "new"}, ctx)
+
+        backups = list((project / ".agent" / ".history").rglob("a.py.*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == b"old\n"
+
+    def test_a_file_just_edited_can_be_edited_again(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\n")
+        read_file({"path": "a.py"}, ctx)
+
+        edit_file({"path": "a.py", "old_string": "one", "new_string": "two"}, ctx)
+        edit_file({"path": "a.py", "old_string": "two", "new_string": "three"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"three\n"
+
+    def test_a_missing_file_points_at_write_file(self, project, ctx):
+        with pytest.raises(FileNotFoundError, match="用 write_file"):
+            edit_file({"path": "nope.py", "old_string": "x", "new_string": "y"}, ctx)
+
+    def test_a_directory_is_rejected(self, project, ctx):
+        with pytest.raises(IsADirectoryError):
+            edit_file({"path": "src", "old_string": "x", "new_string": "y"}, ctx)
+
+    def test_a_sensitive_path_is_rejected(self, project, ctx):
+        with pytest.raises(SensitiveFileError, match="敏感位置"):
+            edit_file({"path": ".env", "old_string": "KEY", "new_string": "X"}, ctx)
+
+    def test_a_path_outside_the_root_is_rejected(self, project, ctx, tmp_path_factory):
+        outside = tmp_path_factory.mktemp("outside") / "x.txt"
+
+        with pytest.raises(OutOfSandboxError):
+            edit_file({"path": str(outside), "old_string": "x", "new_string": "y"}, ctx)
+
+    def test_an_empty_old_string_is_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"x\n")
+
+        with pytest.raises(ValueError, match="不能为空"):
+            edit_file({"path": "a.py", "old_string": "", "new_string": "y"}, ctx)
+
+    def test_an_unchanged_edit_is_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"x\n")
+
+        with pytest.raises(ValueError, match="一模一样"):
+            edit_file({"path": "a.py", "old_string": "x", "new_string": "x"}, ctx)
+
+    def test_non_string_arguments_are_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"x\n")
+
+        with pytest.raises(ValueError, match="得是字符串"):
+            edit_file({"path": "a.py", "old_string": 123, "new_string": "y"}, ctx)
+
+    def test_two_edits_in_the_same_second_keep_separate_backups(self, project, ctx):
+        """备份名只精确到秒的话，同一秒里的第二次会把第一次覆盖掉。
+
+        而第一次那份才是这轮改动**之前**的原始内容——真丢了就没得回退了。连改两次是
+        很正常的事（实跑里撞到过），不是边角情况。
+        """
+        (project / "a.py").write_bytes(b"v1\n")
+        read_file({"path": "a.py"}, ctx)
+
+        edit_file({"path": "a.py", "old_string": "v1", "new_string": "v2"}, ctx)
+        edit_file({"path": "a.py", "old_string": "v2", "new_string": "v3"}, ctx)
+
+        backups = sorted((project / ".agent" / ".history").rglob("a.py.*"))
+        assert len(backups) == 2
+        assert [backup.read_bytes() for backup in backups] == [b"v1\n", b"v2\n"]
+
+    def test_no_temp_file_is_left_behind(self, project, ctx):
+        (project / "a.py").write_bytes(b"x\n")
+        read_file({"path": "a.py"}, ctx)
+
+        edit_file({"path": "a.py", "old_string": "x", "new_string": "y"}, ctx)
+
         assert [p.name for p in project.iterdir() if p.suffix == ".tmp"] == []
 
 

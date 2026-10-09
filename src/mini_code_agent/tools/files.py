@@ -155,6 +155,29 @@ WRITE_FILE_SCHEMA: dict[str, Any] = {
     "required": ["path", "content"],
 }
 
+EDIT_FILE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "改哪个文件，相对项目根目录",
+        },
+        "old_string": {
+            "type": "string",
+            "description": "要被换掉的那段原文，必须和文件里一模一样，包括缩进和空白",
+        },
+        "new_string": {
+            "type": "string",
+            "description": "换成什么。留空字符串就是把那段删掉",
+        },
+        "replace_all": {
+            "type": "boolean",
+            "description": "old_string 在文件里出现多次时是否全部替换。默认 false，只换第一处",
+        },
+    },
+    "required": ["path", "old_string", "new_string"],
+}
+
 
 def list_files(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """列出某个目录下面一层的文件和子目录，不往下钻。
@@ -340,33 +363,7 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     if not target.is_file():
         raise ValueError(f"{raw!r} 不是普通文件（可能是管道、设备文件之类），读不了。")
 
-    # 大小先卡住：后面要把整个文件读进内存再解码，先截流比先撑爆强。
-    ensure_within_size(target)
-
-    # 读之前先量一次 mtime。不能在记的时候才 stat——那样拿到的是"记录那一刻"的时间戳，
-    # 而内容属于更早的版本，两者一错开，守卫就会以为模型看到的是磁盘上最新的东西。
-    mtime_ns = target.stat().st_mtime_ns
-
-    with target.open("rb") as fh:
-        sample = fh.read(SNIFF_BYTES)
-        if not ensure_text_file(sample):
-            raise NotTextFileError(f"{raw!r} 看着是二进制文件，没法当文本读。")
-        encoding = detect_encoding(sample) or "utf-8"
-        # 采样那一段不浪费：seek 回开头，一个句柄把整篇读完。
-        fh.seek(0)
-        data = fh.read()
-
-    # 读完再量一次。两次不一样，说明读的过程中有人动过这个文件，手上这份可能是撕裂的。
-    # 报错让模型重读，绝不能记下"读过"。
-    if target.stat().st_mtime_ns != mtime_ns:
-        raise ValueError(f"{raw!r} 在读的过程中被改过了，这次拿到的内容不一定完整，请重读一次。")
-
-    try:
-        text = data.decode(encoding)
-    except UnicodeDecodeError as exc:
-        raise UndecodableTextError(
-            f"{raw!r} 不是 {encoding} 编码（可能是 GBK 之类），没法当文本读。"
-        ) from exc
+    text, mtime_ns = _read_text(target, raw)
 
     body = truncate_text(slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line")))
 
@@ -383,160 +380,21 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
 def write_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """用完整内容写一个文件：不存在就新建，存在就整个替换。
 
+    传的是**整篇**内容，不是片段；改局部用 edit_file。
+
     这个工具只管写。要不要批准、要不要问用户是 harness 的事，这里不做。
 
-    涉及改写，所以比读那一侧多几道闸，任何一道不过都不动文件：
-
-    - 路径要落在 cwd 里面，而且路径上不能有符号链接。顺着链接写，改的是它指向的那个
-      文件——模型以为改的是 A，实际改的是 B，而且 B 可能根本不在 cwd 里
-    - 敏感路径一概不写：装着密钥凭据的文件，以及 .git 这类目录。读那边靠这道防泄露，
-      写这边靠它防破坏——覆盖凭据是一种，在 .git/hooks/ 下面新建脚本是另一种
-    - 要覆盖的文件必须**先被读过**，读完之后还不能被别人动过。没读过就整篇盖掉，
-      等于把一份模型从没看过的内容抹掉，它自己还不知道
-    - 这道状态检查放在**顶替之前**，不是函数开头。它前面隔着建临时文件、写内容、
-      备份这几件事，搁开头的话，检查和顶替之间就空出一整轮文件操作的时间
-
-    写入是原子的：先在同目录下写一个随机名的临时文件，写完 os.replace 顶替过去。
-    要么旧内容、要么新内容，不会留下写到一半的半个文件。覆盖前原文件备份到
-    .agent/.history/。
-
-    失败时抛 ToolWriteError 的子类，每个子类都写明原文件有没有被改动。写入没成功
-    绝不返回成功——成功的那句话只在 os.replace 回来之后才拼。
+    闸门在 _checked_writable 里（围栏、符号链接、敏感路径），后面的写临时文件、核对
+    状态、备份、原子顶替在 _commit_change 里——两条都和 edit_file 共用同一份。
     """
-
-    def default_file_mode() -> int:
-        """新文件该用的权限：0o666 去掉进程的 umask，也就是系统默认的那一档。
-
-        mkstemp 建出来的是 0o600（只有自己能读写），对新建的源码文件来说太紧。
-        Python 没有 getumask，只能设一次读一次再把旧的设回去——窗口是进程级的，
-        但只有这一瞬间。
-        """
-        current = os.umask(0o022)
-        os.umask(current)
-        return 0o666 & ~current
-
-    def match_permissions(temp_file: Path) -> None:
-        """让临时文件的权限和"将来那个目标文件该有的"一致。
-
-        覆盖时沿用原文件的（把一个 0o644 的文件换成 0o600 就是悄悄收紧了权限），
-        新建时给系统默认那一档。都是**尽量**：拷不过来或者设不上也照样往下写，
-        丢权限总比丢内容好。
-        """
-        try:
-            if existed:
-                shutil.copymode(target, temp_file)
-            else:
-                os.chmod(temp_file, default_file_mode())
-        except OSError:
-            pass
-
-    def ensure_state_agrees() -> None:
-        """顶替之前核对状态：文件还在不在、读过没有、读过之后动过没有。
-
-        这一步已经站在"下一步就是 os.replace"的位置上了。建临时文件、写内容、备份
-        都要花时间，越靠近顶替核对越准。
-        """
-        if target.exists() != existed:
-            what = "冒出来了" if not existed else "不见了"
-            raise StaleReadError(
-                f"{raw!r} 在准备写入的过程中{what}，状态和开始时对不上，这次先不写。"
-            )
-        if not existed:
-            return
-        recorded = ctx.read_state.entries.get(target)
-        if recorded is None:
-            raise StaleReadError(
-                f"{raw!r} 已经存在，但你还没读过它。先读一遍再改——"
-                f"不然会把一份你从没看过的内容整个盖掉。"
-            )
-        recorded_mtime, _ = recorded
-        if target.stat().st_mtime_ns != recorded_mtime:
-            raise StaleReadError(
-                f"{raw!r} 在你读过之后被改过了（可能是别的程序，也可能是你自己另一次操作）。"
-                f"先重读一遍，再改。"
-            )
-
-    def backup_existing() -> Path:
-        """把原文件留一份。名字带时间戳，同一个文件改多次就留下多份历史。"""
-        relative = target.relative_to(root)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        saved = root / HISTORY_DIR / relative.parent / f"{relative.name}.{stamp}"
-        try:
-            saved.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, saved)
-        except OSError as exc:
-            raise BackupFailedError(f"{raw!r} 没被改动；备份原文件失败：{exc}") from exc
-        return saved
-
-    def write_atomically() -> Path | None:
-        """写临时文件 -> 核对状态 -> 备份 -> 顶替。返回备份路径（没备份就是 None）。"""
-        try:
-            handle_fd, temp_name = tempfile.mkstemp(
-                dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
-            )
-        except OSError as exc:
-            raise WriteFailedError(f"{raw!r} 没被改动；建临时文件失败：{exc}") from exc
-
-        temp = Path(temp_name)
-        try:
-            try:
-                # newline="" 表示不做换行转换：模型给什么就写什么。默认行为在 Windows
-                # 上会把 \n 翻成 \r\n，那会让一个 LF 的文件每写一次就整体变一次行尾。
-                with os.fdopen(handle_fd, "w", encoding="utf-8", newline="") as fh:
-                    fh.write(content)
-                match_permissions(temp)
-                # mtime 在顶替**之前**量。改名不改时间戳，所以这就是新内容将来在目标上
-                # 的时间戳，而且不受"顶替之后、记录之前"那点窗口影响。
-                new_mtime_ns = temp.stat().st_mtime_ns
-            except OSError as exc:
-                raise WriteFailedError(f"{raw!r} 没被改动；写临时文件失败：{exc}") from exc
-
-            ensure_state_agrees()
-            saved = backup_existing() if existed else None
-
-            try:
-                os.replace(temp, target)
-            except OSError as exc:
-                raise ReplaceFailedError(f"{raw!r} 没被改动；顶替那一步失败：{exc}") from exc
-        finally:
-            # 顶替成功后 temp 已经被改走、不存在了，这里是 no-op；失败时把临时文件收掉。
-            # 收尾自己出的错不该盖掉真正的错因。
-            try:
-                temp.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-        ctx.read_state.record(target, content, new_mtime_ns)
-        return saved
-
     root = ctx.cwd.resolve()
     raw = kwargs["path"]
     content = kwargs["content"]
     if not isinstance(content, str):
         raise ValueError(f"content 得是字符串，收到的是 {type(content).__name__}。")
 
-    target = _resolve_inside(root, raw)
-    link = _find_symlink(raw, root)
-    if link is not None:
-        raise ValueError(
-            f"{raw!r} 的路径上有符号链接（{link}）。write_file 默认不写这种路径——"
-            f"顺着链接写改的是它指向的那个文件，你以为改的是 A，实际改的是 B。"
-        )
-    if is_sensitive(target):
-        raise SensitiveFileError(
-            f"{raw!r} 是敏感位置（可能装着密钥或凭据，或者本身就是 .git 这种目录），"
-            f"write_file 不写这里。覆盖它可能毁掉凭据；在里面新建同样危险——"
-            f"比如 .git/hooks/ 下放个脚本，会在你下次提交时被执行。"
-        )
-    if target.is_dir():
-        raise IsADirectoryError(f"{raw!r} 是个目录。write_file 只写文件，不写目录。")
-    if not target.parent.is_dir():
-        raise FileNotFoundError(
-            f"{raw!r} 的上级目录不存在。这个工具不会替你建目录——路径是不是写错了？"
-        )
-
-    existed = target.exists()
-    saved = write_atomically()
+    target = _checked_writable(root, raw)
+    saved = _commit_change(root, target, raw, content, target.exists(), ctx)
 
     if saved is None:
         return f"新建了 {raw}（{len(content.splitlines())} 行）。"
@@ -544,6 +402,58 @@ def write_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
         f"覆盖了 {raw}（{len(content.splitlines())} 行）。"
         f"原内容备份在 {saved.relative_to(root).as_posix()}。"
     )
+
+
+def edit_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+    """把文件里的一段文本替换掉。
+
+    old_string 必须和文件里**一模一样**，包括缩进和空白——差一个空格就找不到，报错里
+    会说清。它在文件里出现多次时：replace_all=True 全部替换，否则只替换**第一处**，
+    并在返回里注明原本有几处，好让模型自己判断改的地方对不对。
+
+    新内容是在内存里算好的，往后跟 write_file 共用同一套：写临时文件、核对状态、备份、
+    原子顶替。核对放在顶替之前是有必要的——从读文件到真正落盘之间隔着算替换、写临时
+    文件，那段时间里别人改的东西要是不核对就被直接盖掉了。
+    """
+    root = ctx.cwd.resolve()
+    raw = kwargs["path"]
+    old = kwargs["old_string"]
+    new = kwargs["new_string"]
+    replace_all = bool(kwargs.get("replace_all"))
+
+    for name, value in (("old_string", old), ("new_string", new)):
+        if not isinstance(value, str):
+            raise ValueError(f"{name} 得是字符串，收到的是 {type(value).__name__}。")
+    if not old:
+        raise ValueError("old_string 不能为空——空文本在哪儿都匹配得上，替换出什么没法预料。")
+    if old == new:
+        raise ValueError("old_string 和 new_string 一模一样，这一改等于什么都没做。")
+
+    target = _checked_writable(root, raw)
+    if not target.exists():
+        raise FileNotFoundError(f"{raw!r} 不存在。edit_file 只改已有的文件，新建用 write_file。")
+    if not target.is_file():
+        raise ValueError(f"{raw!r} 不是普通文件（可能是管道、设备文件之类），改不了。")
+
+    current, _ = _read_text(target, raw)
+
+    count = current.count(old)
+    if count == 0:
+        raise ValueError(
+            f"{raw!r} 里找不到 old_string。它得和文件里的原文一模一样，包括缩进和空白——"
+            f"先 read_file 看一眼再照着写。"
+        )
+    updated = current.replace(old, new) if replace_all else current.replace(old, new, 1)
+
+    saved = _commit_change(root, target, raw, updated, True, ctx)
+
+    done = count if replace_all else 1
+    message = f"改了 {raw}（替换 {done} 处，文件现在 {len(updated.splitlines())} 行）。"
+    if count > 1 and not replace_all:
+        message += f" 注意：old_string 在文件里出现了 {count} 次，这次只替换了第一处。"
+    if saved is not None:
+        message += f" 原内容备份在 {saved.relative_to(root).as_posix()}。"
+    return message
 
 
 def glob(kwargs: dict[str, Any], ctx: ToolContext) -> str:
@@ -842,6 +752,184 @@ def _find_symlink(raw: str | Path, root: Path) -> Path | None:
         if current.is_symlink():
             return current
     return None
+
+
+def _read_text(target: Path, raw: str) -> tuple[str, int]:
+    """把文件读成文本，顺带带出"读之前"量到的 mtime。
+
+    大小、二进制、编码三道检查都在这儿——read_file 和 edit_file 都要走，各写一份的话
+    以后补一道检查只会补在其中一份上。mtime 也在这儿量：读完再量就和内容错开版本了。
+    """
+    ensure_within_size(target)
+
+    mtime_ns = target.stat().st_mtime_ns
+
+    with target.open("rb") as fh:
+        sample = fh.read(SNIFF_BYTES)
+        if not ensure_text_file(sample):
+            raise NotTextFileError(f"{raw!r} 看着是二进制文件，没法当文本读。")
+        encoding = detect_encoding(sample) or "utf-8"
+        # 采样那一段不浪费：seek 回开头，一个句柄把整篇读完。
+        fh.seek(0)
+        data = fh.read()
+
+    # 读完再量一次。两次不一样，说明读的过程中有人动过这个文件，手上这份可能是撕裂的。
+    if target.stat().st_mtime_ns != mtime_ns:
+        raise ValueError(f"{raw!r} 在读的过程中被改过了，这次拿到的内容不一定完整，请重读一次。")
+
+    try:
+        return data.decode(encoding), mtime_ns
+    except UnicodeDecodeError as exc:
+        raise UndecodableTextError(
+            f"{raw!r} 不是 {encoding} 编码（可能是 GBK 之类），没法当文本读。"
+        ) from exc
+
+
+def _checked_writable(root: Path, raw: str | Path) -> Path:
+    """写类工具的路径闸门：围栏、符号链接、敏感路径、不是目录、上级目录存在。
+
+    不查存在性——write_file 要能新建还不存在的文件，那件事留给调用方各自判。
+    """
+    target = _resolve_inside(root, raw)
+
+    link = _find_symlink(raw, root)
+    if link is not None:
+        raise ValueError(
+            f"{raw!r} 的路径上有符号链接（{link}）。不顺着链接写——"
+            f"那样改的是另一个文件，你以为改的是 A，实际改的是 B。"
+        )
+
+    if is_sensitive(target):
+        raise SensitiveFileError(
+            f"{raw!r} 是敏感位置（可能装着密钥或凭据，或者本身就是 .git 这种目录），"
+            f"不能写。覆盖它可能毁掉凭据；在里面新建同样危险——"
+            f"比如 .git/hooks/ 下放个脚本，会在你下次提交时被执行。"
+        )
+
+    if target.is_dir():
+        raise IsADirectoryError(f"{raw!r} 是个目录。只能写文件，不能写目录。")
+    if not target.parent.is_dir():
+        raise FileNotFoundError(f"{raw!r} 的上级目录不存在。不会替你建目录——路径是不是写错了？")
+    return target
+
+
+def _commit_change(
+    root: Path, target: Path, raw: str, new_content: str, existed: bool, ctx: ToolContext
+) -> Path | None:
+    """改文件的公共后半段：写临时文件 -> 核对状态 -> 备份 -> 原子顶替 -> 记 read_state。
+
+    返回备份路径（本来没有这个文件就是 None）。write_file 和 edit_file 只有"新内容是
+    怎么算出来的"不同，从这里往后一模一样，所以只留一份。
+
+    顺序是刻意的：**状态核对放在顶替之前**，不是函数开头。它前面隔着建临时文件、写内容、
+    备份这几件事，搁开头的话，核对和顶替之间就空出一整轮文件操作的时间。
+    """
+
+    def default_file_mode() -> int:
+        """新文件该用的权限：0o666 去掉进程的 umask，也就是系统默认的那一档。
+
+        mkstemp 建出来的是 0o600（只有自己能读写），对新建的源码文件来说太紧。
+        Python 没有 getumask，只能设一次读一次再把旧的设回去——窗口是进程级的，
+        但只有这一瞬间。
+        """
+        current = os.umask(0o022)
+        os.umask(current)
+        return 0o666 & ~current
+
+    def match_permissions(temp_file: Path) -> None:
+        """让临时文件的权限和"将来那个目标文件该有的"一致。
+
+        覆盖时沿用原文件的（把一个 0o644 的文件换成 0o600 就是悄悄收紧了权限），
+        新建时给系统默认那一档。都是**尽量**：拷不过来或者设不上也照样往下写，
+        丢权限总比丢内容好。
+        """
+        try:
+            if existed:
+                shutil.copymode(target, temp_file)
+            else:
+                os.chmod(temp_file, default_file_mode())
+        except OSError:
+            pass
+
+    def ensure_state_agrees() -> None:
+        """顶替之前核对状态：文件还在不在、读过没有、读过之后动过没有。"""
+        if target.exists() != existed:
+            what = "冒出来了" if not existed else "不见了"
+            raise StaleReadError(
+                f"{raw!r} 在准备写入的过程中{what}，状态和开始时对不上，这次先不写。"
+            )
+        if not existed:
+            return
+        recorded = ctx.read_state.entries.get(target)
+        if recorded is None:
+            raise StaleReadError(
+                f"{raw!r} 已经存在，但你还没读过它。先读一遍再改——"
+                f"不然会把一份你从没看过的内容整个盖掉。"
+            )
+        recorded_mtime, _ = recorded
+        if target.stat().st_mtime_ns != recorded_mtime:
+            raise StaleReadError(
+                f"{raw!r} 在你读过之后被改过了（可能是别的程序，也可能是你自己另一次操作）。"
+                f"先重读一遍，再改。"
+            )
+
+    def backup_existing() -> Path:
+        """把原文件留一份。名字带时间戳，同一个文件改多次就留下多份历史。"""
+        relative = target.relative_to(root)
+        name = f"{relative.name}.{time.strftime('%Y%m%d-%H%M%S')}"
+        saved = root / HISTORY_DIR / relative.parent / name
+        # 撞名就往后排，**绝不覆盖**：先来的那份才是更早的原始内容，正是要留住的。
+        # 不指望"时间戳够细"来避免撞名——Windows 上 time 的精度可能粗到毫秒，
+        # 同一瞬间连着改两次会拿到一模一样的时间戳（实跑里撞到过，还因此丢过一份备份）。
+        counter = 1
+        while saved.exists():
+            saved = saved.with_name(f"{name}-{counter}")
+            counter += 1
+        try:
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, saved)
+        except OSError as exc:
+            raise BackupFailedError(f"{raw!r} 没被改动；备份原文件失败：{exc}") from exc
+        return saved
+
+    try:
+        handle_fd, temp_name = tempfile.mkstemp(
+            dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+        )
+    except OSError as exc:
+        raise WriteFailedError(f"{raw!r} 没被改动；建临时文件失败：{exc}") from exc
+
+    temp = Path(temp_name)
+    try:
+        try:
+            # newline="" 表示不做换行转换：给什么就写什么。默认行为在 Windows 上会把
+            # \n 翻成 \r\n，那会让一个 LF 的文件每写一次就整体变一次行尾。
+            with os.fdopen(handle_fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(new_content)
+            match_permissions(temp)
+            # mtime 在顶替**之前**量。改名不改时间戳，所以这就是新内容将来在目标上的
+            # 时间戳，而且不受"顶替之后、记录之前"那点窗口影响。
+            new_mtime_ns = temp.stat().st_mtime_ns
+        except OSError as exc:
+            raise WriteFailedError(f"{raw!r} 没被改动；写临时文件失败：{exc}") from exc
+
+        ensure_state_agrees()
+        saved = backup_existing() if existed else None
+
+        try:
+            os.replace(temp, target)
+        except OSError as exc:
+            raise ReplaceFailedError(f"{raw!r} 没被改动；顶替那一步失败：{exc}") from exc
+    finally:
+        # 顶替成功后 temp 已经被改走、不存在了，这里是 no-op；失败时把临时文件收掉。
+        # 收尾自己出的错不该盖掉真正的错因。
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    ctx.read_state.record(target, new_content, new_mtime_ns)
+    return saved
 
 
 def _checked_path(root: Path, raw: str | Path) -> Path:
