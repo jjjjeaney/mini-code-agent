@@ -23,7 +23,7 @@ MAX_READ_BYTES = 256 * 1024
 
 # 单次读进上下文的字符数上限。超了就截断，并在正文里说明被截了。
 # 注意是字符不是字节——8000 个中文字符在 UTF-8 下要占 24000 字节。
-MAX_TEXT_CHARS = 8000
+MAX_TEXT_CHARS = 12000
 
 EXCLUDED_DIRS = {
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -68,6 +68,14 @@ class NotTextFileError(Exception):
     """这段内容看着不是能当文本读的东西。
 
     ensure_text_file 只回 True/False，不抛异常；这个类型留给调用方在判否时抛。
+    """
+
+
+class UndecodableTextError(Exception):
+    """内容是文本，但不是我们认得的那种编码，解不开。
+
+    和 NotTextFileError 分开是有意的：那个是"根本不是文字"，这个是"是文字，只是读法
+    不对"。模型看到之后该做的事不一样——前者该换个文件，后者该换个编码。
     """
 
 

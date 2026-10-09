@@ -8,8 +8,14 @@ from pathlib import Path
 import pytest
 
 from mini_code_agent.tools.base import ToolContext
-from mini_code_agent.tools.files import list_files, project_tree
-from mini_code_agent.tools.safety import OutOfSandboxError
+from mini_code_agent.tools.files import list_files, project_tree, read_file
+from mini_code_agent.tools.safety import (
+    MAX_READ_BYTES,
+    MAX_TEXT_CHARS,
+    NotTextFileError,
+    OutOfSandboxError,
+    UndecodableTextError,
+)
 
 
 @pytest.fixture
@@ -189,3 +195,102 @@ class TestProjectTree:
 
         assert "link/" in out
         assert "secret.py" not in out
+
+
+class TestReadFile:
+    def test_reads_a_small_file_whole(self, project, ctx):
+        (project / "a.txt").write_text("第一行\n第二行\n", encoding="utf-8")
+
+        assert read_file({"path": "a.txt"}, ctx) == "第一行\n第二行"
+
+    def test_no_range_note_when_the_whole_file_was_read(self, project, ctx):
+        (project / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+        assert "[这是第" not in read_file({"path": "a.txt"}, ctx)
+
+    def test_a_line_range_slices_and_says_which_part(self, project, ctx):
+        body = "\n".join(f"line{i}" for i in range(1, 11))
+        (project / "a.txt").write_text(body, encoding="utf-8")
+
+        out = read_file({"path": "a.txt", "start_line": 3, "end_line": 5}, ctx)
+
+        assert out.splitlines()[:3] == ["line3", "line4", "line5"]
+        assert "[这是第 3-5 行，文件共 10 行]" in out
+
+    def test_start_line_alone_reads_to_the_end(self, project, ctx):
+        (project / "a.txt").write_text("\n".join(f"line{i}" for i in range(1, 6)), encoding="utf-8")
+
+        out = read_file({"path": "a.txt", "start_line": 4}, ctx)
+
+        assert out.splitlines()[:2] == ["line4", "line5"]
+        assert "[这是第 4-5 行，文件共 5 行]" in out
+
+    def test_line_numbers_start_at_one(self, project, ctx):
+        (project / "a.txt").write_text("first\nsecond\n", encoding="utf-8")
+
+        out = read_file({"path": "a.txt", "start_line": 1, "end_line": 1}, ctx)
+
+        assert out.startswith("first")
+        assert "second" not in out
+
+    def test_end_line_beyond_the_file_is_clamped(self, project, ctx):
+        (project / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+        assert read_file({"path": "a.txt", "end_line": 999}, ctx) == "one\ntwo"
+
+    def test_starting_past_the_end_says_how_long_the_file_is(self, project, ctx):
+        (project / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+        assert "只有 2 行" in read_file({"path": "a.txt", "start_line": 50}, ctx)
+
+    def test_a_reversed_range_is_rejected(self, project, ctx):
+        (project / "a.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="不成立"):
+            read_file({"path": "a.txt", "start_line": 3, "end_line": 1}, ctx)
+
+    def test_crlf_files_come_back_with_plain_newlines(self, project, ctx):
+        (project / "a.txt").write_bytes(b"one\r\ntwo\r\n")
+
+        assert read_file({"path": "a.txt"}, ctx) == "one\ntwo"
+
+    def test_a_directory_is_rejected(self, project, ctx):
+        with pytest.raises(IsADirectoryError):
+            read_file({"path": "src"}, ctx)
+
+    def test_a_missing_file_is_reported(self, project, ctx):
+        with pytest.raises(FileNotFoundError):
+            read_file({"path": "nope.txt"}, ctx)
+
+    def test_path_outside_the_root_is_rejected(self, project, ctx, tmp_path_factory):
+        outside = tmp_path_factory.mktemp("outside") / "secret.txt"
+        outside.write_text("x", encoding="utf-8")
+
+        with pytest.raises(OutOfSandboxError):
+            read_file({"path": str(outside)}, ctx)
+
+    def test_binary_is_rejected(self, project, ctx):
+        (project / "logo.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(200, 256))
+        )
+
+        with pytest.raises(NotTextFileError):
+            read_file({"path": "logo.png"}, ctx)
+
+    def test_a_too_large_file_is_rejected_before_reading_it(self, project, ctx):
+        (project / "big.txt").write_bytes(b"x" * (MAX_READ_BYTES + 1))
+
+        with pytest.raises(ValueError, match="too large"):
+            read_file({"path": "big.txt"}, ctx)
+
+    def test_gbk_is_reported_as_an_encoding_problem_not_as_binary(self, project, ctx):
+        """是文本、只是编码不对——这跟"是二进制"要分开报，模型该做的事不一样。"""
+        (project / "gbk.txt").write_bytes("你好，世界\n".encode("gbk"))
+
+        with pytest.raises(UndecodableTextError):
+            read_file({"path": "gbk.txt"}, ctx)
+
+    def test_long_output_is_truncated(self, project, ctx):
+        (project / "long.txt").write_text("x" * (MAX_TEXT_CHARS + 500), encoding="utf-8")
+
+        assert "已截断" in read_file({"path": "long.txt"}, ctx)

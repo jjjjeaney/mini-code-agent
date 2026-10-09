@@ -11,8 +11,10 @@ from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
 from mini_code_agent.tools.files import (
     LIST_FILES_SCHEMA,
     PROJECT_TREE_SCHEMA,
+    READ_FILE_SCHEMA,
     list_files,
     project_tree,
+    read_file,
 )
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
@@ -105,6 +107,15 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=project_tree,
                 params=PROJECT_TREE_SCHEMA,
+            ),
+            Tool(
+                name="read_file",
+                description=(
+                    "读一个文本文件的内容。文件很长时可以只读一段："
+                    "start_line / end_line 指定行号范围，从 1 数起。"
+                ),
+                fn=read_file,
+                params=READ_FILE_SCHEMA,
             ),
             Tool(
                 name="web_search",

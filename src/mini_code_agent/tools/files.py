@@ -13,7 +13,12 @@ from typing import Any
 
 from mini_code_agent.tools.base import ToolContext
 from mini_code_agent.tools.safety import (
+    NotTextFileError,
     OutOfSandboxError,
+    UndecodableTextError,
+    detect_encoding,
+    ensure_text_file,
+    ensure_within_size,
     is_within,
     resolve_within,
     should_skip,
@@ -22,6 +27,9 @@ from mini_code_agent.tools.safety import (
 
 DEFAULT_MAX_DEPTH = 5
 DEFAULT_MAX_NODES = 200
+
+# 判文本还是二进制，只看开头这么多字节。git 判断二进制用的也是这个量级。
+SNIFF_BYTES = 8192
 
 LIST_FILES_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -32,6 +40,25 @@ LIST_FILES_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [],
+}
+
+READ_FILE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "要读哪个文件，相对项目根目录。",
+        },
+        "start_line": {
+            "type": "integer",
+            "description": "从第几行开始读，从 1 数起，默认 1",
+        },
+        "end_line": {
+            "type": "integer",
+            "description": "读到第几行（含这一行），默认读到文件末尾",
+        },
+    },
+    "required": ["path"],
 }
 
 PROJECT_TREE_SCHEMA: dict[str, Any] = {
@@ -61,7 +88,11 @@ def list_files(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """
     root = ctx.cwd.resolve()
     raw = kwargs.get("path") or "."
-    target = _checked_dir(root, raw)
+    target = _checked_path(root, raw)
+    if not target.is_dir():
+        raise NotADirectoryError(
+            f"{raw!r} 是文件不是目录。list_files 只能列目录，看单个文件用 read_file。"
+        )
 
     entries = _children(target)
     if not entries:
@@ -92,6 +123,71 @@ def project_tree(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     return text
 
 
+def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+    """读一个文本文件，可以只读其中一段。
+
+    start_line / end_line 从 1 数起、两头都含。分段读长文件就靠它：先读一段，看
+    末尾注明的"共 N 行"决定下一段从哪开始。
+
+    检查顺序是有讲究的：先判类型和大小（便宜，而且能挡住大文件），再开文件嗅一下
+    是不是文本，最后才解码。任何一步不通过，内容都不会被读进来。
+    """
+    root = ctx.cwd.resolve()
+    raw = kwargs["path"]
+    target = _checked_path(root, raw)
+
+    if target.is_dir():
+        raise IsADirectoryError(f"{raw!r} 是目录不是文件。想看目录里有什么就用 list_files。")
+    if not target.is_file():
+        raise ValueError(f"{raw!r} 不是普通文件（可能是管道、设备文件之类），读不了。")
+
+    # 大小先卡住：后面要把整个文件读进内存再解码，先截流比先撑爆强。
+    ensure_within_size(target)
+
+    with target.open("rb") as fh:
+        sample = fh.read(SNIFF_BYTES)
+        if not ensure_text_file(sample):
+            raise NotTextFileError(f"{raw!r} 看着是二进制文件，没法当文本读。")
+        encoding = detect_encoding(sample) or "utf-8"
+        # 采样那一段不浪费：seek 回开头，一个句柄把整篇读完。
+        fh.seek(0)
+        data = fh.read()
+
+    try:
+        text = data.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise UndecodableTextError(
+            f"{raw!r} 不是 {encoding} 编码（可能是 GBK 之类），没法当文本读。"
+        ) from exc
+
+    return _slice_lines(raw, text, kwargs.get("start_line"), kwargs.get("end_line"))
+
+
+def _slice_lines(raw: str, text: str, start_line: Any, end_line: Any) -> str:
+    """按行号切一段。行号从 1 数起，两头都含。"""
+    lines = text.splitlines()
+    total = len(lines)
+
+    start = max(1, int(start_line or 1))
+    asked_end = None if end_line is None else int(end_line)
+
+    # 只拿用户自己给的数比。没给 end_line 的时候不能拿"文件末尾"去跟 start 比——
+    # 那样"读一个 2 行文件的第 50 行"会报成范围不成立，而真正的原因是文件没那么长。
+    if asked_end is not None and asked_end < start:
+        raise ValueError(f"end_line({asked_end}) 比 start_line({start}) 还小，这个范围不成立。")
+
+    end = total if asked_end is None else min(asked_end, total)
+    selected = lines[start - 1 : end]
+    if not selected:
+        return f"{raw!r} 只有 {total} 行，从第 {start} 行开始没有内容了。"
+
+    body = "\n".join(selected)
+    # 只读了一段才注明范围。整篇读下来时不用多说，免得平白多一行噪音。
+    if start > 1 or end < total:
+        body += f"\n\n[这是第 {start}-{end} 行，文件共 {total} 行]"
+    return truncate_text(body)
+
+
 @dataclass
 class _Node:
     name: str
@@ -100,20 +196,16 @@ class _Node:
     kept: bool = False
 
 
-def _checked_dir(root: Path, raw: str | Path) -> Path:
-    """确认 raw 指向 root 里面的一个目录，否则抛错。三种失败给三种提示。"""
+def _checked_path(root: Path, raw: str | Path) -> Path:
+    """解析路径、确认落在 root 里面、且确实存在。是不是目录/文件由调用方各自判。"""
     target = resolve_within(root, raw)
     if not is_within(root, target):
         raise OutOfSandboxError(
             f"路径 {str(raw)!r} 指向 {target}，超出了允许的范围 {root}。"
-            f"只能列 {root} 里面的目录。"
+            f"只能访问 {root} 里面的东西。"
         )
     if not target.exists():
-        raise FileNotFoundError(f"{str(raw)!r} 不存在。用 '.' 可以列项目根目录。")
-    if not target.is_dir():
-        raise NotADirectoryError(
-            f"{str(raw)!r} 是文件不是目录。list_files 只能列目录，看单个文件用 read_file。"
-        )
+        raise FileNotFoundError(f"{str(raw)!r} 不存在。路径要相对项目根目录写。")
     return target
 
 
