@@ -86,9 +86,10 @@ class UndecodableTextError(Exception):
 
 
 class SensitiveFileError(Exception):
-    """这个文件碰不得——里面可能装着密钥、token 或凭据。
+    """这个路径碰不得——可能是装着密钥、token 或凭据的文件，也可能是 .git 这种目录。
 
-    由调用方在 is_sensitive 判真时抛。拦在读之前，内容根本不会被读进来。
+    由调用方在 is_sensitive 判真时抛。读和写都用到：读是怕内容被带出去；写是怕覆盖掉
+    凭据，更怕在那种位置新建出别的东西——比如 .git/hooks/ 下面放个脚本。
     """
 
 

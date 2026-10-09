@@ -267,8 +267,9 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     start_line / end_line 从 1 数起、两头都含，得是 ≥1 的整数。分段读长文件就靠它：
     先读一段，看末尾注明的"共 N 行"决定下一段从哪开始。
 
-    检查顺序是有讲究的：先判类型和大小（便宜，而且能挡住大文件），再开文件嗅一下
-    是不是文本，最后才解码。任何一步不通过，内容都不会被读进来。
+    检查顺序是有讲究的：先判路径（围栏、符号链接、敏感文件），再判类型和大小（便宜，
+    而且能挡住大文件），然后开文件嗅一下是不是文本，最后才解码。任何一步不通过，
+    内容都不会被读进来。
     """
 
     def as_line_number(value: Any, name: str) -> int | None:
@@ -319,6 +320,15 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     root = ctx.cwd.resolve()
     raw = kwargs["path"]
     target = _checked_path(root, raw)
+
+    # 不顺着符号链接读。指向 cwd 外面的链接，围栏那一步已经拦下了；指向 cwd 里面的
+    # 拦不住——顺着它读到的可能是另一个文件，模型以为读的是 A，实际读的是 B。
+    link = _find_symlink(raw, root)
+    if link is not None:
+        raise ValueError(
+            f"{raw!r} 的路径上有符号链接（{link}）。read_file 不顺着链接读——"
+            f"那样读到的可能是另一个文件，你以为读的是 A，实际读的是 B。"
+        )
 
     # 拦在最前面，连开都不开。.env 就躺在项目根目录，一次 read 就能让 key 随下一轮
     # 对话发出去，而且全程没有任何报错——这是这个工具最需要挡住的一件事。
@@ -379,6 +389,8 @@ def write_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
 
     - 路径要落在 cwd 里面，而且路径上不能有符号链接。顺着链接写，改的是它指向的那个
       文件——模型以为改的是 A，实际改的是 B，而且 B 可能根本不在 cwd 里
+    - 敏感路径一概不写：装着密钥凭据的文件，以及 .git 这类目录。读那边靠这道防泄露，
+      写这边靠它防破坏——覆盖凭据是一种，在 .git/hooks/ 下面新建脚本是另一种
     - 要覆盖的文件必须**先被读过**，读完之后还不能被别人动过。没读过就整篇盖掉，
       等于把一份模型从没看过的内容抹掉，它自己还不知道
     - 这道状态检查放在**顶替之前**，不是函数开头。它前面隔着建临时文件、写内容、
@@ -509,6 +521,12 @@ def write_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
         raise ValueError(
             f"{raw!r} 的路径上有符号链接（{link}）。write_file 默认不写这种路径——"
             f"顺着链接写改的是它指向的那个文件，你以为改的是 A，实际改的是 B。"
+        )
+    if is_sensitive(target):
+        raise SensitiveFileError(
+            f"{raw!r} 是敏感位置（可能装着密钥或凭据，或者本身就是 .git 这种目录），"
+            f"write_file 不写这里。覆盖它可能毁掉凭据；在里面新建同样危险——"
+            f"比如 .git/hooks/ 下放个脚本，会在你下次提交时被执行。"
         )
     if target.is_dir():
         raise IsADirectoryError(f"{raw!r} 是个目录。write_file 只写文件，不写目录。")

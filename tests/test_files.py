@@ -460,6 +460,34 @@ class TestReadFile:
         assert ctx.read_state.entries == {}
 
 
+    def test_a_path_through_a_symlink_is_refused(self, project, ctx):
+        """顺着链接读，读到的可能是另一个文件——模型以为读的是 A，实际读的是 B。"""
+        (project / "real.txt").write_bytes(b"real\n")
+        try:
+            (project / "link.txt").symlink_to(project / "real.txt")
+        except OSError:
+            pytest.skip("这个环境建不了符号链接（Windows 上需要开发者模式或管理员权限）")
+
+        with pytest.raises(ValueError, match="符号链接"):
+            read_file({"path": "link.txt"}, ctx)
+
+    def test_the_symlink_check_looks_at_every_path_component(self, project, ctx, monkeypatch):
+        """路径上**任何一段**是链接都要拦，不只是最后一段。
+
+        用打桩而不是真建链接：Windows 上建链接要权限，这条验的是判断逻辑本身，
+        顺便钉住"走的是没解析过的那条路径"——解析之后链接信息就没了。
+        """
+        real_is_symlink = Path.is_symlink
+
+        def fake_is_symlink(self):
+            return self.name == "src" or real_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+
+        with pytest.raises(ValueError, match="符号链接"):
+            read_file({"path": "src/cli.py"}, ctx)
+
+
 class TestWriteFile:
     def test_creates_a_file_that_did_not_exist(self, project, ctx):
         message = write_file({"path": "new.py", "content": "print(1)\n"}, ctx)
@@ -577,6 +605,26 @@ class TestWriteFile:
     def test_non_string_content_is_rejected(self, project, ctx):
         with pytest.raises(ValueError, match="得是字符串"):
             write_file({"path": "a.txt", "content": 123}, ctx)
+
+    def test_a_sensitive_file_is_refused(self, project, ctx):
+        """读那边靠这道防泄露，写这边靠它防破坏。"""
+        with pytest.raises(SensitiveFileError, match="敏感位置"):
+            write_file({"path": ".env", "content": "KEY=stolen\n"}, ctx)
+        assert (project / ".env").read_bytes() == b"KEY=1"
+
+    def test_creating_a_new_sensitive_file_is_refused(self, project, ctx):
+        """新建那条路没有 read-state 兜底，全靠这道。"""
+        with pytest.raises(SensitiveFileError, match="敏感位置"):
+            write_file({"path": "id_rsa", "content": "fake key\n"}, ctx)
+        assert not (project / "id_rsa").exists()
+
+    def test_creating_a_file_in_a_sensitive_directory_is_refused(self, project, ctx):
+        """这条是真会出事的：.git/hooks/ 下面的脚本会在下次提交时被执行。"""
+        (project / ".git" / "hooks").mkdir(parents=True)
+
+        with pytest.raises(SensitiveFileError, match="敏感位置"):
+            write_file({"path": ".git/hooks/pre-commit", "content": "#!/bin/sh\n"}, ctx)
+        assert not (project / ".git" / "hooks" / "pre-commit").exists()
 
     def test_the_temp_file_sits_beside_the_target_with_a_random_name(
         self, project, ctx, monkeypatch
