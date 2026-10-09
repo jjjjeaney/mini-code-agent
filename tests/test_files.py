@@ -14,6 +14,7 @@ from mini_code_agent.tools.safety import (
     MAX_TEXT_CHARS,
     NotTextFileError,
     OutOfSandboxError,
+    SensitiveFileError,
     UndecodableTextError,
 )
 
@@ -294,3 +295,34 @@ class TestReadFile:
         (project / "long.txt").write_text("x" * (MAX_TEXT_CHARS + 500), encoding="utf-8")
 
         assert "已截断" in read_file({"path": "long.txt"}, ctx)
+
+    def test_env_is_refused(self, project, ctx):
+        """fixture 里那个 .env 装着 KEY=1——读了就等于把它发出去。"""
+        with pytest.raises(SensitiveFileError):
+            read_file({"path": ".env"}, ctx)
+
+    def test_env_variants_are_refused(self, project, ctx):
+        (project / ".env.production").write_text("K=1", encoding="utf-8")
+
+        with pytest.raises(SensitiveFileError):
+            read_file({"path": ".env.production"}, ctx)
+
+    def test_key_files_are_refused(self, project, ctx):
+        (project / "server.pem").write_text("x", encoding="utf-8")
+
+        with pytest.raises(SensitiveFileError):
+            read_file({"path": "server.pem"}, ctx)
+
+    def test_a_file_inside_git_is_refused(self, project, ctx):
+        """.git/config 的 remote URL 里经常嵌着 token。"""
+        (project / ".git" / "config").write_text(
+            "[remote]\n\turl = https://user:token@example.com/x.git\n", encoding="utf-8"
+        )
+
+        with pytest.raises(SensitiveFileError):
+            read_file({"path": ".git/config"}, ctx)
+
+    def test_a_normal_file_is_still_readable(self, project, ctx):
+        (project / "app.py").write_text("print(1)", encoding="utf-8")
+
+        assert read_file({"path": "app.py"}, ctx) == "print(1)"
