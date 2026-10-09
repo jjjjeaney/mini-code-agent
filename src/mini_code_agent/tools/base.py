@@ -22,6 +22,32 @@ class ReadFileState:
         # 而它要防的恰恰就是这一类错位。
         self.entries[path] = (mtime_ns, len(content))
 
+
+class ToolWriteError(Exception):
+    """改文件的工具出的错。子类区分是**哪一步**失败的。
+
+    分这么细不是为了好看：模型看到 WriteFailedError 知道"原文件没被动过，可以重试"，
+    看到 StaleReadError 知道"该重读一遍"。报错原文会被 dispatch 交给模型，说清是哪
+    一步、原文件有没有被改动，比一句笼统的"写入失败"有用得多。
+    """
+
+
+class StaleReadError(ToolWriteError):
+    """状态对不上：没读过这个文件，或者读过之后它又被改过。原文件没有被改动。"""
+
+
+class BackupFailedError(ToolWriteError):
+    """备份原文件那一步失败了。原文件没有被改动。"""
+
+
+class WriteFailedError(ToolWriteError):
+    """写临时文件那一步失败了。原文件没有被改动。"""
+
+
+class ReplaceFailedError(ToolWriteError):
+    """临时文件写好了，但顶替原文件那一步失败了。原文件没有被改动。"""
+
+
 @dataclass
 class ToolContext:
     """调用工具时的运行环境。

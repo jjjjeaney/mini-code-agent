@@ -30,6 +30,8 @@ EXCLUDED_DIRS = {
     ".tox", ".nox", ".venv", "venv", "env", "node_modules", ".next",
     ".nuxt", "dist", "build", ".turbo", ".idea", ".vscode", "target",
     "bin", "obj", ".cache", "tmp", "temp", "htmlcov",
+    # 工具自己的痕迹（改文件前的备份），不该出现在模型的视野里
+    ".agent",
 }
 
 EXCLUDED_FILES = {

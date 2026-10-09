@@ -12,12 +12,20 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from mini_code_agent.tools.base import ToolContext
+from mini_code_agent.tools.base import (
+    BackupFailedError,
+    ReplaceFailedError,
+    StaleReadError,
+    ToolContext,
+    WriteFailedError,
+)
 from mini_code_agent.tools.safety import (
     EXCLUDED_DIRS,
     EXCLUDED_FILES,
@@ -44,6 +52,10 @@ MAX_GREP_MATCHES = 200
 
 # 判文本还是二进制，只看开头这么多字节。git 判断二进制用的也是这个量级。
 SNIFF_BYTES = 8192
+
+# 覆盖文件前，原内容往这儿留一份。是工具自己的痕迹，不该进模型的视野，
+# 所以 safety 的跳过规则里也加了 .agent。
+HISTORY_DIR = Path(".agent") / ".history"
 
 LIST_FILES_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -126,6 +138,21 @@ GREP_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["pattern"],
+}
+
+WRITE_FILE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "要写到哪个文件，相对项目根目录",
+        },
+        "content": {
+            "type": "string",
+            "description": "文件的完整内容。是整篇，不是片段；是替换，不是追加",
+        },
+    },
+    "required": ["path", "content"],
 }
 
 
@@ -341,6 +368,164 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     ctx.read_state.record(target, text, mtime_ns)
 
     return body
+
+
+def write_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+    """用完整内容写一个文件：不存在就新建，存在就整个替换。
+
+    这个工具只管写。要不要批准、要不要问用户是 harness 的事，这里不做。
+
+    涉及改写，所以比读那一侧多几道闸，任何一道不过都不动文件：
+
+    - 路径要落在 cwd 里面，而且路径上不能有符号链接。顺着链接写，改的是它指向的那个
+      文件——模型以为改的是 A，实际改的是 B，而且 B 可能根本不在 cwd 里
+    - 要覆盖的文件必须**先被读过**，读完之后还不能被别人动过。没读过就整篇盖掉，
+      等于把一份模型从没看过的内容抹掉，它自己还不知道
+    - 这道状态检查放在**顶替之前**，不是函数开头。它前面隔着建临时文件、写内容、
+      备份这几件事，搁开头的话，检查和顶替之间就空出一整轮文件操作的时间
+
+    写入是原子的：先在同目录下写一个随机名的临时文件，写完 os.replace 顶替过去。
+    要么旧内容、要么新内容，不会留下写到一半的半个文件。覆盖前原文件备份到
+    .agent/.history/。
+
+    失败时抛 ToolWriteError 的子类，每个子类都写明原文件有没有被改动。写入没成功
+    绝不返回成功——成功的那句话只在 os.replace 回来之后才拼。
+    """
+
+    def default_file_mode() -> int:
+        """新文件该用的权限：0o666 去掉进程的 umask，也就是系统默认的那一档。
+
+        mkstemp 建出来的是 0o600（只有自己能读写），对新建的源码文件来说太紧。
+        Python 没有 getumask，只能设一次读一次再把旧的设回去——窗口是进程级的，
+        但只有这一瞬间。
+        """
+        current = os.umask(0o022)
+        os.umask(current)
+        return 0o666 & ~current
+
+    def match_permissions(temp_file: Path) -> None:
+        """让临时文件的权限和"将来那个目标文件该有的"一致。
+
+        覆盖时沿用原文件的（把一个 0o644 的文件换成 0o600 就是悄悄收紧了权限），
+        新建时给系统默认那一档。都是**尽量**：拷不过来或者设不上也照样往下写，
+        丢权限总比丢内容好。
+        """
+        try:
+            if existed:
+                shutil.copymode(target, temp_file)
+            else:
+                os.chmod(temp_file, default_file_mode())
+        except OSError:
+            pass
+
+    def ensure_state_agrees() -> None:
+        """顶替之前核对状态：文件还在不在、读过没有、读过之后动过没有。
+
+        这一步已经站在"下一步就是 os.replace"的位置上了。建临时文件、写内容、备份
+        都要花时间，越靠近顶替核对越准。
+        """
+        if target.exists() != existed:
+            what = "冒出来了" if not existed else "不见了"
+            raise StaleReadError(
+                f"{raw!r} 在准备写入的过程中{what}，状态和开始时对不上，这次先不写。"
+            )
+        if not existed:
+            return
+        recorded = ctx.read_state.entries.get(target)
+        if recorded is None:
+            raise StaleReadError(
+                f"{raw!r} 已经存在，但你还没读过它。先读一遍再改——"
+                f"不然会把一份你从没看过的内容整个盖掉。"
+            )
+        recorded_mtime, _ = recorded
+        if target.stat().st_mtime_ns != recorded_mtime:
+            raise StaleReadError(
+                f"{raw!r} 在你读过之后被改过了（可能是别的程序，也可能是你自己另一次操作）。"
+                f"先重读一遍，再改。"
+            )
+
+    def backup_existing() -> Path:
+        """把原文件留一份。名字带时间戳，同一个文件改多次就留下多份历史。"""
+        relative = target.relative_to(root)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        saved = root / HISTORY_DIR / relative.parent / f"{relative.name}.{stamp}"
+        try:
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, saved)
+        except OSError as exc:
+            raise BackupFailedError(f"{raw!r} 没被改动；备份原文件失败：{exc}") from exc
+        return saved
+
+    def write_atomically() -> Path | None:
+        """写临时文件 -> 核对状态 -> 备份 -> 顶替。返回备份路径（没备份就是 None）。"""
+        try:
+            handle_fd, temp_name = tempfile.mkstemp(
+                dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+            )
+        except OSError as exc:
+            raise WriteFailedError(f"{raw!r} 没被改动；建临时文件失败：{exc}") from exc
+
+        temp = Path(temp_name)
+        try:
+            try:
+                # newline="" 表示不做换行转换：模型给什么就写什么。默认行为在 Windows
+                # 上会把 \n 翻成 \r\n，那会让一个 LF 的文件每写一次就整体变一次行尾。
+                with os.fdopen(handle_fd, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(content)
+                match_permissions(temp)
+                # mtime 在顶替**之前**量。改名不改时间戳，所以这就是新内容将来在目标上
+                # 的时间戳，而且不受"顶替之后、记录之前"那点窗口影响。
+                new_mtime_ns = temp.stat().st_mtime_ns
+            except OSError as exc:
+                raise WriteFailedError(f"{raw!r} 没被改动；写临时文件失败：{exc}") from exc
+
+            ensure_state_agrees()
+            saved = backup_existing() if existed else None
+
+            try:
+                os.replace(temp, target)
+            except OSError as exc:
+                raise ReplaceFailedError(f"{raw!r} 没被改动；顶替那一步失败：{exc}") from exc
+        finally:
+            # 顶替成功后 temp 已经被改走、不存在了，这里是 no-op；失败时把临时文件收掉。
+            # 收尾自己出的错不该盖掉真正的错因。
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        ctx.read_state.record(target, content, new_mtime_ns)
+        return saved
+
+    root = ctx.cwd.resolve()
+    raw = kwargs["path"]
+    content = kwargs["content"]
+    if not isinstance(content, str):
+        raise ValueError(f"content 得是字符串，收到的是 {type(content).__name__}。")
+
+    target = _resolve_inside(root, raw)
+    link = _find_symlink(raw, root)
+    if link is not None:
+        raise ValueError(
+            f"{raw!r} 的路径上有符号链接（{link}）。write_file 默认不写这种路径——"
+            f"顺着链接写改的是它指向的那个文件，你以为改的是 A，实际改的是 B。"
+        )
+    if target.is_dir():
+        raise IsADirectoryError(f"{raw!r} 是个目录。write_file 只写文件，不写目录。")
+    if not target.parent.is_dir():
+        raise FileNotFoundError(
+            f"{raw!r} 的上级目录不存在。这个工具不会替你建目录——路径是不是写错了？"
+        )
+
+    existed = target.exists()
+    saved = write_atomically()
+
+    if saved is None:
+        return f"新建了 {raw}（{len(content.splitlines())} 行）。"
+    return (
+        f"覆盖了 {raw}（{len(content.splitlines())} 行）。"
+        f"原内容备份在 {saved.relative_to(root).as_posix()}。"
+    )
 
 
 def glob(kwargs: dict[str, Any], ctx: ToolContext) -> str:
@@ -603,11 +788,12 @@ def _compile_glob(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(out) + r"\Z")
 
 
-def _checked_path(root: Path, raw: str | Path) -> Path:
-    """解析路径、确认落在 root 里面、且确实存在。是不是目录/文件由调用方各自判。
+def _resolve_inside(root: Path, raw: str | Path) -> Path:
+    """解析路径并确认它落在 root 里面。存不存在、是不是目录由调用方各自判。
 
-    留在这儿而不是嵌进工具，是因为它是**安全闸门**，两个工具都要走。抄成两份的话，
-    以后补一条校验只会补在其中一份上——安全校验有三份，就等于只会被修好一份。
+    这是安全闸门，几个工具都要走。抄成多份的话，以后补一条校验只会补在其中一份上——
+    安全校验有多份，就等于只会被修好一份。写文件那个工具要允许"还不存在"，
+    所以围栏和"必须存在"是分开的两件事。
     """
     target = resolve_within(root, raw)
     if not is_within(root, target):
@@ -615,6 +801,34 @@ def _checked_path(root: Path, raw: str | Path) -> Path:
             f"路径 {str(raw)!r} 指向 {target}，超出了允许的范围 {root}。"
             f"只能访问 {root} 里面的东西。"
         )
+    return target
+
+
+def _find_symlink(raw: str | Path, root: Path) -> Path | None:
+    """沿着**没解析过**的路径一段段看，返回第一段符号链接。
+
+    为什么不能拿解析后的 target 去判 `is_symlink()`：链接在 resolve_within 那一步就
+    被展开了，等拿到 target，"这是链接"这个信息已经没了。只能顺着原始路径重新走一遍。
+
+    和围栏一样，这是安全校验——将来 edit_file 也要走同一份。
+    """
+    unresolved = Path(raw)
+    if unresolved.is_absolute():
+        try:
+            unresolved = unresolved.relative_to(root)
+        except ValueError:
+            return None  # 压根不在 root 下面，围栏那一步会另行拒绝
+    current = root
+    for part in unresolved.parts:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def _checked_path(root: Path, raw: str | Path) -> Path:
+    """在 _resolve_inside 之上再要求它确实存在。读类工具都用这个。"""
+    target = _resolve_inside(root, raw)
     if not target.exists():
         raise FileNotFoundError(f"{str(raw)!r} 不存在。路径要相对项目根目录写。")
     return target
@@ -636,3 +850,6 @@ def _children(directory: Path) -> list[tuple[str, bool, bool]]:
     # 目录在前、文件在后，两组各自按名字排（忽略大小写）。
     entries.sort(key=lambda entry: (not entry[1], entry[0].lower()))
     return entries
+
+
+

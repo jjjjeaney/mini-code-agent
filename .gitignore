@@ -29,3 +29,6 @@ htmlcov/
 # 本地试验文件，不入库
 /main.py
 /notebook/
+
+# 改文件工具留下的备份历史，是本地产物
+.agent/

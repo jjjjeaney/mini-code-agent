@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
 
-from mini_code_agent.tools.base import ToolContext
+from mini_code_agent.tools.base import (
+    BackupFailedError,
+    ReplaceFailedError,
+    StaleReadError,
+    ToolContext,
+    WriteFailedError,
+)
 from mini_code_agent.tools.files import (
     MAX_GREP_MATCHES,
     glob,
@@ -15,6 +23,7 @@ from mini_code_agent.tools.files import (
     list_files,
     project_tree,
     read_file,
+    write_file,
 )
 from mini_code_agent.tools.safety import (
     MAX_READ_BYTES,
@@ -449,6 +458,236 @@ class TestReadFile:
         with pytest.raises(ValueError, match="读的过程中被改过"):
             read_file({"path": "a.txt"}, ctx)
         assert ctx.read_state.entries == {}
+
+
+class TestWriteFile:
+    def test_creates_a_file_that_did_not_exist(self, project, ctx):
+        message = write_file({"path": "new.py", "content": "print(1)\n"}, ctx)
+
+        assert (project / "new.py").read_bytes() == b"print(1)\n"
+        assert "新建了" in message
+
+    def test_a_new_file_needs_no_prior_read(self, project, ctx):
+        """不存在的文件没有"会盖掉什么"的问题，所以不要求先读。"""
+        assert ctx.read_state.entries == {}
+
+        write_file({"path": "new.py", "content": "x\n"}, ctx)
+
+        assert (project / "new.py").exists()
+
+    def test_overwrites_a_file_that_was_read(self, project, ctx):
+        (project / "a.txt").write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+
+        message = write_file({"path": "a.txt", "content": "new\n"}, ctx)
+
+        assert (project / "a.txt").read_bytes() == b"new\n"
+        assert "覆盖了" in message
+
+    def test_refuses_to_overwrite_a_file_that_was_never_read(self, project, ctx):
+        """整篇盖掉一份模型从没看过的内容，而且它自己还不知道——这就是要挡的事。"""
+        (project / "a.txt").write_bytes(b"old\n")
+
+        with pytest.raises(StaleReadError, match="还没读过"):
+            write_file({"path": "a.txt", "content": "new\n"}, ctx)
+        assert (project / "a.txt").read_bytes() == b"old\n"
+
+    def test_refuses_to_overwrite_a_file_changed_since_it_was_read(self, project, ctx):
+        target = project / "a.txt"
+        target.write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+
+        # 明确把 mtime 推远，而不是指望"再写一次文件系统就一定更新 mtime"。那条在
+        # Windows 上偶尔不成立（这条用例因此闪过一次，单独连跑 20 遍却复现不出来）。
+        # 这里要验的是"读完之后文件被动了就拒绝"，不是文件系统怎么记时间戳。
+        bumped = target.stat().st_mtime_ns + 1_000_000_000
+        os.utime(target, ns=(bumped, bumped))
+
+        with pytest.raises(StaleReadError, match="被改过了"):
+            write_file({"path": "a.txt", "content": "new\n"}, ctx)
+        assert target.read_bytes() == b"old\n"
+
+    def test_the_backup_keeps_the_previous_content(self, project, ctx):
+        (project / "a.txt").write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+
+        write_file({"path": "a.txt", "content": "new\n"}, ctx)
+
+        backups = list((project / ".agent" / ".history").rglob("a.txt.*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == b"old\n"
+
+    def test_the_history_directory_is_hidden_from_listing(self, project, ctx):
+        (project / "a.txt").write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+        write_file({"path": "a.txt", "content": "new\n"}, ctx)
+
+        assert ".agent" not in list_files({}, ctx)
+
+    def test_no_temp_file_is_left_behind(self, project, ctx):
+        write_file({"path": "a.txt", "content": "hi\n"}, ctx)
+
+        assert [p.name for p in project.iterdir() if p.suffix == ".tmp"] == []
+
+    def test_a_failed_replace_leaves_the_original_and_cleans_up(self, project, ctx, monkeypatch):
+        (project / "a.txt").write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+
+        def explode(*args, **kwargs):
+            raise OSError("模拟顶替失败")
+
+        monkeypatch.setattr(os, "replace", explode)
+
+        with pytest.raises(ReplaceFailedError, match="顶替"):
+            write_file({"path": "a.txt", "content": "new\n"}, ctx)
+
+        assert (project / "a.txt").read_bytes() == b"old\n"
+        assert [p.name for p in project.iterdir() if p.suffix == ".tmp"] == []
+
+    def test_a_file_just_written_can_be_written_again(self, project, ctx):
+        """写完就等于"我知道它现在是什么"了，第二次不用再读一遍。"""
+        write_file({"path": "a.txt", "content": "one\n"}, ctx)
+
+        write_file({"path": "a.txt", "content": "two\n"}, ctx)
+
+        assert (project / "a.txt").read_bytes() == b"two\n"
+
+    def test_content_is_written_verbatim(self, project, ctx):
+        """newline="" ：模型给什么就写什么，不在 Windows 上偷偷把 \\n 翻成 \\r\\n。"""
+        write_file({"path": "a.txt", "content": "one\ntwo\n"}, ctx)
+
+        assert (project / "a.txt").read_bytes() == b"one\ntwo\n"
+
+    def test_a_path_outside_the_root_is_rejected(self, project, ctx, tmp_path_factory):
+        outside = tmp_path_factory.mktemp("outside") / "x.txt"
+
+        with pytest.raises(OutOfSandboxError):
+            write_file({"path": str(outside), "content": "x"}, ctx)
+        assert not outside.exists()
+
+    def test_writing_to_a_directory_is_rejected(self, project, ctx):
+        with pytest.raises(IsADirectoryError):
+            write_file({"path": "src", "content": "x"}, ctx)
+
+    def test_a_missing_parent_directory_is_reported(self, project, ctx):
+        """这个工具不替模型建目录——多半是路径写错了，包出来比悄悄建一个树好。"""
+        with pytest.raises(FileNotFoundError, match="上级目录"):
+            write_file({"path": "nope/deep/x.txt", "content": "x"}, ctx)
+
+    def test_non_string_content_is_rejected(self, project, ctx):
+        with pytest.raises(ValueError, match="得是字符串"):
+            write_file({"path": "a.txt", "content": 123}, ctx)
+
+    def test_the_temp_file_sits_beside_the_target_with_a_random_name(
+        self, project, ctx, monkeypatch
+    ):
+        """同目录是为了 os.replace 真的是原子的（跨盘就不是了），随机名是为了别撞上真文件。"""
+        seen: dict[str, Path] = {}
+        real_replace = os.replace
+
+        def capture(src, dst):
+            seen["temp"] = Path(src)
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", capture)
+
+        write_file({"path": "a.txt", "content": "x\n"}, ctx)
+
+        assert seen["temp"].parent == project
+        assert seen["temp"].name != "a.txt"
+
+    def test_a_path_through_a_symlink_is_refused(self, project, ctx):
+        """顺着链接写，改的是它指向的那个文件——方向可能完全出乎模型意料。"""
+        (project / "real.txt").write_bytes(b"original\n")
+        try:
+            (project / "link.txt").symlink_to(project / "real.txt")
+        except OSError:
+            pytest.skip("这个环境建不了符号链接（Windows 上需要开发者模式或管理员权限）")
+
+        with pytest.raises(ValueError, match="符号链接"):
+            write_file({"path": "link.txt", "content": "new\n"}, ctx)
+        assert (project / "real.txt").read_bytes() == b"original\n"
+
+    def test_the_symlink_check_looks_at_every_path_component(self, project, ctx, monkeypatch):
+        """路径上**任何一段**是链接都要拦，不只是最后一段。
+
+        用打桩而不是真建链接：Windows 上建链接要权限，这条验的是判断逻辑本身，顺便
+        钉住"走的是没解析过的那条路径"——解析之后链接信息就没了。
+        """
+        real_is_symlink = Path.is_symlink
+
+        def fake_is_symlink(self):
+            return self.name == "src" or real_is_symlink(self)
+
+        monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+
+        with pytest.raises(ValueError, match="符号链接"):
+            write_file({"path": "src/x.txt", "content": "x\n"}, ctx)
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows 的权限位和 POSIX 不是一回事")
+    def test_overwriting_keeps_the_original_file_mode(self, project, ctx):
+        target = project / "a.txt"
+        target.write_bytes(b"old\n")
+        os.chmod(target, 0o640)
+        read_file({"path": "a.txt"}, ctx)
+
+        write_file({"path": "a.txt", "content": "new\n"}, ctx)
+
+        assert target.stat().st_mode & 0o777 == 0o640
+
+    def test_a_backup_failure_says_the_original_was_not_touched(self, project, ctx, monkeypatch):
+        (project / "a.txt").write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+
+        def explode(*args, **kwargs):
+            raise OSError("模拟备份失败")
+
+        monkeypatch.setattr(shutil, "copy2", explode)
+
+        with pytest.raises(BackupFailedError, match="没被改动"):
+            write_file({"path": "a.txt", "content": "new\n"}, ctx)
+        assert (project / "a.txt").read_bytes() == b"old\n"
+
+    def test_a_write_failure_says_the_original_was_not_touched(self, project, ctx, monkeypatch):
+        (project / "a.txt").write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+
+        def explode(*args, **kwargs):
+            raise OSError("模拟建临时文件失败")
+
+        monkeypatch.setattr(tempfile, "mkstemp", explode)
+
+        with pytest.raises(WriteFailedError, match="没被改动"):
+            write_file({"path": "a.txt", "content": "new\n"}, ctx)
+        assert (project / "a.txt").read_bytes() == b"old\n"
+
+    def test_the_state_check_happens_after_the_temp_file_is_written(
+        self, project, ctx, monkeypatch
+    ):
+        """状态检查放在顶替之前，不是函数开头。
+
+        这条在"临时文件已经建好"之后才去改目标文件的 mtime：检查要是搁在函数开头，
+        它看不到这次改动、写入会照常成功；搁在顶替之前才拦得住。顺带证明拦下来时
+        原文件没被碰、临时文件也没留下。
+        """
+        target = project / "a.txt"
+        target.write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+
+        real_mkstemp = tempfile.mkstemp
+
+        def mkstemp_then_touch(*args, **kwargs):
+            result = real_mkstemp(*args, **kwargs)
+            bumped = target.stat().st_mtime_ns + 1_000_000_000
+            os.utime(target, ns=(bumped, bumped))
+            return result
+
+        monkeypatch.setattr(tempfile, "mkstemp", mkstemp_then_touch)
+
+        with pytest.raises(StaleReadError, match="被改过了"):
+            write_file({"path": "a.txt", "content": "new\n"}, ctx)
+        assert target.read_bytes() == b"old\n"
+        assert [p.name for p in project.iterdir() if p.suffix == ".tmp"] == []
 
 
 class TestGlob:

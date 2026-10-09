@@ -14,11 +14,13 @@ from mini_code_agent.tools.files import (
     LIST_FILES_SCHEMA,
     PROJECT_TREE_SCHEMA,
     READ_FILE_SCHEMA,
+    WRITE_FILE_SCHEMA,
     glob,
     grep,
     list_files,
     project_tree,
     read_file,
+    write_file,
 )
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
@@ -120,6 +122,16 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_file,
                 params=READ_FILE_SCHEMA,
+            ),
+            Tool(
+                name="write_file",
+                description=(
+                    "写一个文件：不存在就新建，存在就用给的内容整个替换。"
+                    "传的是**整篇**内容，不是片段；改局部用 edit_file。"
+                    "覆盖已存在的文件前必须先读过它。"
+                ),
+                fn=write_file,
+                params=WRITE_FILE_SCHEMA,
             ),
             Tool(
                 name="glob",
