@@ -8,7 +8,12 @@ from typing import Any
 from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
 from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
-from mini_code_agent.tools.files import LIST_FILES_SCHEMA, list_files
+from mini_code_agent.tools.files import (
+    LIST_FILES_SCHEMA,
+    PROJECT_TREE_SCHEMA,
+    list_files,
+    project_tree,
+)
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
 
@@ -86,11 +91,20 @@ def default_tools() -> ToolRegistry:
             Tool(
                 name="list_files",
                 description=(
-                    "列出目录下的所有文件和目录，含子目录。想知道项目里有什么文件时用它。"
-                    "返回的路径可以直接拿去读。"
+                    "列出某个目录下面一层的文件和子目录，不往下钻。"
+                    "想知道某个目录里有什么时用它。"
                 ),
                 fn=list_files,
                 params=LIST_FILES_SCHEMA,
+            ),
+            Tool(
+                name="project_tree",
+                description=(
+                    "把整个项目画成一棵树，用于一眼看清整体结构。"
+                    "想知道项目怎么组织、有哪些模块时用它。"
+                ),
+                fn=project_tree,
+                params=PROJECT_TREE_SCHEMA,
             ),
             Tool(
                 name="web_search",
