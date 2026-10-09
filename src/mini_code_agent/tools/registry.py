@@ -15,6 +15,7 @@ from mini_code_agent.tools.files import (
     LIST_FILES_SCHEMA,
     PROJECT_TREE_SCHEMA,
     READ_FILE_SCHEMA,
+    REPLACE_LINES_SCHEMA,
     WRITE_FILE_SCHEMA,
     edit_file,
     glob,
@@ -22,6 +23,7 @@ from mini_code_agent.tools.files import (
     list_files,
     project_tree,
     read_file,
+    replace_lines,
     write_file,
 )
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
@@ -144,6 +146,16 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=edit_file,
                 params=EDIT_FILE_SCHEMA,
+            ),
+            Tool(
+                name="replace_lines",
+                description=(
+                    "按行号替换一段：把第 start_line 到 end_line 行换成 new_text。"
+                    "改的内容在文件里不唯一、或者要按位置增删几行时用它；"
+                    "按内容找位置用 edit_file。"
+                ),
+                fn=replace_lines,
+                params=REPLACE_LINES_SCHEMA,
             ),
             Tool(
                 name="glob",

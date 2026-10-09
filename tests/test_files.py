@@ -24,6 +24,7 @@ from mini_code_agent.tools.files import (
     list_files,
     project_tree,
     read_file,
+    replace_lines,
     write_file,
 )
 from mini_code_agent.tools.safety import (
@@ -895,6 +896,165 @@ class TestEditFile:
         edit_file({"path": "a.py", "old_string": "x", "new_string": "y"}, ctx)
 
         assert [p.name for p in project.iterdir() if p.suffix == ".tmp"] == []
+
+
+class TestReplaceLines:
+    def test_replaces_one_line(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\ntwo\nthree\n")
+        read_file({"path": "a.py"}, ctx)
+
+        message = replace_lines(
+            {"path": "a.py", "start_line": 2, "end_line": 2, "new_text": "TWO"}, ctx
+        )
+
+        assert (project / "a.py").read_bytes() == b"one\nTWO\nthree\n"
+        assert "第 2-2 行换成了 1 行" in message
+
+    def test_replaces_a_range(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\ntwo\nthree\nfour\n")
+        read_file({"path": "a.py"}, ctx)
+
+        replace_lines({"path": "a.py", "start_line": 2, "end_line": 3, "new_text": "X"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"one\nX\nfour\n"
+
+    def test_new_text_can_be_longer(self, project, ctx):
+        (project / "a.py").write_bytes(b"a\nb\n")
+        read_file({"path": "a.py"}, ctx)
+
+        replace_lines({"path": "a.py", "start_line": 1, "end_line": 1, "new_text": "x\ny\nz"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"x\ny\nz\nb\n"
+
+    def test_a_missing_trailing_newline_is_added(self, project, ctx):
+        """不补的话，下一行会和它粘成一行。"""
+        (project / "a.py").write_bytes(b"a\nb\nc\n")
+        read_file({"path": "a.py"}, ctx)
+
+        replace_lines({"path": "a.py", "start_line": 2, "end_line": 2, "new_text": "X"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"a\nX\nc\n"
+
+    def test_an_empty_new_text_deletes_the_range(self, project, ctx):
+        (project / "a.py").write_bytes(b"keep\ndrop me\nalso drop\nkeep too\n")
+        read_file({"path": "a.py"}, ctx)
+
+        message = replace_lines(
+            {"path": "a.py", "start_line": 2, "end_line": 3, "new_text": ""}, ctx
+        )
+
+        assert (project / "a.py").read_bytes() == b"keep\nkeep too\n"
+        assert "删掉了第 2-3 行" in message
+
+    def test_the_empty_range_inserts(self, project, ctx):
+        """end_line = start_line - 1：不替换任何行，只在这个位置插入。"""
+        (project / "a.py").write_bytes(b"a\nc\n")
+        read_file({"path": "a.py"}, ctx)
+
+        message = replace_lines(
+            {"path": "a.py", "start_line": 2, "end_line": 1, "new_text": "b"}, ctx
+        )
+
+        assert (project / "a.py").read_bytes() == b"a\nb\nc\n"
+        assert "插了 1 行" in message
+
+    def test_appending_at_the_end(self, project, ctx):
+        (project / "a.py").write_bytes(b"a\n")
+        read_file({"path": "a.py"}, ctx)
+
+        replace_lines({"path": "a.py", "start_line": 2, "end_line": 1, "new_text": "b"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"a\nb\n"
+
+    def test_an_empty_file_can_take_an_insert(self, project, ctx):
+        (project / "a.py").write_bytes(b"")
+        read_file({"path": "a.py"}, ctx)
+
+        replace_lines({"path": "a.py", "start_line": 1, "end_line": 0, "new_text": "first"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"first\n"
+
+    def test_a_final_line_without_a_newline_survives_untouched(self, project, ctx):
+        """区间外的内容按字节原样拼回去——包括"最后一行没有换行"这种。"""
+        (project / "a.py").write_bytes(b"one\ntwo")
+        read_file({"path": "a.py"}, ctx)
+
+        replace_lines({"path": "a.py", "start_line": 1, "end_line": 1, "new_text": "X"}, ctx)
+
+        assert (project / "a.py").read_bytes() == b"X\ntwo"
+
+    def test_a_start_past_the_end_is_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\ntwo\n")
+        read_file({"path": "a.py"}, ctx)
+
+        with pytest.raises(ValueError, match="超出了文件"):
+            replace_lines({"path": "a.py", "start_line": 9, "end_line": 9, "new_text": "x"}, ctx)
+
+    def test_an_end_past_the_end_is_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\ntwo\n")
+        read_file({"path": "a.py"}, ctx)
+
+        with pytest.raises(ValueError, match="超出了文件"):
+            replace_lines({"path": "a.py", "start_line": 1, "end_line": 9, "new_text": "x"}, ctx)
+
+    def test_a_reversed_range_is_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\ntwo\nthree\n")
+        read_file({"path": "a.py"}, ctx)
+
+        with pytest.raises(ValueError, match="小太多"):
+            replace_lines({"path": "a.py", "start_line": 3, "end_line": 1, "new_text": "x"}, ctx)
+
+    def test_a_zero_start_line_is_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\n")
+        read_file({"path": "a.py"}, ctx)
+
+        with pytest.raises(ValueError, match="从 1 数起"):
+            replace_lines({"path": "a.py", "start_line": 0, "end_line": 1, "new_text": "x"}, ctx)
+
+    def test_a_negative_end_line_is_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\n")
+        read_file({"path": "a.py"}, ctx)
+
+        with pytest.raises(ValueError, match="不能是负数"):
+            replace_lines({"path": "a.py", "start_line": 1, "end_line": -1, "new_text": "x"}, ctx)
+
+    def test_a_missing_file_points_at_write_file(self, project, ctx):
+        with pytest.raises(FileNotFoundError, match="用 write_file"):
+            replace_lines({"path": "nope.py", "start_line": 1, "end_line": 1, "new_text": "x"}, ctx)
+
+    def test_it_must_have_been_read_first(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\n")
+
+        with pytest.raises(StaleReadError, match="还没读过"):
+            replace_lines({"path": "a.py", "start_line": 1, "end_line": 1, "new_text": "x"}, ctx)
+
+    def test_it_backs_up_the_previous_content(self, project, ctx):
+        (project / "a.py").write_bytes(b"old\n")
+        read_file({"path": "a.py"}, ctx)
+
+        replace_lines({"path": "a.py", "start_line": 1, "end_line": 1, "new_text": "new"}, ctx)
+
+        backups = list((project / ".agent" / ".history").rglob("a.py.*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == b"old\n"
+
+    def test_a_sensitive_path_is_rejected(self, project, ctx):
+        with pytest.raises(SensitiveFileError, match="敏感位置"):
+            replace_lines({"path": ".env", "start_line": 1, "end_line": 1, "new_text": "x"}, ctx)
+
+    def test_a_path_outside_the_root_is_rejected(self, project, ctx, tmp_path_factory):
+        outside = tmp_path_factory.mktemp("outside") / "x.txt"
+
+        with pytest.raises(OutOfSandboxError):
+            replace_lines(
+                {"path": str(outside), "start_line": 1, "end_line": 1, "new_text": "x"}, ctx
+            )
+
+    def test_non_string_new_text_is_rejected(self, project, ctx):
+        (project / "a.py").write_bytes(b"one\n")
+
+        with pytest.raises(ValueError, match="得是字符串"):
+            replace_lines({"path": "a.py", "start_line": 1, "end_line": 1, "new_text": 1}, ctx)
 
 
 class TestGlob:

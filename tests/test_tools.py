@@ -190,6 +190,7 @@ class TestDefaultTools:
             "read_file",
             "write_file",
             "edit_file",
+            "replace_lines",
             "glob",
             "grep",
             "web_search",

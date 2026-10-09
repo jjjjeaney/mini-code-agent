@@ -178,6 +178,32 @@ EDIT_FILE_SCHEMA: dict[str, Any] = {
     "required": ["path", "old_string", "new_string"],
 }
 
+REPLACE_LINES_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "改哪个文件，相对项目根目录",
+        },
+        "start_line": {
+            "type": "integer",
+            "description": "从第几行开始（含这一行），从 1 数起",
+        },
+        "end_line": {
+            "type": "integer",
+            "description": (
+                "到第几行结束（含这一行）。可以等于 start_line-1，"
+                "那表示不替换任何行、只在那个位置插入"
+            ),
+        },
+        "new_text": {
+            "type": "string",
+            "description": "替换成什么。留空字符串就是把这几行删掉",
+        },
+    },
+    "required": ["path", "start_line", "end_line", "new_text"],
+}
+
 
 def list_files(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """列出某个目录下面一层的文件和子目录，不往下钻。
@@ -295,33 +321,13 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     内容都不会被读进来。
     """
 
-    def as_line_number(value: Any, name: str) -> int | None:
-        """把模型给的行号参数转成整数；没给（None）就返回 None。
-
-        校验得严一点。直接 int() 的话，模型传 0（以为是从 0 数起）会被悄悄当成第 1 行、
-        传 "abc" 只会得到一句 invalid literal for int()——两种都太含糊，模型都不知道
-        自己错在哪。布尔值也要挡：bool 是 int 的子类，放进去 True 就成了第 1 行。
-        浮点也不收：int(2.7) 会静默截成 2，一样是把错误藏起来。
-        """
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, (int, str)):
-            raise ValueError(f"{name} 得是整数，收到的是 {type(value).__name__}：{value!r}")
-        try:
-            number = int(value)
-        except ValueError:
-            raise ValueError(f"{name} 得是整数，收到的是 {value!r}") from None
-        if number < 1:
-            raise ValueError(f"{name} 从 1 数起，不能是 {number}")
-        return number
-
     def slice_lines(text: str, start_line: Any, end_line: Any) -> str:
         """按行号切一段。行号从 1 数起，两头都含。"""
         lines = text.splitlines()
         total = len(lines)
 
-        asked_start = as_line_number(start_line, "start_line")
-        asked_end = as_line_number(end_line, "end_line")
+        asked_start = None if start_line is None else _line_number(start_line, "start_line")
+        asked_end = None if end_line is None else _line_number(end_line, "end_line")
         start = 1 if asked_start is None else asked_start
 
         # 只拿用户自己给的数比。没给 end_line 的时候不能拿"文件末尾"去跟 start 比——
@@ -451,6 +457,74 @@ def edit_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     message = f"改了 {raw}（替换 {done} 处，文件现在 {len(updated.splitlines())} 行）。"
     if count > 1 and not replace_all:
         message += f" 注意：old_string 在文件里出现了 {count} 次，这次只替换了第一处。"
+    if saved is not None:
+        message += f" 原内容备份在 {saved.relative_to(root).as_posix()}。"
+    return message
+
+
+def replace_lines(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+    """按行号替换文件里的一段：换掉 start_line 到 end_line（两头都含）。
+
+    增删改都用它——new_text 比原来长就是在插内容，短就是在删，空串就是整段删掉。
+    和 edit_file 的分工：那个按内容找位置（适合"把某个东西改掉"），这个按行号定位
+    （适合"把这几行换掉"，不用把原文一字不差地抄出来）。
+
+    end_line 可以等于 start_line - 1，那是个**空区间**：不替换任何行，只在这个位置插入。
+    在文件末尾追加就写 start_line = 总行数+1、end_line = 总行数。没有这个空区间的话，
+    想在文件头尾插内容就得把旁边那行原样重抄一遍——那正是它该替你省掉的事。
+
+    new_text 不是空的话会自动补一个换行。不补的话，拼出来的下一行会和它粘在一起
+    （变成 `新内容旧行` 一行）；补上才能保证它自己占整行。空串不补——那是"删掉这段"，
+    本来就没有内容需要占行。
+
+    写法和 edit_file 一样：整篇读进内存、在内存里拼好，再交给同一套（写临时文件、
+    核对状态、备份、原子顶替）。所以 read-before-write 那几道闸和它完全一致。
+    """
+    root = ctx.cwd.resolve()
+    raw = kwargs["path"]
+    new_text = kwargs["new_text"]
+    if not isinstance(new_text, str):
+        raise ValueError(f"new_text 得是字符串，收到的是 {type(new_text).__name__}。")
+
+    start = _line_number(kwargs["start_line"], "start_line")
+    end = _line_number(kwargs["end_line"], "end_line", minimum=0)
+
+    target = _checked_writable(root, raw)
+    if not target.exists():
+        raise FileNotFoundError(
+            f"{raw!r} 不存在。replace_lines 只改已有的文件，新建用 write_file。"
+        )
+    if not target.is_file():
+        raise ValueError(f"{raw!r} 不是普通文件（可能是管道、设备文件之类），改不了。")
+
+    current, _ = _read_text(target, raw)
+    # keepends=True：每行连自己的换行一起留着，这样区间外的内容能原样拼回去，
+    # 不会因为我们重新拼一遍就把文件尾部的换行、或者 CRLF 之类的换行风格改掉。
+    lines = current.splitlines(keepends=True)
+    total = len(lines)
+
+    if start > total + 1:
+        raise ValueError(f"start_line({start}) 超出了文件：{raw!r} 一共 {total} 行。")
+    if end > total:
+        raise ValueError(f"end_line({end}) 超出了文件：{raw!r} 一共 {total} 行。")
+    if end < start - 1:
+        raise ValueError(f"end_line({end}) 比 start_line({start}) 小太多，这个范围不成立。")
+
+    body = new_text if not new_text or new_text.endswith("\n") else new_text + "\n"
+    updated = "".join(lines[: start - 1]) + body + "".join(lines[end:])
+
+    saved = _commit_change(root, target, raw, updated, True, ctx)
+
+    removed = max(0, end - start + 1)
+    added = len(body.splitlines())
+    if removed == 0:
+        what = f"在第 {start} 行前面插了 {added} 行"
+    elif added == 0:
+        what = f"删掉了第 {start}-{end} 行（{removed} 行）"
+    else:
+        what = f"第 {start}-{end} 行换成了 {added} 行"
+
+    message = f"改了 {raw}（{what}，文件现在 {len(updated.splitlines())} 行）。"
     if saved is not None:
         message += f" 原内容备份在 {saved.relative_to(root).as_posix()}。"
     return message
@@ -752,6 +826,29 @@ def _find_symlink(raw: str | Path, root: Path) -> Path | None:
         if current.is_symlink():
             return current
     return None
+
+
+def _line_number(value: Any, name: str, minimum: int = 1) -> int:
+    """把模型给的行号参数转成整数，低于 minimum 就报错。
+
+    校验得严一点。直接 int() 的话，模型传 0（以为是从 0 数起）会被悄悄当成第 1 行、
+    传 "abc" 只会得到一句 invalid literal for int()——两种都太含糊，模型都不知道
+    自己错在哪。布尔值也要挡：bool 是 int 的子类，放进去 True 就成了第 1 行。
+    浮点也不收：int(2.7) 会静默截成 2，一样是把错误藏起来。
+
+    minimum 默认是 1（行号从 1 数起）；只有"区间终点"这种允许空区间的场合才传 0。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{name} 得是整数，收到的是 {type(value).__name__}：{value!r}")
+    try:
+        number = int(value)
+    except ValueError:
+        raise ValueError(f"{name} 得是整数，收到的是 {value!r}") from None
+    if number < minimum:
+        if minimum == 0:
+            raise ValueError(f"{name} 不能是负数，收到的是 {number}")
+        raise ValueError(f"{name} 从 {minimum} 数起，不能是 {number}")
+    return number
 
 
 def _read_text(target: Path, raw: str) -> tuple[str, int]:
