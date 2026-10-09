@@ -334,6 +334,122 @@ class TestReadFile:
 
         assert read_file({"path": "app.py"}, ctx) == "print(1)"
 
+    def test_a_successful_read_is_recorded(self, project, ctx):
+        # 用 write_bytes 而不是 write_text：文本模式在 Windows 上会把 \n 翻成 \r\n，
+        # 磁盘上就多出字符来，这条测的正是"记的长度等于文件实际有多长"。
+        (project / "a.txt").write_bytes(b"hello\n")
+
+        read_file({"path": "a.txt"}, ctx)
+
+        mtime_ns, char_count = ctx.read_state.entries[(project / "a.txt").resolve()]
+        assert mtime_ns == (project / "a.txt").stat().st_mtime_ns
+        assert char_count == len("hello\n")
+
+    def test_an_unread_file_has_no_record(self, project, ctx):
+        (project / "a.txt").write_text("hello\n", encoding="utf-8")
+
+        assert (project / "a.txt").resolve() not in ctx.read_state.entries
+
+    def test_a_failed_read_records_nothing(self, project, ctx):
+        """读目录会抛错——那一次什么都没读到，不该留下"读过"的痕迹。"""
+        with pytest.raises(IsADirectoryError):
+            read_file({"path": "src"}, ctx)
+
+        assert ctx.read_state.entries == {}
+
+    def test_a_bad_line_range_records_nothing(self, project, ctx):
+        (project / "a.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="不成立"):
+            read_file({"path": "a.txt", "start_line": 3, "end_line": 1}, ctx)
+
+        assert ctx.read_state.entries == {}
+
+    def test_a_partial_read_records_the_whole_file_length(self, project, ctx):
+        """记的是整篇的长度，不是给模型的那一段——后面要拿它跟磁盘上的现状比。"""
+        (project / "a.txt").write_bytes(b"one\ntwo\nthree\n")
+
+        read_file({"path": "a.txt", "start_line": 2, "end_line": 2}, ctx)
+
+        assert ctx.read_state.entries[(project / "a.txt").resolve()][1] == len("one\ntwo\nthree\n")
+
+    def test_a_second_read_updates_the_record(self, project, ctx):
+        (project / "a.txt").write_text("hello\n", encoding="utf-8")
+        read_file({"path": "a.txt"}, ctx)
+        before = ctx.read_state.entries[(project / "a.txt").resolve()]
+
+        (project / "a.txt").write_text("hello world\n", encoding="utf-8")
+        read_file({"path": "a.txt"}, ctx)
+
+        assert ctx.read_state.entries[(project / "a.txt").resolve()] != before
+
+    def test_the_record_is_keyed_by_the_resolved_path(self, project, ctx):
+        """后面改文件的工具也会把路径解析一遍，键必须是解析后的绝对路径才对得上。"""
+        (project / "src" / "b.py").write_text("x\n", encoding="utf-8")
+
+        read_file({"path": "src/../src/b.py"}, ctx)
+
+        assert (project / "src" / "b.py").resolve() in ctx.read_state.entries
+
+    def test_a_zero_line_number_is_rejected(self, project, ctx):
+        """行号从 1 数起。以前 0 会被悄悄当成第 1 行，模型不会知道自己数错了。"""
+        (project / "a.txt").write_bytes(b"one\ntwo\n")
+
+        with pytest.raises(ValueError, match="从 1 数起"):
+            read_file({"path": "a.txt", "start_line": 0}, ctx)
+
+    def test_a_negative_line_number_is_rejected(self, project, ctx):
+        (project / "a.txt").write_bytes(b"one\ntwo\n")
+
+        with pytest.raises(ValueError, match="从 1 数起"):
+            read_file({"path": "a.txt", "end_line": -3}, ctx)
+
+    def test_a_non_numeric_line_number_is_rejected(self, project, ctx):
+        (project / "a.txt").write_bytes(b"one\ntwo\n")
+
+        with pytest.raises(ValueError, match="得是整数"):
+            read_file({"path": "a.txt", "start_line": "abc"}, ctx)
+
+    def test_a_float_line_number_is_rejected(self, project, ctx):
+        """int(2.7) 会静默截成 2——那一样是把错误藏起来。"""
+        (project / "a.txt").write_bytes(b"one\ntwo\nthree\n")
+
+        with pytest.raises(ValueError, match="得是整数"):
+            read_file({"path": "a.txt", "start_line": 2.7}, ctx)
+
+    def test_a_boolean_line_number_is_rejected(self, project, ctx):
+        """bool 是 int 的子类，不挡的话 True 会变成第 1 行。"""
+        (project / "a.txt").write_bytes(b"one\ntwo\n")
+
+        with pytest.raises(ValueError, match="得是整数"):
+            read_file({"path": "a.txt", "start_line": True}, ctx)
+
+    def test_a_numeric_string_is_still_accepted(self, project, ctx):
+        """模型偶尔会把数字包成字符串，这个不用为难它。"""
+        (project / "a.txt").write_bytes(b"one\ntwo\nthree\n")
+
+        assert read_file({"path": "a.txt", "start_line": "3"}, ctx).startswith("three")
+
+    def test_a_file_changed_while_reading_is_reported(self, project, ctx, monkeypatch):
+        """读到一半文件被改了：手上这份可能是撕裂的，必须报错，也不能记下"读过"。"""
+        target = project / "a.txt"
+        target.write_bytes(b"one\ntwo\n")
+
+        real_open = Path.open
+
+        def open_then_touch(self, *args, **kwargs):
+            handle = real_open(self, *args, **kwargs)
+            # 模拟"打开之后、读完之前，别人动了这个文件"
+            bumped = self.stat().st_mtime_ns + 1_000_000_000
+            os.utime(self, ns=(bumped, bumped))
+            return handle
+
+        monkeypatch.setattr(Path, "open", open_then_touch)
+
+        with pytest.raises(ValueError, match="读的过程中被改过"):
+            read_file({"path": "a.txt"}, ctx)
+        assert ctx.read_state.entries == {}
+
 
 class TestGlob:
     def test_star_lists_everything_sorted(self, project, ctx):

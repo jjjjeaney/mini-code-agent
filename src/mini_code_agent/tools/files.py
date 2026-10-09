@@ -237,20 +237,41 @@ def project_tree(kwargs: dict[str, Any], ctx: ToolContext) -> str:
 def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """读一个文本文件，可以只读其中一段。
 
-    start_line / end_line 从 1 数起、两头都含。分段读长文件就靠它：先读一段，看
-    末尾注明的"共 N 行"决定下一段从哪开始。
+    start_line / end_line 从 1 数起、两头都含，得是 ≥1 的整数。分段读长文件就靠它：
+    先读一段，看末尾注明的"共 N 行"决定下一段从哪开始。
 
     检查顺序是有讲究的：先判类型和大小（便宜，而且能挡住大文件），再开文件嗅一下
     是不是文本，最后才解码。任何一步不通过，内容都不会被读进来。
     """
+
+    def as_line_number(value: Any, name: str) -> int | None:
+        """把模型给的行号参数转成整数；没给（None）就返回 None。
+
+        校验得严一点。直接 int() 的话，模型传 0（以为是从 0 数起）会被悄悄当成第 1 行、
+        传 "abc" 只会得到一句 invalid literal for int()——两种都太含糊，模型都不知道
+        自己错在哪。布尔值也要挡：bool 是 int 的子类，放进去 True 就成了第 1 行。
+        浮点也不收：int(2.7) 会静默截成 2，一样是把错误藏起来。
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ValueError(f"{name} 得是整数，收到的是 {type(value).__name__}：{value!r}")
+        try:
+            number = int(value)
+        except ValueError:
+            raise ValueError(f"{name} 得是整数，收到的是 {value!r}") from None
+        if number < 1:
+            raise ValueError(f"{name} 从 1 数起，不能是 {number}")
+        return number
 
     def slice_lines(text: str, start_line: Any, end_line: Any) -> str:
         """按行号切一段。行号从 1 数起，两头都含。"""
         lines = text.splitlines()
         total = len(lines)
 
-        start = max(1, int(start_line or 1))
-        asked_end = None if end_line is None else int(end_line)
+        asked_start = as_line_number(start_line, "start_line")
+        asked_end = as_line_number(end_line, "end_line")
+        start = 1 if asked_start is None else asked_start
 
         # 只拿用户自己给的数比。没给 end_line 的时候不能拿"文件末尾"去跟 start 比——
         # 那样"读一个 2 行文件的第 50 行"会报成范围不成立，而真正的原因是文件没那么长。
@@ -285,6 +306,10 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     # 大小先卡住：后面要把整个文件读进内存再解码，先截流比先撑爆强。
     ensure_within_size(target)
 
+    # 读之前先量一次 mtime。不能在记的时候才 stat——那样拿到的是"记录那一刻"的时间戳，
+    # 而内容属于更早的版本，两者一错开，守卫就会以为模型看到的是磁盘上最新的东西。
+    mtime_ns = target.stat().st_mtime_ns
+
     with target.open("rb") as fh:
         sample = fh.read(SNIFF_BYTES)
         if not ensure_text_file(sample):
@@ -294,6 +319,11 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
         fh.seek(0)
         data = fh.read()
 
+    # 读完再量一次。两次不一样，说明读的过程中有人动过这个文件，手上这份可能是撕裂的。
+    # 报错让模型重读，绝不能记下"读过"。
+    if target.stat().st_mtime_ns != mtime_ns:
+        raise ValueError(f"{raw!r} 在读的过程中被改过了，这次拿到的内容不一定完整，请重读一次。")
+
     try:
         text = data.decode(encoding)
     except UnicodeDecodeError as exc:
@@ -301,7 +331,16 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
             f"{raw!r} 不是 {encoding} 编码（可能是 GBK 之类），没法当文本读。"
         ) from exc
 
-    return truncate_text(slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line")))
+    body = truncate_text(slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line")))
+
+    # 读成功了才记：路径 -> (读之前的 mtime, 整篇的长度)。
+    # 长度记的是**整篇**，不是返回给模型的那一段——后面改文件的工具要拿它跟磁盘上的现状
+    # 比，两边都得是"文件自己的属性"，掺进"模型看到多少"就没法比了。
+    # 放在 slice_lines 后面是有意的：行号范围写反会抛错，那一次模型什么都没拿到，
+    # 不该留下"读过"的痕迹。
+    ctx.read_state.record(target, text, mtime_ns)
+
+    return body
 
 
 def glob(kwargs: dict[str, Any], ctx: ToolContext) -> str:

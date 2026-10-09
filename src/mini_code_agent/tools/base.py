@@ -10,6 +10,19 @@ from typing import Any
 
 
 @dataclass
+class ReadFileState:
+    # path -> (mtime_ns, char_count)。Day 4 的 read-before-edit 要靠它判断
+    # "模型读过这个文件之后，文件在磁盘上是不是又被改过"。今天先只做记录。
+    entries: dict[Path, tuple[int, int]] = field(default_factory=dict)
+
+    def record(self, path: Path, content: str, mtime_ns: int) -> None:
+        # mtime_ns 由调用方在**读之前**量好传进来，这里不再自己去 stat。
+        # 让这里 stat 的话，取到的是"记录那一刻"的时间戳，而 content 属于更早的版本——
+        # 两者一错开，读-before-改的守卫就会以为模型看到的就是磁盘上最新的东西，
+        # 而它要防的恰恰就是这一类错位。
+        self.entries[path] = (mtime_ns, len(content))
+
+@dataclass
 class ToolContext:
     """调用工具时的运行环境。
 
@@ -20,6 +33,7 @@ class ToolContext:
     """
 
     cwd: Path
+    read_state: ReadFileState=field(default_factory=ReadFileState)
 
 
 @dataclass
