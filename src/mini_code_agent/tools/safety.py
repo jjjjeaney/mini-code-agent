@@ -39,7 +39,7 @@ EXCLUDED_FILES = {
 
 # 敏感文件靠整名列举必然漏——.env.staging、.env.bak、deploy.key 是数不完的。
 # 用通配兜住整个家族。代价是 .env.example 这类模板也会被滤掉，不过那是安全的方向。
-EXCLUDED_FILE_PATTERNS = (
+SENSITIVE_FILE_PATTERNS = (
     ".env*",
     "*.pem",
     "*.key",
@@ -55,6 +55,10 @@ EXCLUDED_FILE_PATTERNS = (
     ".pypirc",
     ".git-credentials",
 )
+
+# 敏感目录：里面的东西一律不给读。.git 单列出来，是因为它的 config 里经常嵌着
+# 带 token 的 remote URL——那是很常见的一种泄露。
+SENSITIVE_DIRS = {".git", ".ssh", ".aws", ".gnupg"}
 
 class OutOfSandboxError(Exception):
     """模型要访问的路径落在了允许的目录之外。
@@ -76,6 +80,13 @@ class UndecodableTextError(Exception):
 
     和 NotTextFileError 分开是有意的：那个是"根本不是文字"，这个是"是文字，只是读法
     不对"。模型看到之后该做的事不一样——前者该换个文件，后者该换个编码。
+    """
+
+
+class SensitiveFileError(Exception):
+    """这个文件碰不得——里面可能装着密钥、token 或凭据。
+
+    由调用方在 is_sensitive 判真时抛。拦在读之前，内容根本不会被读进来。
     """
 
 
@@ -186,7 +197,24 @@ def should_skip(path: Path) -> bool:
     if path.is_dir():
         return name in EXCLUDED_DIRS
     return name in EXCLUDED_FILES or any(
-        fnmatchcase(name, pattern) for pattern in EXCLUDED_FILE_PATTERNS
+        fnmatchcase(name, pattern) for pattern in SENSITIVE_FILE_PATTERNS
+    )
+
+
+def is_sensitive(path: Path) -> bool:
+    """这个路径碰不碰得——里面可能装着密钥、token 或凭据。
+
+    和 should_skip 的区别就是它存在的理由：那个管"列目录时藏不藏"，这个管"连读都不许"。
+    噪音文件（.coverage 之类）该藏但不该拦，所以两个判断不能合并成一个。
+
+    看路径的**每一段**，不只是文件名：`.git/config` 里可能嵌着带 token 的 remote URL，
+    而它的文件名 `config` 本身看不出任何问题——只看最后一段会漏掉。
+    """
+    if any(part.lower() in SENSITIVE_DIRS for part in path.parts[:-1]):
+        return True
+    name = path.name.lower()
+    return name in SENSITIVE_DIRS or any(
+        fnmatchcase(name, pattern) for pattern in SENSITIVE_FILE_PATTERNS
     )
 
 

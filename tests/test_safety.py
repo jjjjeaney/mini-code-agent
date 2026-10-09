@@ -11,6 +11,7 @@ from mini_code_agent.tools.safety import (
     MAX_TEXT_CHARS,
     detect_encoding,
     ensure_text_file,
+    is_sensitive,
     is_within,
     resolve_within,
     should_skip,
@@ -253,3 +254,42 @@ class TestShouldSkip:
         (tmp_path / "build").write_text("#!/bin/sh\n", encoding="utf-8")
 
         assert should_skip(tmp_path / "build") is False
+
+
+class TestIsSensitive:
+    """纯判定，只看路径分量，不用起临时文件。"""
+
+    def test_env_is_sensitive(self):
+        assert is_sensitive(Path(".env")) is True
+
+    def test_env_variants_are_sensitive(self):
+        assert is_sensitive(Path(".env.production")) is True
+        assert is_sensitive(Path("config/.env.staging")) is True
+
+    def test_key_and_credential_files_are_sensitive(self):
+        for name in ("server.pem", "id_rsa", "deploy.key", "credentials.json", ".npmrc"):
+            assert is_sensitive(Path(name)) is True
+
+    def test_a_file_inside_git_is_sensitive(self):
+        """`.git/config` 里可能嵌着带 token 的 remote URL，而文件名 config 本身没毛病。
+
+        所以判的是路径的每一段，不只是最后一段。
+        """
+        assert is_sensitive(Path(".git/config")) is True
+        assert is_sensitive(Path(".git/objects/ab/cdef")) is True
+
+    def test_normal_source_files_are_not_sensitive(self):
+        for name in ("main.py", "README.md", "pyproject.toml", "src/core/agent.py"):
+            assert is_sensitive(Path(name)) is False
+
+    def test_noise_files_are_not_sensitive(self):
+        """噪音文件该从列表里藏起来，但不该拦住读——这正是它和 should_skip 的分工。"""
+        assert is_sensitive(Path(".coverage")) is False
+        assert is_sensitive(Path("Thumbs.db")) is False
+
+    def test_case_is_ignored(self):
+        assert is_sensitive(Path(".ENV")) is True
+        assert is_sensitive(Path(".Git/config")) is True
+
+    def test_an_empty_path_is_not_sensitive(self):
+        assert is_sensitive(Path(".")) is False
