@@ -6,7 +6,7 @@ import pytest
 
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.providers.base import ModelResponse, ToolCall
-from mini_code_agent.tools import Tool, ToolRegistry, default_tools
+from mini_code_agent.tools import Tool, ToolContext, ToolRegistry, default_tools
 
 ADD_SCHEMA = {
     "type": "object",
@@ -15,8 +15,9 @@ ADD_SCHEMA = {
 }
 
 
-def add(a: int, b: int) -> int:
-    return a + b
+# 工具函数现在收两样：模型给的参数字典，和一个 ToolContext。
+def add(kwargs: dict, ctx: ToolContext) -> int:
+    return kwargs["a"] + kwargs["b"]
 
 
 class ScriptedProvider:
@@ -82,7 +83,8 @@ def test_trace_renders_the_call_its_result_and_the_final_answer(registry):
 
 
 def test_no_argument_call_and_structured_result_are_rendered():
-    registry = ToolRegistry([Tool(name="ls", description="列目录", fn=lambda: ["a.py", "b.py"])])
+    tool = Tool(name="ls", description="列目录", fn=lambda kwargs, ctx: ["a.py", "b.py"])
+    registry = ToolRegistry([tool])
     provider = ScriptedProvider([tool_turn("toolu_1", "ls", {}), text_turn("两个文件")])
 
     result = runagent("列一下", provider, registry)

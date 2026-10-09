@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from mini_code_agent.providers.base import ToolCall
-from mini_code_agent.tools import Tool, ToolRegistry, ToolResult, default_tools, web
+from mini_code_agent.tools import (
+    Tool,
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    default_tools,
+    web,
+)
 from mini_code_agent.tools.builtin import echo as builtin_echo
 
 ADD_SCHEMA = {
@@ -17,20 +25,26 @@ ADD_SCHEMA = {
 }
 
 
-def add(a: int, b: int) -> int:
-    return a + b
+# 工具函数现在收两样：模型给的参数字典，和一个 ToolContext。
+def add(kwargs: dict, ctx: ToolContext) -> int:
+    return kwargs["a"] + kwargs["b"]
 
 
-def boom() -> str:
+def boom(kwargs: dict, ctx: ToolContext) -> str:
     raise RuntimeError("工具内部炸了")
 
 
-def echo(payload: dict | None = None) -> dict:
-    return payload or {}
+def echo(kwargs: dict, ctx: ToolContext) -> dict:
+    return kwargs.get("payload") or {}
 
 
 def make_add() -> Tool:
     return Tool(name="add", description="把两个整数相加", fn=add, params=ADD_SCHEMA)
+
+
+@pytest.fixture
+def ctx(tmp_path: Path) -> ToolContext:
+    return ToolContext(cwd=tmp_path)
 
 
 @pytest.fixture
@@ -53,7 +67,7 @@ class TestTool:
         }
 
     def test_missing_params_becomes_empty_object_schema(self):
-        tool = Tool(name="now", description="返回当前时间", fn=lambda: "now")
+        tool = Tool(name="now", description="返回当前时间", fn=lambda kwargs, ctx: "now")
         assert tool.to_anthropic_schema()["input_schema"] == {
             "type": "object",
             "properties": {},
@@ -61,7 +75,7 @@ class TestTool:
         }
 
     def test_missing_description_is_omitted_instead_of_sent_as_null(self):
-        tool = Tool(name="now", fn=lambda: "now")
+        tool = Tool(name="now", fn=lambda kwargs, ctx: "now")
         assert "description" not in tool.to_anthropic_schema()
 
     def test_empty_name_is_rejected(self):
@@ -109,43 +123,59 @@ class TestToolRegistry:
         with pytest.raises(ValueError, match="已经注册过"):
             registry.register(make_add())
 
-    def test_run_calls_the_underlying_function(self, registry):
-        assert registry.run("add", {"a": 2, "b": 3}) == 5
+    def test_run_calls_the_underlying_function(self, registry, ctx):
+        assert registry.run(ctx, "add", {"a": 2, "b": 3}) == 5
 
-    def test_run_without_arguments(self, registry):
-        assert registry.run("echo") == {}
+    def test_run_without_arguments(self, registry, ctx):
+        assert registry.run(ctx, "echo") == {}
 
-    def test_run_unknown_tool_raises_key_error(self, registry):
+    def test_run_unknown_tool_raises_key_error(self, registry, ctx):
         with pytest.raises(KeyError, match="nope"):
-            registry.run("nope")
+            registry.run(ctx, "nope")
+
+    def test_run_rejects_a_missing_required_argument(self, registry, ctx):
+        """缺必填参数要在派发前就拦住。
+
+        放过去的话工具会拿着 None 悄悄跑完，模型收到一个看起来正常的结果，还以为
+        自己成功了——它本来能收到一句"你少传了什么"然后自己改对。
+        """
+        with pytest.raises(ValueError, match="缺少必填参数"):
+            registry.run(ctx, "add", {"a": 1})
 
     def test_schemas_lists_every_tool(self, registry):
         assert [schema["name"] for schema in registry.schemas()] == ["add", "boom", "echo"]
 
-    def test_dispatch_wraps_the_return_value_in_a_tool_result(self, registry):
+    def test_dispatch_wraps_the_return_value_in_a_tool_result(self, registry, ctx):
         call = ToolCall(id="toolu_1", name="add", arguments={"a": 1, "b": 2})
 
-        result = registry.dispatch(call)
+        result = registry.dispatch(ctx, call)
 
         assert result == ToolResult(id="toolu_1", name="add", result=3)
         assert result.to_anthropic_block()["content"] == "3"
 
-    def test_dispatch_turns_tool_errors_into_results(self, registry):
-        result = registry.dispatch(ToolCall(id="toolu_3", name="boom", arguments={}))
+    def test_dispatch_turns_tool_errors_into_results(self, registry, ctx):
+        result = registry.dispatch(ctx, ToolCall(id="toolu_3", name="boom", arguments={}))
 
         assert result.is_error is True
         assert "RuntimeError" in result.result
 
-    def test_dispatch_unknown_tool_is_a_result_not_an_exception(self, registry):
-        result = registry.dispatch(ToolCall(id="toolu_4", name="nope", arguments={}))
+    def test_dispatch_unknown_tool_is_a_result_not_an_exception(self, registry, ctx):
+        result = registry.dispatch(ctx, ToolCall(id="toolu_4", name="nope", arguments={}))
 
         assert result.is_error is True
         assert "KeyError" in result.result
 
+    def test_dispatch_hands_a_missing_argument_back_to_the_model(self, registry, ctx):
+        """缺参数和工具自己抛错走的是同一条路：变成 is_error 的结果交回模型。"""
+        result = registry.dispatch(ctx, ToolCall(id="toolu_5", name="add", arguments={"a": 1}))
+
+        assert result.is_error is True
+        assert "缺少必填参数" in result.result
+
 
 class TestBuiltinEcho:
-    def test_prints_the_text_and_returns_a_confirmation(self, capsys):
-        result = builtin_echo("你好")
+    def test_prints_the_text_and_returns_a_confirmation(self, ctx, capsys):
+        result = builtin_echo({"text": "你好"}, ctx)
 
         assert capsys.readouterr().out == "你好\n"
         assert "你好" in result
@@ -153,7 +183,15 @@ class TestBuiltinEcho:
 
 class TestDefaultTools:
     def test_registers_the_builtin_tools(self):
-        assert [tool.name for tool in default_tools().list()] == ["echo", "web_search"]
+        assert [tool.name for tool in default_tools().list()] == [
+            "echo",
+            "list_files",
+            "project_tree",
+            "read_file",
+            "glob",
+            "grep",
+            "web_search",
+        ]
 
     def test_echo_schema_requires_text(self):
         schema = default_tools().schemas()[0]
@@ -164,8 +202,8 @@ class TestDefaultTools:
     def test_each_call_returns_a_fresh_registry(self):
         assert default_tools() is not default_tools()
 
-    def test_echo_runs_through_the_registry(self, capsys):
-        default_tools().run("echo", {"text": "hi"})
+    def test_echo_runs_through_the_registry(self, ctx, capsys):
+        default_tools().run(ctx, "echo", {"text": "hi"})
 
         assert capsys.readouterr().out == "hi\n"
 
@@ -193,7 +231,7 @@ def fake_tavily(monkeypatch) -> FakeTavilyClient:
 
 
 class TestWebSearch:
-    def test_formats_title_url_and_snippet(self, fake_tavily):
+    def test_formats_title_url_and_snippet(self, fake_tavily, ctx):
         fake_tavily.response = {
             "results": [
                 {
@@ -206,13 +244,13 @@ class TestWebSearch:
             ]
         }
 
-        text = web.web_search("Leo Messi")
+        text = web.web_search({"query": "Leo Messi"}, ctx)
 
         assert "[1] Lionel Messi - Wikipedia" in text
         assert "https://en.wikipedia.org/wiki/Lionel_Messi" in text
         assert "Argentine footballer." in text
 
-    def test_drops_the_noise_tavily_returns(self, fake_tavily):
+    def test_drops_the_noise_tavily_returns(self, fake_tavily, ctx):
         fake_tavily.response = {
             "request_id": "abc",
             "response_time": 1.23,
@@ -220,23 +258,23 @@ class TestWebSearch:
             "results": [{"title": "t", "url": "u", "content": "c"}],
         }
 
-        text = web.web_search("x")
+        text = web.web_search({"query": "x"}, ctx)
 
         assert "abc" not in text
         assert "nope.jpg" not in text
 
-    def test_passes_query_and_max_results_to_tavily(self, fake_tavily):
-        web.web_search("python 3.13", max_results=3)
+    def test_passes_query_and_max_results_to_tavily(self, fake_tavily, ctx):
+        web.web_search({"query": "python 3.13", "max_results": 3}, ctx)
 
         assert fake_tavily.calls == [{"query": "python 3.13", "max_results": 3}]
 
-    def test_clamps_max_results_to_the_cap(self, fake_tavily):
-        web.web_search("x", max_results=999)
+    def test_clamps_max_results_to_the_cap(self, fake_tavily, ctx):
+        web.web_search({"query": "x", "max_results": 999}, ctx)
 
         assert fake_tavily.calls[0]["max_results"] == web.MAX_RESULTS_LIMIT
 
-    def test_says_so_when_nothing_matched(self, fake_tavily):
-        assert "没有搜到" in web.web_search("绝不可能存在的词")
+    def test_says_so_when_nothing_matched(self, fake_tavily, ctx):
+        assert "没有搜到" in web.web_search({"query": "绝不可能存在的词"}, ctx)
 
     def test_missing_api_key_gives_an_actionable_error(self, monkeypatch):
         monkeypatch.delenv("TAVILY_API_KEY", raising=False)
@@ -244,11 +282,11 @@ class TestWebSearch:
         with pytest.raises(RuntimeError, match="TAVILY_API_KEY"):
             web._client()
 
-    def test_client_transport_error_reaches_the_model_as_a_result(self, fake_tavily):
+    def test_client_transport_error_reaches_the_model_as_a_result(self, fake_tavily, ctx):
         fake_tavily.error = RuntimeError("rate limited")
 
         result = default_tools().dispatch(
-            ToolCall(id="t1", name="web_search", arguments={"query": "x"})
+            ctx, ToolCall(id="t1", name="web_search", arguments={"query": "x"})
         )
 
         assert result.is_error is True
