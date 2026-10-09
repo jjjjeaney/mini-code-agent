@@ -9,9 +9,13 @@ from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
 from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
 from mini_code_agent.tools.files import (
+    GLOB_SCHEMA,
+    GREP_SCHEMA,
     LIST_FILES_SCHEMA,
     PROJECT_TREE_SCHEMA,
     READ_FILE_SCHEMA,
+    glob,
+    grep,
     list_files,
     project_tree,
     read_file,
@@ -116,6 +120,25 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_file,
                 params=READ_FILE_SCHEMA,
+            ),
+            Tool(
+                name="glob",
+                description=(
+                    "按文件名或路径模式递归查找文件和目录。"
+                    "想知道某类文件都在哪儿时用它，比逐个目录 list_files 快；"
+                    "返回的路径可以直接拿去读。"
+                ),
+                fn=glob,
+                params=GLOB_SCHEMA,
+            ),
+            Tool(
+                name="grep",
+                description=(
+                    "按内容搜索，返回每条匹配的文件、行号和那一行。"
+                    "找某个函数、变量、字符串在哪儿定义或使用时用它，比逐个文件读快。"
+                ),
+                fn=grep,
+                params=GREP_SCHEMA,
             ),
             Tool(
                 name="web_search",

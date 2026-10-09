@@ -2,21 +2,26 @@
 
 路径一律先过 safety 的围栏：解析、判越界、再决定要不要碰文件系统。
 
-三个工具各自成一体：每个工具用到的小函数都定义在它自己里面，读一个函数就能读懂
-一个工具。唯一的例外是文件最底下那两个（`_checked_path` 和 `_children`），它们被
-多个工具共用，留在模块这一层，理由写在那儿。
-"""
+每个工具各自成一体：它用到的小函数都定义在它自己里面，读一个函数就能读懂一个工具。
+唯一的例外是文件最底下那两个（`_checked_path` 和 `_children`），它们被多个工具共用，
+留在模块这一层，理由写在那儿。"""
 
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import subprocess
 from collections import deque
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from mini_code_agent.tools.base import ToolContext
 from mini_code_agent.tools.safety import (
+    EXCLUDED_DIRS,
+    EXCLUDED_FILES,
+    SENSITIVE_FILE_PATTERNS,
     NotTextFileError,
     OutOfSandboxError,
     SensitiveFileError,
@@ -33,6 +38,9 @@ from mini_code_agent.tools.safety import (
 
 DEFAULT_MAX_DEPTH = 5
 DEFAULT_MAX_NODES = 200
+
+# grep 最多返回多少条匹配。一条匹配就是一行，不设上限的话搜个 "e" 能把上下文塞满。
+MAX_GREP_MATCHES = 200
 
 # 判文本还是二进制，只看开头这么多字节。git 判断二进制用的也是这个量级。
 SNIFF_BYTES = 8192
@@ -80,6 +88,44 @@ PROJECT_TREE_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [],
+}
+
+GLOB_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "pattern": {
+            "type": "string",
+            "description": (
+                "匹配模式，相对项目根目录。不含 / 时按文件名在整个项目里递归找，"
+                "比如 *.py；含 / 时按相对路径匹配，比如 src/*.py。"
+                "支持 *（不跨目录）、**（跨任意层）和 ?。"
+            ),
+        },
+    },
+    "required": ["pattern"],
+}
+
+GREP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "pattern": {
+            "type": "string",
+            "description": "要搜的内容，可以是普通文本也可以是正则表达式",
+        },
+        "path": {
+            "type": "string",
+            "description": "搜哪个目录或文件，相对项目根目录，默认整个项目",
+        },
+        "glob": {
+            "type": "string",
+            "description": "限定只搜哪类文件，比如 *.py。省略就是所有文本文件",
+        },
+        "ignore_case": {
+            "type": "boolean",
+            "description": "是否忽略大小写，默认 false",
+        },
+    },
+    "required": ["pattern"],
 }
 
 
@@ -258,7 +304,264 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     return truncate_text(slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line")))
 
 
-# ——— 下面两个是三个工具共用的，所以没嵌进任何一个工具里 ———
+def glob(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+    """按文件名或路径模式，递归查找项目里的文件和目录。
+
+    模式里不含 `/` 时按文件名匹配、整棵树递归找——`*.py` 找得到 src/core/agent.py；
+    含 `/` 时按相对路径匹配。要跨层就用 `**`。
+
+    匹配用的是 `_compile_glob`（和 grep 共用同一套 glob 语义，所以两个工具不会各说各话）。
+    匹配对象是相对路径，结果按构造就不可能跑出 cwd——`..` 和绝对路径压根匹配不上任何东西。
+    """
+
+    def collect(directory: Path, relative: PurePosixPath) -> None:
+        """递归走一遍，边走边挑。"""
+        for name, is_dir, is_symlink in _children(directory):
+            child = relative / name
+            if matcher.match(child.as_posix()):
+                found.append((child, is_dir))
+            # 不跟进符号链接：链成环会走不完。
+            if is_dir and not is_symlink:
+                collect(directory / name, child)
+
+    root = ctx.cwd.resolve()
+    pattern = (kwargs["pattern"] or "").strip()
+    if not pattern:
+        raise ValueError("pattern 不能为空。想找所有文件可以写 *。")
+
+    # 这两种写法匹配不上任何相对路径。与其返回空结果让人猜，不如直接说清楚。
+    if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+        raise ValueError(f"模式 {pattern!r} 要相对项目根目录写，不能用绝对路径，也不能有 ..。")
+
+    matcher = _compile_glob(pattern)
+
+    found: list[tuple[PurePosixPath, bool]] = []
+    collect(root, PurePosixPath("."))
+    if not found:
+        return f"没有匹配 {pattern!r} 的文件或目录。"
+
+    found.sort(key=lambda item: item[0].as_posix().lower())
+    lines = [f"{path.as_posix()}{'/' if is_dir else ''}" for path, is_dir in found]
+    return truncate_text("\n".join(lines))
+
+
+def grep(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+    """按内容搜索，返回每条匹配的位置：`文件:行号:那一行`。
+
+    优先用 ripgrep，找不到就纯 Python 整棵树走一遍。两条路共用同一套跳过规则和同一种
+    glob 语义，所以换不换 rg，结果应该一致。
+
+    pattern 按正则处理（跟 rg 一样）。**这个工具会读到文件内容，所以敏感文件的过滤放在
+    结果这一层**——不管 rg 认不认那套排除规则，最后都从结果里剔掉。
+    """
+
+    def rg_excludes() -> list[str]:
+        """把跳过规则翻译成 rg 的 --glob 排除项。
+
+        这只影响速度和"要不要真去读那个文件"，正确性由 keep() 保证。两件事分开写，
+        免得以后有人以为光靠这个就够了。
+        """
+        args: list[str] = []
+        for name in sorted(EXCLUDED_DIRS):
+            args += ["--glob", f"!**/{name}/**"]
+        for name in sorted(EXCLUDED_FILES) + list(SENSITIVE_FILE_PATTERNS):
+            args += ["--glob", f"!**/{name}"]
+        return args
+
+    def run_rg(exe: str) -> list[tuple[str, int, str]] | None:
+        """跑 rg 并解析输出。拉不起来、或 rg 自己出错（退出码 2）就返回 None 交给兜底。"""
+        nonlocal truncated
+
+        args = [
+            exe,
+            "--line-number",
+            "--with-filename",
+            "--no-heading",
+            "--color=never",
+            "--no-messages",
+            "--hidden",
+            "--no-ignore",
+        ]
+        if ignore_case:
+            args.append("--ignore-case")
+        if glob_pattern:
+            args += ["--glob", glob_pattern]
+        args += rg_excludes()
+        args += ["-e", pattern, target_arg]
+
+        # cwd 设成 root、目标传相对路径，这样 rg 吐出来的路径也是相对的：解析时按前两个
+        # 冒号切就行。要是传绝对路径，Windows 上那个盘符冒号会把切分带错位。
+        try:
+            process = subprocess.Popen(
+                args,
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return None
+
+        found: list[tuple[str, int, str]] = []
+        with process:
+            for raw in process.stdout or ():
+                if len(found) >= MAX_GREP_MATCHES:
+                    truncated = True
+                    process.kill()
+                    break
+                parts = raw.rstrip("\n").split(":", 2)
+                if len(parts) != 3 or not parts[1].isdigit():
+                    continue
+                # rg 在 Windows 上吐的是 `.\src\a.py`（反斜杠 + 点斜杠前缀）。统一成
+                # `src/a.py`：不然两条后端给出的路径长得不一样，而且反斜杠路径喂回别的
+                # 工具也难看。只在 Windows 上替换——Linux 上反斜杠是合法的文件名字符。
+                path = parts[0].replace("\\", "/") if os.name == "nt" else parts[0]
+                found.append((path.removeprefix("./"), int(parts[1]), parts[2]))
+            process.wait()
+        # rg 退出码 2 表示它自己出错（比如正则写坏了）。这时候空结果不是"没有匹配"，
+        # 得让纯 Python 那条路去跑，它会给出说得清楚的报错。
+        if not found and process.returncode not in (0, 1):
+            return None
+        return found
+
+    def scan(directory: Path, relative: PurePosixPath) -> None:
+        """纯 Python 兜底：整棵树走一遍，一个文件一个文件搜。"""
+        for name, is_dir, is_symlink in _children(directory):
+            if len(matches) >= MAX_GREP_MATCHES:
+                return
+            path = directory / name
+            child = relative / name
+            if is_dir:
+                # 不跟进符号链接：链成环会走不完。
+                if not is_symlink:
+                    scan(path, child)
+                continue
+            if matcher is not None and not matcher.match(child.as_posix()):
+                continue
+            search_in(path)
+
+    def search_in(path: Path) -> None:
+        try:
+            ensure_within_size(path)
+        except ValueError:
+            return  # 太大的跳过，不为一个文件中断整次搜索
+        with path.open("rb") as fh:
+            sample = fh.read(SNIFF_BYTES)
+            if not ensure_text_file(sample):
+                return  # 二进制跳过
+            fh.seek(0)
+            data = fh.read()
+        try:
+            text = data.decode(detect_encoding(sample) or "utf-8")
+        except UnicodeDecodeError:
+            return  # 编码解不开也跳过——grep 不该因为一两个文件整体失败
+        for number, line in enumerate(text.splitlines(), start=1):
+            if regex.search(line):
+                matches.append((path.relative_to(root).as_posix(), number, line))
+                if len(matches) >= MAX_GREP_MATCHES:
+                    return
+
+    def keep(relative: str) -> bool:
+        """结果层的过滤：敏感文件和噪音文件一律不进结果。
+
+        rg 那条路的输出也要过这一道。它用的是自己的排除规则，而排除规则只管"搜不搜"，
+        管不了"搜到了也不许说"。这里是最后一道，也是唯一保证得住的一道。
+        """
+        path = root / relative
+        return not should_skip(path) and not is_sensitive(path)
+
+    root = ctx.cwd.resolve()
+    pattern = kwargs["pattern"]
+    if not pattern:
+        raise ValueError("pattern 不能为空。")
+
+    ignore_case = bool(kwargs.get("ignore_case"))
+    glob_pattern = (kwargs.get("glob") or "").strip()
+    matcher: re.Pattern[str] | None = None
+    if glob_pattern:
+        if Path(glob_pattern).is_absolute() or ".." in Path(glob_pattern).parts:
+            raise ValueError(
+                f"glob {glob_pattern!r} 要相对项目根目录写，不能用绝对路径，也不能有 ..。"
+            )
+        matcher = _compile_glob(glob_pattern)
+
+    try:
+        regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        raise ValueError(f"pattern 不是合法的正则表达式：{exc}") from exc
+
+    target = _checked_path(root, kwargs.get("path") or ".")
+    if not (target.is_dir() or target.is_file()):
+        raise ValueError(f"{target} 既不是目录也不是普通文件，搜不了。")
+    # 目标传相对路径给 rg，输出里的路径才会是相对的（见 run_rg 里的说明）。
+    target_arg = target.relative_to(root).as_posix()
+
+    matches: list[tuple[str, int, str]] = []
+    truncated = False
+
+    exe = shutil.which("rg")
+    outcome = run_rg(exe) if exe else None
+    if outcome is None:
+        scan(target, PurePosixPath("."))
+        truncated = len(matches) >= MAX_GREP_MATCHES
+    else:
+        # run_rg 返回的就是匹配列表本身；truncated 它是通过 nonlocal 直接改的。
+        matches = outcome
+
+    matches = [item for item in matches if keep(item[0])]
+    if not matches:
+        return f"没有找到包含 {pattern!r} 的地方。"
+
+    # 排一下序。两条后端吐出来的顺序本来不一样（rg 按自己的目录遍历，纯 Python 走的是
+    # 目录优先的深度优先），不排的话同一份代码换台机器结果顺序就变了。
+    matches.sort(key=lambda item: (item[0].lower(), item[1]))
+
+    body = "\n".join(f"{path}:{number}:{text}" for path, number, text in matches)
+    if truncated:
+        body += f"\n\n[已截断：匹配数到了上限 {MAX_GREP_MATCHES}，后面还有]"
+    return truncate_text(body)
+
+
+# ——— 下面是几个工具共用的，所以没嵌进任何一个工具里 ———
+
+
+def _compile_glob(pattern: str) -> re.Pattern[str]:
+    r"""把 glob 翻译成正则，锚在字符串开头。
+
+    `**/` 跨任意层（包括零层），`*` 和 `?` 都不跨 `/`。不含 `/` 的模式前面补一个 `**/`，
+    意思就是"在任意层找这个名字"——`*.py` 该匹配整棵树里所有 .py。
+
+    没用 pathlib 是因为 `PurePath.match` 拿模式尾部跟路径尾部对齐：
+    `PurePath("deep/src/cli.py").match("src/*.py")` 返回 True，那不是"相对某个目录"
+    的意思。实测见 tests/test_files.py 里那条对照用例。
+
+    glob 和 grep 共用这一份：两个工具必须对"*"是什么意思给出同一个答案。
+    """
+    plain = pattern.removeprefix("./")
+    if "/" not in plain:
+        plain = f"**/{plain}"
+
+    out: list[str] = []
+    index = 0
+    while index < len(plain):
+        if plain.startswith("**/", index):
+            out.append("(?:[^/]+/)*")
+            index += 3
+        elif plain.startswith("**", index):
+            out.append(".*")
+            index += 2
+        elif plain[index] == "*":
+            out.append("[^/]*")
+            index += 1
+        elif plain[index] == "?":
+            out.append("[^/]")
+            index += 1
+        else:
+            out.append(re.escape(plain[index]))
+            index += 1
+    return re.compile("".join(out) + r"\Z")
 
 
 def _checked_path(root: Path, raw: str | Path) -> Path:

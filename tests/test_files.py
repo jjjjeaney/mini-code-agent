@@ -8,7 +8,14 @@ from pathlib import Path
 import pytest
 
 from mini_code_agent.tools.base import ToolContext
-from mini_code_agent.tools.files import list_files, project_tree, read_file
+from mini_code_agent.tools.files import (
+    MAX_GREP_MATCHES,
+    glob,
+    grep,
+    list_files,
+    project_tree,
+    read_file,
+)
 from mini_code_agent.tools.safety import (
     MAX_READ_BYTES,
     MAX_TEXT_CHARS,
@@ -326,3 +333,228 @@ class TestReadFile:
         (project / "app.py").write_text("print(1)", encoding="utf-8")
 
         assert read_file({"path": "app.py"}, ctx) == "print(1)"
+
+
+class TestGlob:
+    def test_star_lists_everything_sorted(self, project, ctx):
+        assert glob({"pattern": "*"}, ctx) == "\n".join(
+            [
+                "README.md",
+                "src/",
+                "src/cli.py",
+                "src/core/",
+                "src/core/agent.py",
+            ]
+        )
+
+    def test_a_bare_name_matches_at_any_depth(self, project, ctx):
+        out = glob({"pattern": "*.py"}, ctx)
+
+        assert "src/cli.py" in out
+        assert "src/core/agent.py" in out
+
+    def test_a_pattern_with_a_slash_is_anchored_at_the_root(self, project, ctx):
+        assert glob({"pattern": "src/*.py"}, ctx) == "src/cli.py"
+
+    def test_it_does_not_match_a_deeper_tail_the_way_purepath_match_would(self, project, ctx):
+        """就是为了这条才自己写匹配的。
+
+        `PurePath("deep/src/cli.py").match("src/*.py")` 返回 True——它是拿模式尾部跟
+        路径尾部对齐的。那不符合"相对项目根目录"的意思，所以不能用它。
+        """
+        (project / "deep" / "src").mkdir(parents=True)
+        (project / "deep" / "src" / "cli.py").write_text("x", encoding="utf-8")
+
+        assert glob({"pattern": "src/*.py"}, ctx) == "src/cli.py"
+
+    def test_double_star_crosses_levels(self, project, ctx):
+        assert glob({"pattern": "src/**/*.py"}, ctx) == "src/cli.py\nsrc/core/agent.py"
+
+    def test_a_bare_name_finds_a_directory_too(self, project, ctx):
+        assert glob({"pattern": "src"}, ctx) == "src/"
+
+    def test_question_mark_matches_exactly_one_character(self, project, ctx):
+        assert glob({"pattern": "cli.p?"}, ctx) == "src/cli.py"
+
+    def test_a_leading_dot_slash_is_ignored(self, project, ctx):
+        assert glob({"pattern": "./src/*.py"}, ctx) == "src/cli.py"
+
+    def test_skipped_entries_are_not_returned(self, project, ctx):
+        out = glob({"pattern": "*"}, ctx)
+
+        assert ".env" not in out
+        assert "__pycache__" not in out
+
+    def test_skipped_directories_are_not_walked_into(self, project, ctx):
+        assert "没有匹配" in glob({"pattern": "HEAD"}, ctx)
+
+    def test_no_match_says_so(self, project, ctx):
+        assert "没有匹配" in glob({"pattern": "*.rs"}, ctx)
+
+    def test_an_absolute_pattern_is_rejected(self, project, ctx):
+        with pytest.raises(ValueError, match="相对项目根目录"):
+            glob({"pattern": str(project / "*.py")}, ctx)
+
+    def test_a_parent_escape_pattern_is_rejected(self, project, ctx):
+        with pytest.raises(ValueError, match="不能有"):
+            glob({"pattern": "../*.py"}, ctx)
+
+    def test_an_empty_pattern_is_rejected(self, project, ctx):
+        with pytest.raises(ValueError, match="不能为空"):
+            glob({"pattern": "   "}, ctx)
+
+
+class TestGrep:
+    """纯 Python 那条路——这台机器上 shutil.which("rg") 就是 None，走的一直是它。"""
+
+    def test_finds_path_line_and_text(self, project, ctx):
+        body = "import os\n\ndef main():\n    return os\n"
+        (project / "app.py").write_text(body, encoding="utf-8")
+
+        assert grep({"pattern": "os"}, ctx) == "app.py:1:import os\napp.py:4:    return os"
+
+    def test_results_are_sorted_by_path_then_line(self, project, ctx):
+        (project / "src" / "b.py").write_text("needle\n", encoding="utf-8")
+        (project / "a.py").write_text("needle\n", encoding="utf-8")
+
+        assert grep({"pattern": "needle"}, ctx) == "a.py:1:needle\nsrc/b.py:1:needle"
+
+    def test_path_limits_the_search(self, project, ctx):
+        (project / "a.py").write_text("needle\n", encoding="utf-8")
+        (project / "src" / "b.py").write_text("needle\n", encoding="utf-8")
+
+        assert grep({"pattern": "needle", "path": "src"}, ctx) == "src/b.py:1:needle"
+
+    def test_glob_limits_which_files_are_searched(self, project, ctx):
+        (project / "a.py").write_text("needle\n", encoding="utf-8")
+        (project / "a.txt").write_text("needle\n", encoding="utf-8")
+
+        assert grep({"pattern": "needle", "glob": "*.py"}, ctx) == "a.py:1:needle"
+
+    def test_case_sensitive_by_default(self, project, ctx):
+        (project / "a.txt").write_text("Needle\n", encoding="utf-8")
+
+        assert "没有找到" in grep({"pattern": "needle"}, ctx)
+
+    def test_ignore_case_finds_it_anyway(self, project, ctx):
+        (project / "a.txt").write_text("Needle\n", encoding="utf-8")
+
+        assert grep({"pattern": "needle", "ignore_case": True}, ctx) == "a.txt:1:Needle"
+
+    def test_the_pattern_is_a_regex(self, project, ctx):
+        (project / "a.txt").write_text("def foo():\ndef bar():\n", encoding="utf-8")
+
+        assert grep({"pattern": r"def \w+\(\):", "glob": "a.txt"}, ctx) == (
+            "a.txt:1:def foo():\na.txt:2:def bar():"
+        )
+
+    def test_sensitive_files_are_not_searched(self, project, ctx):
+        """fixture 里 .env 的内容是 KEY=1——它不该出现在任何结果里。"""
+        assert "没有找到" in grep({"pattern": "KEY"}, ctx)
+
+    def test_skipped_directories_are_not_walked_into(self, project, ctx):
+        (project / "__pycache__" / "deep.pyc").write_text("uniqueneedle\n", encoding="utf-8")
+
+        assert "没有找到" in grep({"pattern": "uniqueneedle"}, ctx)
+
+    def test_matches_are_capped(self, project, ctx):
+        (project / "many.txt").write_text("hit\n" * (MAX_GREP_MATCHES + 50), encoding="utf-8")
+
+        out = grep({"pattern": "hit", "glob": "many.txt"}, ctx)
+
+        assert "已截断" in out
+        assert f"上限 {MAX_GREP_MATCHES}" in out
+
+    def test_no_match_says_so(self, project, ctx):
+        assert "没有找到" in grep({"pattern": "绝对不存在的字符串"}, ctx)
+
+    def test_a_bad_regex_is_reported(self, project, ctx):
+        with pytest.raises(ValueError, match="正则"):
+            grep({"pattern": "([未闭合"}, ctx)
+
+    def test_an_empty_pattern_is_rejected(self, project, ctx):
+        with pytest.raises(ValueError, match="不能为空"):
+            grep({"pattern": ""}, ctx)
+
+    def test_an_absolute_glob_is_rejected(self, project, ctx):
+        with pytest.raises(ValueError, match="相对项目根目录"):
+            grep({"pattern": "x", "glob": str(project / "*.py")}, ctx)
+
+    def test_a_parent_escape_glob_is_rejected(self, project, ctx):
+        with pytest.raises(ValueError, match="不能有"):
+            grep({"pattern": "x", "glob": "../*.py"}, ctx)
+
+    def test_path_outside_the_root_is_rejected(self, project, ctx, tmp_path_factory):
+        outside = tmp_path_factory.mktemp("outside")
+
+        with pytest.raises(OutOfSandboxError):
+            grep({"pattern": "x", "path": str(outside)}, ctx)
+
+
+class FakeRgProcess:
+    """顶掉 subprocess.Popen 的假进程：吐出预设的几行，并记下有没有被 kill。"""
+
+    def __init__(self, lines: list[str], returncode: int = 0) -> None:
+        self.stdout = iter(lines)
+        self.returncode = returncode
+        self.killed = False
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self) -> int:
+        return self.returncode
+
+    def __enter__(self) -> FakeRgProcess:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
+class TestGrepWithRipgrep:
+    """rg 那条分支。
+
+    这台机器上没装 ripgrep（`shutil.which("rg")` 返回 None），所以只能拿假进程测"参数
+    怎么拼、输出怎么解析、结果怎么过滤"。真正的 rg 行为验不了——这点得说清楚。
+    """
+
+    def fake_rg(self, monkeypatch, lines: list[str], returncode: int = 0) -> FakeRgProcess:
+        import mini_code_agent.tools.files as files
+
+        process = FakeRgProcess(lines, returncode)
+        monkeypatch.setattr(files.shutil, "which", lambda _name: "/fake/rg")
+        monkeypatch.setattr(files.subprocess, "Popen", lambda *args, **kwargs: process)
+        return process
+
+    def test_rg_output_is_parsed_into_path_line_text(self, project, ctx, monkeypatch):
+        self.fake_rg(
+            monkeypatch,
+            ["src/cli.py:3:import os\n", "src/cli.py:9:    return os\n"],
+        )
+
+        assert grep({"pattern": "os"}, ctx) == "src/cli.py:3:import os\nsrc/cli.py:9:    return os"
+
+    @pytest.mark.skipif(os.name != "nt", reason="只有 Windows 上 rg 才吐反斜杠路径")
+    def test_windows_style_paths_from_rg_are_normalized(self, project, ctx, monkeypatch):
+        r"""rg 在 Windows 上吐的是 `.\src\cli.py`，要统一成 `src/cli.py`。
+
+        这条不是推断出来的——是拿真 rg（15.2.0）跑出来才发现的：两条后端给的路径长得
+        不一样。以后谁要动这段解析，先看看这条。
+        """
+        self.fake_rg(monkeypatch, [".\\src\\cli.py:3:import os\n"])
+
+        assert grep({"pattern": "os"}, ctx) == "src/cli.py:3:import os"
+
+    def test_rg_results_are_still_filtered_for_sensitive_paths(self, project, ctx, monkeypatch):
+        """就算 rg 把 .env 的结果吐出来，最后也必须被滤掉——这是唯一保证得住的一道。"""
+        self.fake_rg(monkeypatch, [".env:1:KEY=1\n", "src/cli.py:1:fine\n"])
+
+        assert grep({"pattern": ".*"}, ctx) == "src/cli.py:1:fine"
+
+    def test_an_rg_error_falls_back_to_python(self, project, ctx, monkeypatch):
+        """退出码 2 表示 rg 自己出错，这时空结果不是"没有匹配"，该让纯 Python 去跑。"""
+        self.fake_rg(monkeypatch, [], returncode=2)
+        (project / "a.txt").write_text("needle\n", encoding="utf-8")
+
+        assert grep({"pattern": "needle"}, ctx) == "a.txt:1:needle"
