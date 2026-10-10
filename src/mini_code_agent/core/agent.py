@@ -41,6 +41,7 @@ def runagent(
     system: str | None = None,
     max_steps: int = 8,
     cwd: Path | None = None,
+    allow_shell: bool = False,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -54,7 +55,7 @@ def runagent(
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     trace: list[str] = []
     final: str | None = None
-    ctx = ToolContext(cwd or Path.cwd())
+    ctx = ToolContext(cwd or Path.cwd(), allow_shell=allow_shell)
     for _ in range(max_steps):
         response = provider.complete(messages, tools=tools, system=system)
 

@@ -16,11 +16,14 @@ app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
 def main_command(
         prompt: str = typer.Argument("", help="Prompt to send to the agent."),
         cwd: Path | None = typer.Option(None, "--cwd", "-C", help="agent 的工作目录，默认当前目录"),
+        shell: bool = typer.Option(
+            False, "--shell", help="允许 agent 执行命令（跑在一次性 docker 容器里）"
+        ),
 ) -> None:
     """把指令交给 agent，把最终回复打印到标准输出。"""
     prompt=prompt.strip()
     if prompt:
-        result = runagent(prompt, AnthropicProvider(), cwd=cwd)
+        result = runagent(prompt, AnthropicProvider(), cwd=cwd, allow_shell=shell)
         if result.final is None:
             typer.echo(
                 f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
@@ -37,7 +40,7 @@ def main_command(
                     continue
                 if line == "/exit":
                     break
-                result = runagent(line, AnthropicProvider(), cwd=cwd)
+                result = runagent(line, AnthropicProvider(), cwd=cwd, allow_shell=shell)
                 if result.final is None:
                     typer.echo(
                         f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",

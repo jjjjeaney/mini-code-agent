@@ -13,6 +13,7 @@ from mini_code_agent.tools.safety import (
     ensure_text_file,
     is_sensitive,
     is_within,
+    redact_sensitive,
     resolve_within,
     should_skip,
     truncate_text,
@@ -293,3 +294,50 @@ class TestIsSensitive:
 
     def test_an_empty_path_is_not_sensitive(self):
         assert is_sensitive(Path(".")) is False
+
+
+class TestRedactSensitive:
+    """纯函数，不吃文件也不联网。"""
+
+    def test_a_key_line_is_replaced_wholesale(self):
+        text, hidden = redact_sensitive("DEEPSEEK_API_KEY=sk-abcdef\n其他内容")
+
+        assert hidden == 1
+        assert "sk-abcdef" not in text
+        assert "其他内容" in text
+
+    def test_ordinary_lines_are_left_alone(self):
+        text, hidden = redact_sensitive("def foo():\n    return 1")
+
+        assert hidden == 0
+        assert text == "def foo():\n    return 1"
+
+    def test_each_of_the_patterns_fires(self):
+        for line in (
+            "api_key = 1",
+            "TOKEN: abc",
+            "secret=xyz",
+            "password=hunter2",
+            "credential = 1",
+            "PRIVATE KEY",
+            "Authorization: Basic zzz",
+            "Bearer abcdef",
+            "sk-live-123",
+            "ghp_abcdef",
+            "github_pat_abcdef",
+            "xoxb-123",
+            "AKIAIOSFODNN7EXAMPLE",
+            "-----BEGIN RSA PRIVATE KEY-----",
+        ):
+            _, hidden = redact_sensitive(line)
+            assert hidden == 1, f"没涂黑: {line}"
+
+    def test_matching_ignores_case(self):
+        assert redact_sensitive("API_KEY=1")[1] == 1
+        assert redact_sensitive("Bearer abc")[1] == 1
+
+    def test_the_count_is_reported(self):
+        text, hidden = redact_sensitive("api=1\n无事发生\ntoken=2\n又无事")
+
+        assert hidden == 2
+        assert text.splitlines() == ["[已涂黑]", "无事发生", "[已涂黑]", "又无事"]

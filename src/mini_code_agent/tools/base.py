@@ -48,6 +48,26 @@ class ReplaceFailedError(ToolWriteError):
     """临时文件写好了，但顶替原文件那一步失败了。原文件没有被改动。"""
 
 
+class ToolShellError(Exception):
+    """跑命令这个工具出的错。子类区分是**哪一步**失败的。
+
+    和"命令跑了但退出码非 0"要分开：那是命令的结果，交回模型让它自己看；
+    下面是工具自己没跑起来，模型再怎么改命令也没用。
+    """
+
+
+class ShellDisabledError(ToolShellError):
+    """这个 agent 没开命令执行能力（ToolContext.allow_shell 是 False）。"""
+
+
+class DockerUnavailableError(ToolShellError):
+    """docker 用不了：命令没找到，或者 daemon 没起来。命令没有执行过。"""
+
+
+class ContainerStartFailedError(ToolShellError):
+    """容器没起来（镜像不存在、参数不对之类）。命令没有执行过。"""
+
+
 @dataclass
 class ToolContext:
     """调用工具时的运行环境。
@@ -56,10 +76,14 @@ class ToolContext:
     路径校验就拿它当围栏的边界。
 
     cwd 是必填的：让工具在缺省时回落到进程当前目录，等于悄悄换了沙箱的边界。
+
+    allow_shell 管的是能不能跑命令。默认关着——执行任意命令是这个 agent 里权限最大
+    的一件事，不该因为"顺手"就默认打开。
     """
 
     cwd: Path
     read_state: ReadFileState=field(default_factory=ReadFileState)
+    allow_shell: bool = False
 
 
 @dataclass

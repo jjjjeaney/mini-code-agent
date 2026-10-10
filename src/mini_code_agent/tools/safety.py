@@ -221,3 +221,49 @@ def is_sensitive(path: Path) -> bool:
     )
 
 
+# 命令输出里出现这些就整行涂黑。全是小写，比较时也转小写。
+#
+# 这是**启发式，不是保证**：不含这些词的密钥照样会漏出去（一串裸的十六进制、
+# 一个自定义变量名都拦不住）。它挡的是"顺手 cat 一下 .env"这类最常见的泄露，
+# 真正该指望的是"别让容器够得着那些文件"，不是这一层。别把它当安全边界。
+SENSITIVE_OUTPUT_PATTERNS = (
+    "api",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "private key",
+    "authorization",
+    "bearer",
+    "-----begin",
+    # 各家密钥的前缀，比关键词精确一些
+    "sk-",
+    "ghp_",
+    "github_pat_",
+    "xoxb-",
+    "akia",
+)
+
+REDACTED = "[已涂黑]"
+
+
+def redact_sensitive(text: str) -> tuple[str, int]:
+    """把像是装着密钥的行整行涂黑，返回 (处理后的文本, 涂黑了几行)。
+
+    命中就整行换掉，不做"只涂掉值那一段"的花活：整行的说法容易讲清楚、也容易验证
+    ——"这一行出现了这些词，就不给模型看"。代价是误伤（README 里提一句 API 也会被
+    涂掉），但涂掉一行信息的损失，比漏一个密钥小得多。
+    """
+    kept: list[str] = []
+    hidden = 0
+    for line in text.splitlines():
+        lowered = line.lower()
+        if any(pattern in lowered for pattern in SENSITIVE_OUTPUT_PATTERNS):
+            kept.append(REDACTED)
+            hidden += 1
+        else:
+            kept.append(line)
+    return "\n".join(kept), hidden
+
+

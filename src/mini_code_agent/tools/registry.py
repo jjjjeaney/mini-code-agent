@@ -26,6 +26,7 @@ from mini_code_agent.tools.files import (
     replace_lines,
     write_file,
 )
+from mini_code_agent.tools.shell import SHELL_SCHEMA, bash
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
 
@@ -156,6 +157,17 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=replace_lines,
                 params=REPLACE_LINES_SCHEMA,
+            ),
+            Tool(
+                name="bash",
+                description=(
+                    "在一次性沙箱容器里跑一条 shell 命令，返回退出码和输出。"
+                    "只有项目目录挂进去、可写；没有网络。"
+                    "跑测试、装依赖之外的命令、用命令行工具时用它。"
+                    "需要在启动 agent 时打开 --shell 才可用。"
+                ),
+                fn=bash,
+                params=SHELL_SCHEMA,
             ),
             Tool(
                 name="glob",

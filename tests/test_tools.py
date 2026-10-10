@@ -191,6 +191,7 @@ class TestDefaultTools:
             "write_file",
             "edit_file",
             "replace_lines",
+            "bash",
             "glob",
             "grep",
             "web_search",
