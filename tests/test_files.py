@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import tempfile
@@ -352,9 +353,9 @@ class TestReadFile:
 
         read_file({"path": "a.txt"}, ctx)
 
-        mtime_ns, char_count = ctx.read_state.entries[(project / "a.txt").resolve()]
+        mtime_ns, size_bytes = ctx.read_state.entries[(project / "a.txt").resolve()]
         assert mtime_ns == (project / "a.txt").stat().st_mtime_ns
-        assert char_count == len("hello\n")
+        assert size_bytes == (project / "a.txt").stat().st_size
 
     def test_an_unread_file_has_no_record(self, project, ctx):
         (project / "a.txt").write_text("hello\n", encoding="utf-8")
@@ -377,12 +378,14 @@ class TestReadFile:
         assert ctx.read_state.entries == {}
 
     def test_a_partial_read_records_the_whole_file_length(self, project, ctx):
-        """记的是整篇的长度，不是给模型的那一段——后面要拿它跟磁盘上的现状比。"""
+        """记的是整篇的字节数，不是给模型的那一段——后面要拿它跟磁盘上的现状比。"""
         (project / "a.txt").write_bytes(b"one\ntwo\nthree\n")
 
         read_file({"path": "a.txt", "start_line": 2, "end_line": 2}, ctx)
 
-        assert ctx.read_state.entries[(project / "a.txt").resolve()][1] == len("one\ntwo\nthree\n")
+        assert ctx.read_state.entries[(project / "a.txt").resolve()][1] == (
+            project / "a.txt"
+        ).stat().st_size
 
     def test_a_second_read_updates_the_record(self, project, ctx):
         (project / "a.txt").write_text("hello\n", encoding="utf-8")
@@ -456,6 +459,37 @@ class TestReadFile:
             return handle
 
         monkeypatch.setattr(Path, "open", open_then_touch)
+
+        with pytest.raises(ValueError, match="读的过程中被改过"):
+            read_file({"path": "a.txt"}, ctx)
+        assert ctx.read_state.entries == {}
+
+    def test_a_file_rewritten_at_the_same_mtime_while_reading_is_reported(
+        self, project, ctx, monkeypatch
+    ):
+        """mtime 一样、长度变了，照样是撕裂的——只比 mtime 会漏掉这一次。
+
+        同一个时钟刻度里的两次写，时间戳会完全一样（实测这台机器上 10ms 以内经常撞），
+        这里把 mtime 拨回读之前的值，模拟的就是那种情况。关键是读句柄得拿到**旧**字节
+        （真读到一半时文件被换掉就是这个样子），所以这里把旧内容拍个快照返回。
+        """
+        target = project / "a.txt"
+        target.write_bytes(b"one\ntwo\n")
+
+        real_open = Path.open
+
+        def open_then_rewrite(self, mode="r", *args, **kwargs):
+            if "w" in mode or "a" in mode or "+" in mode:
+                return real_open(self, mode, *args, **kwargs)  # 写走真身，不递归
+            with real_open(self, mode, *args, **kwargs) as source:
+                snapshot = source.read()
+            same_mtime = self.stat().st_mtime_ns  # 读之前量到的就是这个值
+            with real_open(self, "wb") as writer:
+                writer.write(b"one\ntwo\nthree\n")
+            os.utime(self, ns=(same_mtime, same_mtime))
+            return io.BytesIO(snapshot)
+
+        monkeypatch.setattr(Path, "open", open_then_rewrite)
 
         with pytest.raises(ValueError, match="读的过程中被改过"):
             read_file({"path": "a.txt"}, ctx)
@@ -536,6 +570,24 @@ class TestWriteFile:
         with pytest.raises(StaleReadError, match="被改过了"):
             write_file({"path": "a.txt", "content": "new\n"}, ctx)
         assert target.read_bytes() == b"old\n"
+
+    def test_refuses_when_only_the_length_changed(self, project, ctx):
+        """把 mtime 拨回原样，长度那道闸还拦得住——这正是两个信号一起比的意义。
+
+        不是假想：两次写落在同一个时钟刻度里，时间戳会**一模一样**（实测这台机器上
+        间隔 10ms 以内经常撞）。只比 mtime 的话，这一段就被静默盖掉了。
+        """
+        target = project / "a.txt"
+        target.write_bytes(b"old\n")
+        read_file({"path": "a.txt"}, ctx)
+        recorded_mtime = target.stat().st_mtime_ns
+
+        target.write_bytes(b"a much longer line\n")
+        os.utime(target, ns=(recorded_mtime, recorded_mtime))
+
+        with pytest.raises(StaleReadError, match="被改过了"):
+            write_file({"path": "a.txt", "content": "new\n"}, ctx)
+        assert target.read_bytes() == b"a much longer line\n"
 
     def test_the_backup_keeps_the_previous_content(self, project, ctx):
         (project / "a.txt").write_bytes(b"old\n")

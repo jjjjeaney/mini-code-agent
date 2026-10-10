@@ -369,16 +369,16 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     if not target.is_file():
         raise ValueError(f"{raw!r} 不是普通文件（可能是管道、设备文件之类），读不了。")
 
-    text, mtime_ns = _read_text(target, raw)
+    text, mtime_ns, size = _read_text(target, raw)
 
     body = truncate_text(slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line")))
 
-    # 读成功了才记：路径 -> (读之前的 mtime, 整篇的长度)。
+    # 读成功了才记：路径 -> (读之前的 mtime, 整篇的字节数)。
     # 长度记的是**整篇**，不是返回给模型的那一段——后面改文件的工具要拿它跟磁盘上的现状
     # 比，两边都得是"文件自己的属性"，掺进"模型看到多少"就没法比了。
     # 放在 slice_lines 后面是有意的：行号范围写反会抛错，那一次模型什么都没拿到，
     # 不该留下"读过"的痕迹。
-    ctx.read_state.record(target, text, mtime_ns)
+    ctx.read_state.record(target, size, mtime_ns)
 
     return body
 
@@ -441,7 +441,9 @@ def edit_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     if not target.is_file():
         raise ValueError(f"{raw!r} 不是普通文件（可能是管道、设备文件之类），改不了。")
 
-    current, _ = _read_text(target, raw)
+    # 只取内容：mtime 和长度这里用不上，核对状态那一步比的是 read_state 里模型那次
+    # read_file 留下的记录。
+    current, _, _ = _read_text(target, raw)
 
     count = current.count(old)
     if count == 0:
@@ -497,7 +499,7 @@ def replace_lines(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     if not target.is_file():
         raise ValueError(f"{raw!r} 不是普通文件（可能是管道、设备文件之类），改不了。")
 
-    current, _ = _read_text(target, raw)
+    current, _, _ = _read_text(target, raw)
     # keepends=True：每行连自己的换行一起留着，这样区间外的内容能原样拼回去，
     # 不会因为我们重新拼一遍就把文件尾部的换行、或者 CRLF 之类的换行风格改掉。
     lines = current.splitlines(keepends=True)
@@ -851,11 +853,15 @@ def _line_number(value: Any, name: str, minimum: int = 1) -> int:
     return number
 
 
-def _read_text(target: Path, raw: str) -> tuple[str, int]:
-    """把文件读成文本，顺带带出"读之前"量到的 mtime。
+def _read_text(target: Path, raw: str) -> tuple[str, int, int]:
+    """把文件读成文本，顺带带出"读之前"量到的 mtime，和这次读到的字节数。
 
     大小、二进制、编码三道检查都在这儿——read_file 和 edit_file 都要走，各写一份的话
     以后补一道检查只会补在其中一份上。mtime 也在这儿量：读完再量就和内容错开版本了。
+
+    字节数给的是 len(data)，不是 st_size：它和上面这份文本是同一次读出来的，跟 mtime
+    属于同一个版本。st_size 是另一次系统调用，中间被人改了的话长度就和内容错开版本了
+    ——那正是这个返回值要防的事。
     """
     ensure_within_size(target)
 
@@ -870,12 +876,16 @@ def _read_text(target: Path, raw: str) -> tuple[str, int]:
         fh.seek(0)
         data = fh.read()
 
-    # 读完再量一次。两次不一样，说明读的过程中有人动过这个文件，手上这份可能是撕裂的。
-    if target.stat().st_mtime_ns != mtime_ns:
+    # 读完再量一次。对不上，说明读的过程中有人动过这个文件，手上这份可能是撕裂的。
+    # 两个信号一起比：只比 mtime 会漏——同一个时钟刻度里的两次写，时间戳会完全一样
+    # （实测这台机器上 10ms 以内经常撞）。长度这边比的是"这次真正读到的字节数"和
+    # "磁盘上现在有多少字节"，直接对上手上这份和盘上那份。
+    after = target.stat()
+    if after.st_mtime_ns != mtime_ns or after.st_size != len(data):
         raise ValueError(f"{raw!r} 在读的过程中被改过了，这次拿到的内容不一定完整，请重读一次。")
 
     try:
-        return data.decode(encoding), mtime_ns
+        return data.decode(encoding), mtime_ns, len(data)
     except UnicodeDecodeError as exc:
         raise UndecodableTextError(
             f"{raw!r} 不是 {encoding} 编码（可能是 GBK 之类），没法当文本读。"
@@ -963,8 +973,11 @@ def _commit_change(
                 f"{raw!r} 已经存在，但你还没读过它。先读一遍再改——"
                 f"不然会把一份你从没看过的内容整个盖掉。"
             )
-        recorded_mtime, _ = recorded
-        if target.stat().st_mtime_ns != recorded_mtime:
+        recorded_mtime, recorded_size = recorded
+        current = target.stat()
+        # 两个信号一起比。只看 mtime 会漏：两次写落在同一个时钟刻度里，时间戳会完全一样
+        # （实测这台机器上间隔 10ms 以内经常撞），那种时候只有长度变了才拦得住。
+        if current.st_mtime_ns != recorded_mtime or current.st_size != recorded_size:
             raise StaleReadError(
                 f"{raw!r} 在你读过之后被改过了（可能是别的程序，也可能是你自己另一次操作）。"
                 f"先重读一遍，再改。"
@@ -1004,9 +1017,13 @@ def _commit_change(
             with os.fdopen(handle_fd, "w", encoding="utf-8", newline="") as fh:
                 fh.write(new_content)
             match_permissions(temp)
-            # mtime 在顶替**之前**量。改名不改时间戳，所以这就是新内容将来在目标上的
-            # 时间戳，而且不受"顶替之后、记录之前"那点窗口影响。
-            new_mtime_ns = temp.stat().st_mtime_ns
+            # mtime 和长度都在顶替**之前**量。改名不改时间戳，所以这就是新内容将来在
+            # 目标上的时间戳，而且不受"顶替之后、记录之前"那点窗口影响。长度必须从临时
+            # 文件上量，不能拿 len(new_content)：非 ASCII 时字符数不等于字节数，而闸门
+            # 比的是 st_size。
+            new_stat = temp.stat()
+            new_mtime_ns = new_stat.st_mtime_ns
+            new_size = new_stat.st_size
         except OSError as exc:
             raise WriteFailedError(f"{raw!r} 没被改动；写临时文件失败：{exc}") from exc
 
@@ -1025,7 +1042,7 @@ def _commit_change(
         except OSError:
             pass
 
-    ctx.read_state.record(target, new_content, new_mtime_ns)
+    ctx.read_state.record(target, new_size, new_mtime_ns)
     return saved
 
 

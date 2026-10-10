@@ -11,16 +11,22 @@ from typing import Any
 
 @dataclass
 class ReadFileState:
-    # path -> (mtime_ns, char_count)。Day 4 的 read-before-edit 要靠它判断
-    # "模型读过这个文件之后，文件在磁盘上是不是又被改过"。今天先只做记录。
+    # path -> (mtime_ns, size_bytes)。read-before-edit 要靠它判断"模型读过这个文件之后，
+    # 文件在磁盘上是不是又被改过"。
+    #
+    # 存两个信号是因为 mtime 一个不够用：两次写落在同一个时钟刻度里，时间戳会**一模一样**
+    # （实测这台机器上间隔 10ms 以内经常撞），那种时候只有长度还拦得住。
     entries: dict[Path, tuple[int, int]] = field(default_factory=dict)
 
-    def record(self, path: Path, content: str, mtime_ns: int) -> None:
-        # mtime_ns 由调用方在**读之前**量好传进来，这里不再自己去 stat。
-        # 让这里 stat 的话，取到的是"记录那一刻"的时间戳，而 content 属于更早的版本——
+    def record(self, path: Path, size: int, mtime_ns: int) -> None:
+        # size 和 mtime_ns 都由调用方量好传进来，这里不再自己去 stat。
+        # 让这里 stat 的话，取到的是"记录那一刻"的状态，而内容属于更早的版本——
         # 两者一错开，读-before-改的守卫就会以为模型看到的就是磁盘上最新的东西，
         # 而它要防的恰恰就是这一类错位。
-        self.entries[path] = (mtime_ns, len(content))
+        #
+        # size 是**字节数**（st_size），不是字符数：字符数得先把文件解码出来才知道，
+        # 而且对非 ASCII 文件，同一份内容的字符数和磁盘上的字节数根本对不上，没法比。
+        self.entries[path] = (mtime_ns, size)
 
 
 class ToolWriteError(Exception):
