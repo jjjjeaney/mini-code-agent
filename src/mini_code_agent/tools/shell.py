@@ -24,7 +24,10 @@ from mini_code_agent.tools.base import (
 )
 from mini_code_agent.tools.safety import redact_sensitive
 
-DEFAULT_IMAGE = "python:3.12-slim"
+# 沙箱镜像：仓库根目录那个 Dockerfile 构建出来的（python:3.12-slim 加 git）。带 git 是为了
+# 模型能读本地历史（status / diff / log）——写历史那条路本来就被挡着，见下面 .git 的只读挂载。
+# 它**不会**被自动拉取（见 --pull=never），所以得先在仓库根目录构建一次。
+DEFAULT_IMAGE = "mca_sandbox"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 300
 
@@ -94,9 +97,16 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     if not timed_out and process.returncode == 125:
         # docker run 自己的退出码 125 表示"容器都没起来"，不是命令的失败——
         # daemon 没起、镜像不存在、参数写错，都走这里。
-        raise ContainerStartFailedError(
-            f"容器没起来，命令没有执行过。docker 说：{stderr.decode('utf-8', 'replace').strip()}"
-        )
+        said = stderr.decode("utf-8", "replace").strip()
+        hint = ""
+        if "Unable to find image" in said or "No such image" in said:
+            # 沙箱镜像是要自己构建的，而上面又写了 --pull=never，所以这一步特别容易漏；
+            # 没有这句提示的话，"容器没起来"看不出是镜像不在。
+            hint = (
+                f" 沙箱镜像 {DEFAULT_IMAGE} 不在本地——"
+                f"先在仓库根目录跑 docker build -t {DEFAULT_IMAGE} ."
+            )
+        raise ContainerStartFailedError(f"容器没起来，命令没有执行过。docker 说：{said}{hint}")
 
     return _format(process.returncode, stdout, stderr, timed_out, timeout)
 
@@ -119,6 +129,18 @@ def _docker_argv(workspace: Path, command: str, cidfile: Path) -> list[str]:
     参与，不存在注入；容器里再解释一遍是刻意的（模型就是要跑 shell 命令），边界由
     容器承担。
     """
+    # 项目目录挂进去、可写（agent 就是要改代码）。as_posix() 是为了 Windows：
+    # docker CLI 认 D:/... 这种，不认反斜杠。
+    mounts = ["--mount", f"type=bind,src={workspace.as_posix()},dst=/workspace"]
+
+    git_dir = workspace / ".git"
+    if git_dir.exists():
+        # .git 单独盖一层**只读**。项目目录整个是可写的，但仓库目录不该被写——里面能放的
+        # 东西会在**宿主机**上生效，比如一个 pre-commit 脚本，会在你自己下次提交时被执行。
+        # 只读之后读历史照旧（status / diff / log），写不进去。
+        # 项目没有 .git 时不能挂：docker 会因为"源路径不存在"直接失败，容器都起不来。
+        mounts += ["--mount", f"type=bind,src={git_dir.as_posix()},dst=/workspace/.git,ro"]
+
     return [
         "docker",
         "run",
@@ -132,9 +154,8 @@ def _docker_argv(workspace: Path, command: str, cidfile: Path) -> list[str]:
         "--init",
         "--network", "none",
         "--read-only",
-        # 只有项目目录是挂进去的，也是唯一可写的地方。
-        # as_posix() 是为了 Windows：docker CLI 认 D:/... 这种，不认反斜杠。
-        "--mount", f"type=bind,src={workspace.as_posix()},dst=/workspace",
+        # 挂载在上面拼好了：项目目录可写，.git 那层只读。
+        *mounts,
         "-w", "/workspace",
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
         "--cap-drop", "ALL",
@@ -149,6 +170,9 @@ def _docker_argv(workspace: Path, command: str, cidfile: Path) -> list[str]:
         "--env", "GIT_CONFIG_GLOBAL=/dev/null",
         "--env", "GIT_CONFIG_NOSYSTEM=1",
         "--env", "GIT_TERMINAL_PROMPT=0",
+        # 上面那条只读的 .git 会让 git status 抢不到 index.lock（它默认想顺手刷一下 index
+        # 缓存），这个变量就是 git 给这种场景准备的开关：可有可无的锁就别去拿了。
+        "--env", "GIT_OPTIONAL_LOCKS=0",
         # git 会拒绝操作"属主不是自己"的目录，挂进来的 /workspace 正是这种；而上面又把
         # global config 指到了 /dev/null，所以只能靠这组变量把 safe.directory 加回来。
         "--env", "GIT_CONFIG_COUNT=1",

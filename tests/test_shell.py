@@ -15,6 +15,7 @@ import pytest
 
 from mini_code_agent.tools.base import ShellDisabledError, ToolContext
 from mini_code_agent.tools.shell import (
+    DEFAULT_IMAGE,
     DEFAULT_TIMEOUT_SECONDS,
     MAX_TIMEOUT_SECONDS,
     _docker_argv,
@@ -23,17 +24,27 @@ from mini_code_agent.tools.shell import (
 )
 
 
-def docker_ready() -> bool:
+def _docker_ok(args: list[str]) -> bool:
     if shutil.which("docker") is None:
         return False
     try:
-        probe = subprocess.run(["docker", "info"], capture_output=True, timeout=60)
+        probe = subprocess.run(args, capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return probe.returncode == 0
 
 
-needs_docker = pytest.mark.skipif(not docker_ready(), reason="这台机器上没有可用的 docker")
+def sandbox_missing() -> str | None:
+    """跑真容器的用例要两样：docker 活着，以及沙箱镜像已经构建过。返回缺的那一样。"""
+    if not _docker_ok(["docker", "info"]):
+        return "这台机器上没有可用的 docker"
+    if not _docker_ok(["docker", "image", "inspect", DEFAULT_IMAGE]):
+        return f"本地还没有沙箱镜像（先跑 docker build -t {DEFAULT_IMAGE} .）"
+    return None
+
+
+_missing = sandbox_missing()
+needs_docker = pytest.mark.skipif(_missing is not None, reason=_missing or "")
 
 
 @pytest.fixture
@@ -59,15 +70,31 @@ class TestBashGuards:
             bash({"command": 123}, shell_ctx)
 
 
+def _mounts(argv: list[str]) -> list[str]:
+    """argv 里所有 --mount 的取值，按出现顺序。"""
+    return [argv[index + 1] for index, item in enumerate(argv) if item == "--mount"]
+
+
 class TestBashArguments:
     """拼出来的 docker 参数长什么样——也不需要 docker。"""
 
-    def test_the_project_directory_is_the_only_mount(self, tmp_path):
-        """挂载只有一处：项目目录。别的都靠 --read-only 和 --tmpfs 挡在外面。"""
+    def test_only_the_project_directory_is_mounted(self, tmp_path):
+        """项目里没有 .git 时就这一处挂载。别的都靠 --read-only 和 --tmpfs 挡在外面。"""
         argv = _docker_argv(tmp_path, "echo hi", tmp_path / "c.cid")
 
-        mounts = [argv[index + 1] for index, item in enumerate(argv) if item == "--mount"]
-        assert mounts == [f"type=bind,src={tmp_path.as_posix()},dst=/workspace"]
+        assert _mounts(argv) == [f"type=bind,src={tmp_path.as_posix()},dst=/workspace"]
+
+    def test_the_git_directory_is_mounted_on_top_read_only(self, tmp_path):
+        """.git 单独盖一层只读：项目目录整个可写，但仓库目录里能放的东西会在**宿主机**上
+        生效——比如一个 pre-commit 脚本，会在你自己下次提交时被执行。"""
+        (tmp_path / ".git").mkdir()
+
+        argv = _docker_argv(tmp_path, "git status", tmp_path / "c.cid")
+
+        assert _mounts(argv) == [
+            f"type=bind,src={tmp_path.as_posix()},dst=/workspace",
+            f"type=bind,src={(tmp_path / '.git').as_posix()},dst=/workspace/.git,ro",
+        ]
 
     def test_the_user_command_is_one_single_argument(self, tmp_path):
         """整条命令作为一个 argv 元素交给容器里的 /bin/sh -c：宿主机这层没有 shell
@@ -101,6 +128,13 @@ class TestBashArguments:
 
         assert "GIT_CONFIG_KEY_0=safe.directory" in argv
         assert "GIT_CONFIG_VALUE_0=/workspace" in argv
+
+    def test_git_is_told_not_to_take_optional_locks(self, tmp_path):
+        """只读的 .git 会让 git status 抢不到 index.lock（它默认想顺手刷一下 index 缓存），
+        这个变量就是 git 给这种场景准备的开关：可有可无的锁别去拿。"""
+        argv = _docker_argv(tmp_path, "true", tmp_path / "c.cid")
+
+        assert "GIT_OPTIONAL_LOCKS=0" in argv
 
 
 class TestTimeoutClamping:
