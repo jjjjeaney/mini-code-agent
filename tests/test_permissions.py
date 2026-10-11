@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import pytest
 
-from mini_code_agent.tools.base import ToolContext
-from mini_code_agent.tools.permissions import (
+from mini_code_agent.permissions import (
     EDIT_TOOLS,
     PERMISSION_MODES,
     PermissionRequest,
     decide_permission,
     parse_permission_mode,
 )
+
+# decide_permission 的第二个参数是 allow_shell。位置参数直接写 True / False 看不出是什么，
+# 测试里用这两个名字代替。
+SHELL_OFF = False
+SHELL_ON = True
 
 
 def request(name: str, **tool_args) -> PermissionRequest:
@@ -80,64 +84,59 @@ class TestTheModeList:
 
 
 class TestDecidePermission:
-    """三档的规则表。
+    """规则表。
 
-    判定是个纯函数：它只答 allow / deny / ask，"ask 之后真去问、用户说不行怎么办"是
-    harness 那一层的事。
+    判定是个纯函数，参数全是权限自己的东西（工具名、shell 开没开、档位）——它不认识
+    ToolContext。"ask 之后真去问、用户说不行怎么办"是 harness 那一层的事，不在这儿测。
     """
 
     @pytest.mark.parametrize("mode", PERMISSION_MODES)
-    def test_bash_always_asks(self, tmp_path, mode):
+    def test_bash_asks_in_every_mode_when_shell_is_on(self, mode):
         """不论哪一档都要问。一条命令会干什么，用户事先看不出来。"""
-        decision = decide_permission(request("bash", command="ls"), ToolContext(cwd=tmp_path), mode)
+        decision = decide_permission(request("bash", command="ls"), SHELL_ON, mode)
 
         assert decision.decision == "ask"
 
-    @pytest.mark.parametrize("name", EDIT_TOOLS)
-    def test_an_edit_tool_is_allowed_in_accept_edit_mode(self, tmp_path, name):
-        context = ToolContext(cwd=tmp_path)
+    @pytest.mark.parametrize("mode", PERMISSION_MODES)
+    def test_bash_is_let_through_when_shell_is_off(self, mode):
+        """没开 shell 时它本来就会报"没开命令执行"，没必要先弹一句询问再让人发现跑不了。"""
+        decision = decide_permission(request("bash", command="ls"), SHELL_OFF, mode)
 
-        assert decide_permission(request(name), context, "accept edit").decision == "allow"
-
-    @pytest.mark.parametrize("name", EDIT_TOOLS)
-    def test_an_edit_tool_asks_in_default_mode(self, tmp_path, name):
-        context = ToolContext(cwd=tmp_path)
-
-        assert decide_permission(request(name), context, "default").decision == "ask"
+        assert decision.decision == "allow"
 
     @pytest.mark.parametrize("name", EDIT_TOOLS)
-    def test_an_edit_tool_is_denied_in_plan_mode(self, tmp_path, name):
-        context = ToolContext(cwd=tmp_path)
+    def test_an_edit_tool_is_allowed_in_accept_edit_mode(self, name):
+        assert decide_permission(request(name), SHELL_ON, "accept edit").decision == "allow"
 
-        assert decide_permission(request(name), context, "plan").decision == "deny"
+    @pytest.mark.parametrize("name", EDIT_TOOLS)
+    def test_an_edit_tool_asks_in_default_mode(self, name):
+        assert decide_permission(request(name), SHELL_ON, "default").decision == "ask"
+
+    @pytest.mark.parametrize("name", EDIT_TOOLS)
+    def test_an_edit_tool_is_denied_in_plan_mode(self, name):
+        assert decide_permission(request(name), SHELL_ON, "plan").decision == "deny"
 
     @pytest.mark.parametrize("mode", PERMISSION_MODES)
-    def test_read_only_tools_are_never_gated(self, tmp_path, mode):
+    def test_read_only_tools_are_never_gated(self, mode):
         """读、列目录、搜索本来就只受路径闸门管，逐个问没人受得了。"""
-        context = ToolContext(cwd=tmp_path)
-
         for name in ("read_file", "list_files", "grep", "glob", "project_tree", "echo"):
-            assert decide_permission(request(name), context, mode).decision == "allow"
+            assert decide_permission(request(name), SHELL_ON, mode).decision == "allow"
 
-    def test_an_unknown_tool_is_allowed(self, tmp_path):
-        context = ToolContext(cwd=tmp_path)
+    def test_an_unknown_tool_is_allowed(self):
+        assert decide_permission(request("nope"), SHELL_ON, "plan").decision == "allow"
 
-        assert decide_permission(request("nope"), context, "plan").decision == "allow"
+    def test_the_mode_can_be_written_the_way_the_user_typed_it(self):
+        decision = decide_permission(request("edit_file"), SHELL_ON, "Accept_Edit")
 
-    def test_the_mode_can_be_written_the_way_the_user_typed_it(self, tmp_path):
-        context = ToolContext(cwd=tmp_path)
+        assert decision.decision == "allow"
 
-        assert decide_permission(request("edit_file"), context, "Accept_Edit").decision == "allow"
-
-    def test_a_bad_mode_raises_instead_of_falling_back(self, tmp_path):
+    def test_a_bad_mode_raises_instead_of_falling_back(self):
         """回落到默认档的后果是：用户以为在 plan，实际在 default 上跑。"""
-        context = ToolContext(cwd=tmp_path)
-
         with pytest.raises(ValueError, match="不是权限模式"):
-            decide_permission(request("edit_file"), context, "yolo")
+            decide_permission(request("edit_file"), SHELL_ON, "yolo")
 
-    def test_the_denial_says_why(self, tmp_path):
+    def test_the_denial_says_why(self):
         """这句话会被原样回给模型，所以它得说清是哪种拒绝。"""
-        decision = decide_permission(request("edit_file"), ToolContext(cwd=tmp_path), "plan")
+        decision = decide_permission(request("edit_file"), SHELL_ON, "plan")
 
         assert "plan" in decision.message

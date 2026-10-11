@@ -7,8 +7,9 @@
 - `default`：要用户确认。每次改文件都停下来问一句
 - `plan`：默认拒绝。计划模式——只读，先让模型把打算怎么做讲清楚，再切出去执行
 
-bash 不在这三档里：**不论什么模式都要用户确认**。一条命令会干什么，用户事先看不出来
-（沙箱挡的是它碰不到宿主机，不是它做的事对不对），所以它不跟着模式走。
+bash 不在这三档里：**不论什么模式都要用户确认**（除非压根没开 shell——那时先弹一句询问、
+答完才发现跑不了，是白问）。一条命令会干什么，用户事先看不出来（沙箱挡的是它碰不到
+宿主机，不是它做的事对不对），所以它不跟着模式走。
 
 这些是**默认**答案：模式定的是"不问的时候怎么办"，具体到某一次调用还可能被别的条件
 改成要问（比如路径在不在围栏里）。这个模块管两件事：把用户敲的档位解析成规范值，
@@ -18,13 +19,7 @@ bash 不在这三档里：**不论什么模式都要用户确认**。一条命�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, get_args
-
-if TYPE_CHECKING:
-    # 只在标注里用到，但这里必须写成真 import 的对立面：本模块住在 tools 包里，而
-    # tools/__init__ 迟早会 import 它（判定要接在派发那一步），模块层互相 import 就成环了。
-    from mini_code_agent.tools import ToolContext
-
+from typing import Literal, get_args
 
 # 三个档位。参数标注、parse_permission_mode 的返回值、报错里列出的可选值都指向这一处，
 # 以后想加第四档只改这里。
@@ -70,10 +65,12 @@ def parse_permission_mode(value: str) -> PermissionMode:
 
 
 def decide_permission(
-    request: PermissionRequest, ctx: ToolContext, permission_mode: str
+    request: PermissionRequest, allow_shell: bool, permission_mode: str
 ) -> PermissionDecision:
     """判一次调用该不该放行：allow / deny / ask。
 
+    - bash 得开了 shell 才谈得上问。没开的话它本来就会报"没开命令执行"，没必要先弹一句
+      询问、再让人发现跑不了——直接放行，把那句报错留给工具自己去说
     - bash **不论哪一档都要问用户**。一条命令会干什么，用户事先看不出来；档位管的是
       "改文件那类动作用不用一个个问"，管不到它
     - 其余的工具一律放行——读文件、列目录、搜索本来就只受路径闸门管，逐个问没人受得了
@@ -81,12 +78,14 @@ def decide_permission(
 
     "ask" 不是答案，是"这事得问用户"；真的去问、以及用户说不行之后怎么办，在 harness 那层。
 
-    ctx 现在用不上，但判定迟早要看上下文（比如这个文件读过没有、shell 有没有开），签名
-    先留在这儿，免得以后每个调用点都要改一遍。
+    参数都是权限自己的东西（工具名、shell 开没开、档位），不认识 ToolContext 那种工具层的
+    环境对象——权限不是工具的属性。
     """
     mode = parse_permission_mode(permission_mode)
 
     if request.tool_name == "bash":
+        if not allow_shell:
+            return PermissionDecision("allow", "")
         return PermissionDecision("ask", "跑命令要用户确认")
     if request.tool_name not in EDIT_TOOLS:
         return PermissionDecision("allow", "")

@@ -6,9 +6,9 @@ from collections.abc import Sequence
 
 import pytest
 
+from mini_code_agent.permissions import PermissionRequest
+from mini_code_agent.prompts import NobodyToAskError, NullPrompter
 from mini_code_agent.tools.base import ToolContext
-from mini_code_agent.tools.permissions import PermissionRequest
-from mini_code_agent.tools.prompt import NobodyToAskError, NullPrompter
 
 
 def request(name: str = "write_file") -> PermissionRequest:
@@ -62,24 +62,20 @@ class FakePrompter:
         return options[0]
 
 
-class TestToolContextWiring:
-    def test_a_context_carries_a_null_prompter_by_default(self, tmp_path):
-        assert isinstance(ToolContext(cwd=tmp_path).prompter, NullPrompter)
+class TestItIsNotPartOfTheToolLayer:
+    def test_the_tool_context_does_not_carry_a_prompter(self, tmp_path):
+        """问用户不是工具的能力：确认是 harness 在调工具**之前**发的，工具那边不需要它。
 
-    def test_the_default_denies_instead_of_waiting_for_input(self, tmp_path):
-        """缺省行为必须是"拒绝"，不是"等输入"——测试和一次性跑都指望这个。"""
-        assert ToolContext(cwd=tmp_path).prompter.confirm_tool(request()) is False
+        这条钉的是一个架构决定——哪天要让工具自己也能问用户（比如 ask_user），那得是有意
+        改的，不是顺手把字段加回来。
+        """
+        assert not hasattr(ToolContext(cwd=tmp_path), "prompter")
 
-    def test_a_context_takes_another_prompter(self, tmp_path):
+    def test_a_fake_stands_in_for_the_protocol(self):
+        """harness 只认协议：换一个实现进来就够了，不用经过 ToolContext。"""
         fake = FakePrompter()
 
-        ctx = ToolContext(cwd=tmp_path, prompter=fake)
-
-        assert ctx.prompter.confirm_command("pytest -q") is True
-        assert fake.asked == ["pytest -q"]
-
-    def test_two_contexts_do_not_share_one_prompter(self, tmp_path):
-        first = ToolContext(cwd=tmp_path)
-        second = ToolContext(cwd=tmp_path)
-
-        assert first.prompter is not second.prompter
+        assert fake.confirm_command("pytest -q") is True
+        assert fake.confirm_tool(request()) is True
+        assert fake.confirm_edit(request("edit_file")) is False
+        assert fake.single_choice("用哪个？", ["a", "b"]) == "a"

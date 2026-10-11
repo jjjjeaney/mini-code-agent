@@ -10,6 +10,7 @@ import pytest
 import typer
 
 from mini_code_agent import prompting
+from mini_code_agent.permissions import PermissionRequest
 from mini_code_agent.prompting import (
     TerminalPrompter,
     interpret_choice,
@@ -17,8 +18,7 @@ from mini_code_agent.prompting import (
     preview_edit,
     preview_tool,
 )
-from mini_code_agent.tools.permissions import PermissionRequest
-from mini_code_agent.tools.prompt import NobodyToAskError
+from mini_code_agent.prompts import NobodyToAskError
 
 
 def request(tool_name: str, **tool_args) -> PermissionRequest:
@@ -160,6 +160,14 @@ class TestTerminalPrompter:
         monkeypatch.setattr(prompting.typer, "confirm", lambda *a, **k: False)
 
         assert TerminalPrompter().confirm_tool(request("bash", command="ls")) is False
+
+    def test_bash_is_shown_as_a_command_line(self, monkeypatch, capsys):
+        """bash 从 confirm_tool 进来，渲染的却是那行命令——分派是 prompter 自己做的。"""
+        monkeypatch.setattr(prompting.typer, "confirm", lambda *a, **k: True)
+
+        TerminalPrompter().confirm_tool(request("bash", command="pytest -q"))
+
+        assert "pytest -q" in capsys.readouterr().err
 
     def test_the_preview_goes_to_stderr_not_stdout(self, monkeypatch, capsys):
         """stdout 留给最终答案：`mca "..." > out.txt` 不该收到提示。"""

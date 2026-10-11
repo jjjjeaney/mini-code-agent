@@ -7,14 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mini_code_agent.permissions import EDIT_TOOLS, PermissionRequest, decide_permission
+from mini_code_agent.prompts import NullPrompter, Prompter
 from mini_code_agent.providers.base import Provider, ToolCall
 from mini_code_agent.tools import ToolContext, ToolRegistry, ToolResult, default_tools
-from mini_code_agent.tools.permissions import (
-    EDIT_TOOLS,
-    PermissionRequest,
-    decide_permission,
-)
-from mini_code_agent.tools.prompt import NullPrompter, Prompter
 
 
 @dataclass
@@ -40,32 +36,33 @@ def _render_result(result: ToolResult) -> str:
     return f"{mark} {result.name}: {_as_text(result.result)}"
 
 
-def _ask(ctx: ToolContext, request: PermissionRequest) -> bool:
+def _ask(prompter: Prompter, request: PermissionRequest) -> bool:
     """真的去问一次用户。
 
-    问**哪一种**由这里定：改文件的给他看改动、bash 给他看命令行、别的看参数。渲染成
-    什么样是 prompter 的事，但"该问哪一种"只有 harness 知道（它手上才有工具名）。
+    问**哪一种**由这里定：改文件的给他看改动、别的看参数（bash 也走这条，prompter 认得
+    工具名，自己会去取那行命令）。渲染成什么样是 prompter 的事，但"该问哪一种"只有 harness
+    知道——它手上才有工具名。
     """
     if request.tool_name in EDIT_TOOLS:
-        return ctx.prompter.confirm_edit(request)
-    if request.tool_name == "bash":
-        return ctx.prompter.confirm_command(str(request.tool_args.get("command", "")))
-    return ctx.prompter.confirm_tool(request)
+        return prompter.confirm_edit(request)
+    return prompter.confirm_tool(request)
 
 
-def _gate(call: ToolCall, ctx: ToolContext, permission_mode: str) -> ToolResult | None:
+def _gate(
+    call: ToolCall, prompter: Prompter, allow_shell: bool, permission_mode: str
+) -> ToolResult | None:
     """权限闸门：放行返回 None，不放行则返回要回给模型的那条结果。
 
     拒绝走**结果**不走异常：模型收到"用户不同意"才能换个做法，抛异常是把一次正常的人机
     协商变成崩溃。也不让它原样重试——那只会再被拒一次。
     """
     request = PermissionRequest(tool_name=call.name, tool_args=call.arguments)
-    decision = decide_permission(request, ctx, permission_mode)
+    decision = decide_permission(request, allow_shell, permission_mode)
 
     blocked: str | None = None
     if decision.decision == "deny":
         blocked = f"这次调用没有放行：{decision.message}"
-    elif decision.decision == "ask" and not _ask(ctx, request):
+    elif decision.decision == "ask" and not _ask(prompter, request):
         blocked = f"用户拒绝了这次调用（{decision.message}）"
 
     if blocked is None:
@@ -96,7 +93,7 @@ def runagent(
     专门用来打印给人看。
     不传 registry 就用 default_tools() 装好的那套内置工具。
 
-    permission_mode 是权限档位（三档见 tools/permissions.py），决定改文件的工具要不要问；
+    permission_mode 是权限档位（三档见 permissions.py），决定改文件的工具要不要问；
     prompter 是"问用户"的方式，不传就用一律拒绝的那个——非交互的跑法不该挂在提示符上。
     """
     registry = registry if registry is not None else default_tools()
@@ -104,11 +101,9 @@ def runagent(
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     trace: list[str] = []
     final: str | None = None
-    ctx = ToolContext(
-        cwd or Path.cwd(),
-        allow_shell=allow_shell,
-        prompter=prompter if prompter is not None else NullPrompter(),
-    )
+    # prompter 不放进 ctx：问用户不是工具的能力，确认是这一层在调工具之前发的。
+    prompter = prompter if prompter is not None else NullPrompter()
+    ctx = ToolContext(cwd or Path.cwd(), allow_shell=allow_shell)
     for _ in range(max_steps):
         response = provider.complete(messages, tools=tools, system=system)
 
@@ -128,7 +123,7 @@ def runagent(
             print(_render_call(call))
 
             # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
-            result = _gate(call, ctx, permission_mode)
+            result = _gate(call, prompter, allow_shell, permission_mode)
             if result is None:
                 result = registry.dispatch(ctx, call)
 

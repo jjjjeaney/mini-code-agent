@@ -1,8 +1,11 @@
 """问用户这件事的接口：谁来问、问什么，以及没人可问的时候怎么办。
 
 这里**只有协议**，没有一行终端代码——打印提示、读键盘、渲染 diff 都在 CLI 那层的
-prompting.py 里，那一层才 import typer。分这么开是因为 tools 层不许 import cli：工具和
-harness 都只认这个 Protocol，于是测试塞一个假实现就能把"问用户"那条路径整个跑起来。
+prompting.py 里，那一层才 import typer。
+
+它不住在 tools 包里，问用户也不是工具的能力：确认是 harness 在调工具**之前**发的，以后
+那个 ask_user 工具要问也是拿这个协议问。谁都只认这个协议，于是测试塞一个假实现就能把
+"问用户"那条路径整个跑起来。
 
 四种问法分两类：
 
@@ -20,9 +23,8 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    # 只在标注里用到，就不真 import 了：本模块在 tools 包里，而 permissions 那边以后
-    # 未必不会反过来碰这里，标注不需要为此变成环。
-    from mini_code_agent.tools.permissions import PermissionRequest
+    # 只在标注里用到，就不真 import 了：两个模块同在上层，标注没必要结成运行时依赖。
+    from mini_code_agent.permissions import PermissionRequest
 
 
 class NobodyToAskError(Exception):

@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 
 from mini_code_agent.core.agent import runagent
+from mini_code_agent.permissions import PermissionRequest
 from mini_code_agent.providers.base import ModelResponse, ToolCall
 from mini_code_agent.tools import Tool, ToolContext, ToolRegistry, default_tools
-from mini_code_agent.tools.permissions import PermissionRequest
 
 ADD_SCHEMA = {
     "type": "object",
@@ -198,10 +198,10 @@ class RecordingPrompter:
     def __init__(self, answer: bool = True) -> None:
         self.answer = answer
         self.tools: list[PermissionRequest] = []
-        self.commands: list[str] = []
 
     def confirm_command(self, command: str) -> bool:
-        self.commands.append(command)
+        # harness 现在不直接调这一条：bash 也走 confirm_tool，那行命令由 prompter 自己
+        # 认出来（见 prompting.py）。协议要求实现它，所以留着。
         return self.answer
 
     def confirm_tool(self, request: PermissionRequest) -> bool:
@@ -319,12 +319,25 @@ def test_bash_always_asks_even_in_accept_edit_mode():
         "跑个测试",
         provider,
         gated_registry("bash", log),
+        allow_shell=True,
         permission_mode="accept edit",
         prompter=prompter,
     )
 
-    assert prompter.commands == ["pytest -q"]  # 问的是命令行本身
+    assert [r.tool_name for r in prompter.tools] == ["bash"]
     assert log == ["bash"]
+
+
+def test_bash_is_not_even_asked_when_shell_is_off():
+    """没开 shell 的话它本来就跑不了。先弹一句询问、答完才发现跑不了，那是白问。"""
+    log: list[str] = []
+    prompter = RecordingPrompter(answer=True)
+    provider = ScriptedProvider([tool_turn("t1", "bash", {"command": "ls"}), text_turn("好")])
+
+    runagent("跑个测试", provider, gated_registry("bash", log), prompter=prompter)
+
+    assert prompter.tools == []  # 没问
+    assert log == ["bash"]  # 工具照跑，"没开命令执行"那句话由它自己说
 
 
 def test_without_a_prompter_the_ask_path_denies():

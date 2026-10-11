@@ -1,7 +1,7 @@
 """把问题摆到终端上的那个实现：提示写 stderr，答案从键盘读。
 
-这是 tools/prompt.py 里那个 Prompter 协议的一份实现，也是这个项目里唯一 import typer
-的地方——协议住在 tools 层，而那边不许 import cli。
+这是 prompts.py 里那个 Prompter 协议的一份实现，也是这个项目里唯一 import typer 的地方
+——协议那边只有标准库，终端这一层才碰键盘。
 
 几件有意这么定的事：
 
@@ -20,8 +20,8 @@ from collections.abc import Sequence
 
 import typer
 
-from mini_code_agent.tools.permissions import PermissionRequest
-from mini_code_agent.tools.prompt import NobodyToAskError
+from mini_code_agent.permissions import PermissionRequest
+from mini_code_agent.prompts import NobodyToAskError
 from mini_code_agent.tools.safety import truncate_text
 
 INDENT = "    "
@@ -142,6 +142,10 @@ class TerminalPrompter:
         return self._yes_no(preview_command(command))
 
     def confirm_tool(self, request: PermissionRequest) -> bool:
+        # bash 走这一条进来，但要看的是那行命令本身、不是它前面那串参数——分派留在
+        # prompter 里，harness 就不必知道"命令藏在 args 的哪个键上"。
+        if request.tool_name == "bash":
+            return self.confirm_command(str(request.tool_args.get("command", "")))
         return self._yes_no(preview_tool(request))
 
     def confirm_edit(self, request: PermissionRequest) -> bool:

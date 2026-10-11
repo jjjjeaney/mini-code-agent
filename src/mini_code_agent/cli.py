@@ -7,9 +7,9 @@ from pathlib import Path
 import typer
 
 from mini_code_agent.core.agent import runagent
+from mini_code_agent.permissions import parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter
 from mini_code_agent.providers.anthropic import AnthropicProvider
-from mini_code_agent.tools.permissions import parse_permission_mode
 
 app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
 
