@@ -14,11 +14,14 @@ from mini_code_agent.permissions import PermissionRequest
 from mini_code_agent.prompting import (
     TerminalPrompter,
     interpret_choice,
+    make_ask_user,
     preview_command,
     preview_edit,
     preview_tool,
 )
-from mini_code_agent.prompts import NobodyToAskError
+from mini_code_agent.prompts import NobodyToAskError, NullPrompter
+from mini_code_agent.providers.base import ToolCall
+from mini_code_agent.tools import ToolContext, ToolRegistry
 
 
 def request(tool_name: str, **tool_args) -> PermissionRequest:
@@ -201,3 +204,71 @@ class TestTerminalPrompter:
 
         with pytest.raises(NobodyToAskError, match="没人回答"):
             TerminalPrompter().single_choice("用哪个？", ["a", "b"])
+
+
+class FixedPrompter:
+    """按剧本回答的假 prompter，顺便记下问过什么。"""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.asked: list[tuple[str, list[str]]] = []
+
+    def confirm_command(self, command: str) -> bool:
+        return True
+
+    def confirm_tool(self, request: PermissionRequest) -> bool:
+        return True
+
+    def confirm_edit(self, request: PermissionRequest) -> bool:
+        return True
+
+    def single_choice(self, question: str, options: list[str]) -> str:
+        self.asked.append((question, list(options)))
+        return self.answer
+
+
+class TestAskUserTool:
+    """把"问用户"包成工具之后，模型那边看到的是什么。"""
+
+    def test_the_model_sees_it_under_the_name_ask_user(self):
+        tool = make_ask_user(FixedPrompter("a"))
+
+        assert tool.name == "ask_user"
+        assert tool.params["required"] == ["question", "options"]
+        assert tool.description  # 得有一句告诉模型什么时候该用它
+
+    def test_it_returns_what_the_user_picked(self, tmp_path):
+        tool = make_ask_user(FixedPrompter("选项B"))
+
+        answer = tool.fn(
+            {"question": "用哪个？", "options": ["选项A", "选项B"]}, ToolContext(cwd=tmp_path)
+        )
+
+        assert answer == "选项B"
+
+    def test_it_passes_the_question_and_the_options_through(self, tmp_path):
+        prompter = FixedPrompter("选项A")
+        tool = make_ask_user(prompter)
+
+        tool.fn({"question": "用哪个？", "options": ["选项A", "选项B"]}, ToolContext(cwd=tmp_path))
+
+        assert prompter.asked == [("用哪个？", ["选项A", "选项B"])]
+
+    def test_options_must_be_a_list_of_strings(self, tmp_path):
+        """模型偶尔会把数组写成字符串——照单全收的话 "选项A" 会被当成三个选项。"""
+        tool = make_ask_user(FixedPrompter("x"))
+
+        with pytest.raises(ValueError, match="字符串数组"):
+            tool.fn({"question": "用哪个？", "options": "选项A"}, ToolContext(cwd=tmp_path))
+
+    def test_nobody_to_ask_comes_back_as_an_error_result(self, tmp_path):
+        """注册表会把异常翻成模型看得见的结果——"没人可问"这条路不用另写代码。"""
+        registry = ToolRegistry([make_ask_user(NullPrompter())])
+        call = ToolCall(
+            id="t1", name="ask_user", arguments={"question": "用哪个？", "options": ["a"]}
+        )
+
+        result = registry.dispatch(ToolContext(cwd=tmp_path), call)
+
+        assert result.is_error is True
+        assert "没人可问" in result.result

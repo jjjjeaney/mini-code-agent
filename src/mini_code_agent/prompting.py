@@ -17,14 +17,29 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from typing import Any
 
 import typer
 
 from mini_code_agent.permissions import PermissionRequest
-from mini_code_agent.prompts import NobodyToAskError
+from mini_code_agent.prompts import NobodyToAskError, Prompter
+from mini_code_agent.tools.base import Tool, ToolContext
 from mini_code_agent.tools.safety import truncate_text
 
 INDENT = "    "
+
+ASK_USER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "question": {"type": "string", "description": "要问用户的问题，一句话说清楚"},
+        "options": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "供他挑选的若干项；他也可以自己写一个，所以选项不全是致命的",
+        },
+    },
+    "required": ["question", "options"],
+}
 
 
 def _block(text: str) -> str:
@@ -177,3 +192,31 @@ class TerminalPrompter:
             # 用户想退出时该在提示符那一层按 Ctrl+C。
             typer.echo("（没有回答，按拒绝处理）", err=True)
             return False
+
+
+def make_ask_user(prompter: Prompter) -> Tool:
+    """把"问用户"包成模型能调的工具。
+
+    谁手上有 prompter、谁在装配的时候把它注册进来——这个工具**不**内置在 default_tools()
+    里：没人可问的地方它就不该存在。好处是 tools 层一行都不用动，也不必给 ToolContext
+    加字段。
+
+    内层的 ask_user 闭包抓着外面的 prompter。抓的是**那个对象**：以后要换实现或换状态，
+    改它内部，别整个替换——换成另一个对象，这个闭包还指着老的。
+    """
+
+    def ask_user(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+        options = kwargs["options"]
+        if not isinstance(options, list) or not all(isinstance(item, str) for item in options):
+            raise ValueError(f"options 得是字符串数组，收到的是 {options!r}")
+        return prompter.single_choice(kwargs["question"], options)
+
+    return Tool(
+        name="ask_user",
+        description=(
+            "把选择摆给用户，让他在几个选项里挑一个。需要用户拍板的事——偏好、取舍、"
+            "没有唯一正确答案的设计选择——用它，不要自己替他决定。"
+        ),
+        fn=ask_user,
+        params=ASK_USER_SCHEMA,
+    )

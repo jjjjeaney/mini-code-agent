@@ -6,6 +6,7 @@ import pytest
 
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.permissions import PermissionRequest
+from mini_code_agent.prompting import make_ask_user
 from mini_code_agent.providers.base import ModelResponse, ToolCall
 from mini_code_agent.tools import Tool, ToolContext, ToolRegistry, default_tools
 
@@ -349,3 +350,20 @@ def test_without_a_prompter_the_ask_path_denies():
 
     assert log == []
     assert blocked_blocks(result)[0]["is_error"] is True
+
+
+def test_the_model_can_ask_the_user_and_gets_the_answer_back():
+    """ask_user 就是个普通工具：问出来的答案按 tool_result 回去，模型接着往下走。"""
+    prompter = RecordingPrompter()
+    registry = ToolRegistry([make_ask_user(prompter)])
+    provider = ScriptedProvider(
+        [
+            tool_turn("t1", "ask_user", {"question": "用哪个？", "options": ["选项A", "选项B"]}),
+            text_turn("好"),
+        ]
+    )
+
+    result = runagent("帮我拿个主意", provider, registry, prompter=prompter)
+
+    assert result.trace[1] == "← ask_user: 选项A"  # RecordingPrompter 挑第一个
+    assert result.final == "好"

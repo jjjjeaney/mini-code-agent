@@ -8,8 +8,9 @@ import typer
 
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.permissions import parse_permission_mode
-from mini_code_agent.prompting import TerminalPrompter
+from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.providers.anthropic import AnthropicProvider
+from mini_code_agent.tools import default_tools
 
 app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
 
@@ -34,10 +35,14 @@ def main_command(
     # prompter 建一次、两个分支共用：它的答案以后要带"这一次会话别再问了"这种记忆，
     # 每轮新建一个的话那份记忆就丢了。
     prompter = TerminalPrompter()
+    # ask_user 只在"有人可问"的时候才存在，所以它不在 default_tools() 里，在这儿装进来。
+    registry = default_tools()
+    registry.register(make_ask_user(prompter))
     if prompt:
         result = runagent(
             prompt,
             AnthropicProvider(),
+            registry,
             cwd=cwd,
             allow_shell=shell,
             permission_mode=permission_mode,
@@ -62,6 +67,7 @@ def main_command(
                 result = runagent(
                     line,
                     AnthropicProvider(),
+                    registry,
                     cwd=cwd,
                     allow_shell=shell,
                     permission_mode=permission_mode,
