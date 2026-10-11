@@ -135,8 +135,13 @@ def runagent(
                 markup=False,
             )
             results.append(result)
-
+        
+        
         # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
         messages.append({"role": "user", "content": [r.to_anthropic_block() for r in results]})
-
+    if final is None:
+        messages.append({"role": "user", "content": "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"})
+        response = provider.complete(messages, system=system)
+        final = response.text
+        trace.append(final)
     return AgentResult(final=final, trace=trace, messages=messages)

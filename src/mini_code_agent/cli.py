@@ -76,12 +76,6 @@ def main_command(
                     permission_mode=permission_mode,
                     prompter=prompter,
                 )
-                if result.final is None:
-                    typer.echo(
-                        f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
-                        err=True,
-                    )
-                    continue
                 console.print(f"\n{result.final}", markup=False)
         except (typer.Abort, EOFError, KeyboardInterrupt):
             # Ctrl+C / Ctrl+D 都当正常退出。打断时提示符后面没有换行，先补一个，
