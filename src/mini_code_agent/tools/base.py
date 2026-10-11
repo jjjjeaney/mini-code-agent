@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mini_code_agent.tools.prompt import NullPrompter, Prompter
+
 
 @dataclass
 class ReadFileState:
@@ -85,11 +87,16 @@ class ToolContext:
 
     allow_shell 管的是能不能跑命令。默认关着——执行任意命令是这个 agent 里权限最大
     的一件事，不该因为"顺手"就默认打开。
+
+    prompter 是"问用户"那件事的方式（四个问法见 tools/prompt.py）。缺省是 NullPrompter：
+    一律拒绝、绝不等输入——非交互的场景不该因为没人可问就崩掉，也不该挂在没人看的提示符
+    上。会真的问用户的那个实现住在 CLI 那层，由调用方换进来。
     """
 
     cwd: Path
     read_state: ReadFileState=field(default_factory=ReadFileState)
     allow_shell: bool = False
+    prompter: Prompter = field(default_factory=NullPrompter)
 
 
 @dataclass

@@ -7,6 +7,7 @@ import pytest
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.providers.base import ModelResponse, ToolCall
 from mini_code_agent.tools import Tool, ToolContext, ToolRegistry, default_tools
+from mini_code_agent.tools.permissions import PermissionRequest
 
 ADD_SCHEMA = {
     "type": "object",
@@ -189,3 +190,149 @@ def test_running_out_of_steps_ends_with_a_result_not_an_answer(registry):
     assert result.final is None
     assert len(result.trace) == 6
     assert result.trace[-1].startswith("← add: ")
+
+
+class RecordingPrompter:
+    """记下问了什么、按剧本回答。四个方法都得有——harness 按工具类别挑一个调。"""
+
+    def __init__(self, answer: bool = True) -> None:
+        self.answer = answer
+        self.tools: list[PermissionRequest] = []
+        self.commands: list[str] = []
+
+    def confirm_command(self, command: str) -> bool:
+        self.commands.append(command)
+        return self.answer
+
+    def confirm_tool(self, request: PermissionRequest) -> bool:
+        self.tools.append(request)
+        return self.answer
+
+    def confirm_edit(self, request: PermissionRequest) -> bool:
+        self.tools.append(request)
+        return self.answer
+
+    def single_choice(self, question: str, options: list[str]) -> str:
+        return options[0]
+
+
+def gated_registry(name: str, log: list[str]) -> ToolRegistry:
+    """只装一个工具的注册表，真跑过就在 log 里记一笔。"""
+
+    def fn(kwargs: dict, ctx: ToolContext) -> str:
+        log.append(name)
+        return "跑过了"
+
+    return ToolRegistry([Tool(name=name, description="", fn=fn, params={})])
+
+
+def blocked_blocks(result) -> list[dict]:
+    """回给模型的那条 tool_result。"""
+    return result.messages[2]["content"]
+
+
+def test_a_read_only_tool_is_not_asked():
+    log: list[str] = []
+    prompter = RecordingPrompter()
+    provider = ScriptedProvider([tool_turn("t1", "read_file", {}), text_turn("好了")])
+
+    runagent("读一下", provider, gated_registry("read_file", log), prompter=prompter)
+
+    assert log == ["read_file"]
+    assert prompter.tools == []
+
+
+def test_an_edit_tool_runs_without_asking_in_accept_edit_mode():
+    log: list[str] = []
+    prompter = RecordingPrompter()
+    provider = ScriptedProvider([tool_turn("t1", "edit_file", {}), text_turn("改好了")])
+
+    runagent(
+        "改一下",
+        provider,
+        gated_registry("edit_file", log),
+        permission_mode="accept edit",
+        prompter=prompter,
+    )
+
+    assert log == ["edit_file"]
+    assert prompter.tools == []
+
+
+def test_an_edit_tool_is_denied_in_plan_mode():
+    log: list[str] = []
+    prompter = RecordingPrompter()
+    provider = ScriptedProvider([tool_turn("t1", "edit_file", {}), text_turn("那我不改了")])
+
+    result = runagent(
+        "改一下",
+        provider,
+        gated_registry("edit_file", log),
+        permission_mode="plan",
+        prompter=prompter,
+    )
+
+    assert log == []  # 工具根本没跑
+    assert prompter.tools == []  # 也没问——策略直接拒了
+    assert result.trace[1].startswith("✗ edit_file: ")
+    assert "plan" in result.trace[1]
+    assert blocked_blocks(result)[0]["is_error"] is True
+    assert result.final == "那我不改了"  # 模型收到了拒绝，接着把话说完
+
+
+def test_default_mode_asks_before_editing_and_runs_when_allowed():
+    log: list[str] = []
+    prompter = RecordingPrompter(answer=True)
+    provider = ScriptedProvider(
+        [tool_turn("t1", "edit_file", {"path": "a.txt"}), text_turn("改好了")]
+    )
+
+    runagent("改一下", provider, gated_registry("edit_file", log), prompter=prompter)
+
+    assert [r.tool_name for r in prompter.tools] == ["edit_file"]
+    assert log == ["edit_file"]
+
+
+def test_a_no_from_the_user_stops_the_tool():
+    log: list[str] = []
+    prompter = RecordingPrompter(answer=False)
+    provider = ScriptedProvider(
+        [tool_turn("t1", "edit_file", {"path": "a.txt"}), text_turn("好，不动它")]
+    )
+
+    result = runagent("改一下", provider, gated_registry("edit_file", log), prompter=prompter)
+
+    assert log == []
+    assert blocked_blocks(result)[0]["is_error"] is True
+    assert "用户拒绝" in result.trace[1]
+
+
+def test_bash_always_asks_even_in_accept_edit_mode():
+    """档位管的是改文件那类动作，管不到跑命令。"""
+    log: list[str] = []
+    prompter = RecordingPrompter(answer=True)
+    provider = ScriptedProvider(
+        [tool_turn("t1", "bash", {"command": "pytest -q"}), text_turn("跑完了")]
+    )
+
+    runagent(
+        "跑个测试",
+        provider,
+        gated_registry("bash", log),
+        permission_mode="accept edit",
+        prompter=prompter,
+    )
+
+    assert prompter.commands == ["pytest -q"]  # 问的是命令行本身
+    assert log == ["bash"]
+
+
+def test_without_a_prompter_the_ask_path_denies():
+    """非交互的跑法不该挂在提示符上：没人可问，就当拒绝。"""
+    log: list[str] = []
+    provider = ScriptedProvider([tool_turn("t1", "edit_file", {}), text_turn("好")])
+
+    result = runagent("改一下", provider, gated_registry("edit_file", log))
+
+    assert log == []
+    assert blocked_blocks(result)[0]["is_error"] is True
