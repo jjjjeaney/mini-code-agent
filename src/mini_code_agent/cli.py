@@ -6,6 +6,7 @@ from pathlib import Path
 
 import typer
 
+from mini_code_agent.console import console
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.permissions import parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
@@ -39,6 +40,8 @@ def main_command(
     registry = default_tools()
     registry.register(make_ask_user(prompter))
     if prompt:
+        # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
+        console.print(f"> {prompt}", style="bold", markup=False)
         result = runagent(
             prompt,
             AnthropicProvider(),
@@ -54,7 +57,7 @@ def main_command(
                 err=True,
             )
             raise typer.Exit(code=1)
-        typer.echo(result.final)
+        console.print(f"\n{result.final}", markup=False)
         return
     else:
         try:
@@ -79,7 +82,7 @@ def main_command(
                         err=True,
                     )
                     continue
-                typer.echo(result.final)
+                console.print(f"\n{result.final}", markup=False)
         except (typer.Abort, EOFError, KeyboardInterrupt):
             # Ctrl+C / Ctrl+D 都当正常退出。打断时提示符后面没有换行，先补一个，
             # 免得 bye 紧跟在 "^C" 后面。

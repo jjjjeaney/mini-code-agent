@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mini_code_agent.console import console
 from mini_code_agent.permissions import EDIT_TOOLS, PermissionRequest, decide_permission
 from mini_code_agent.prompts import NullPrompter, Prompter
 from mini_code_agent.providers.base import Provider, ToolCall
@@ -120,7 +121,7 @@ def runagent(
         for call in response.tool_calls:
             # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
             trace.append(_render_call(call))
-            print(_render_call(call))
+            console.print(_render_call(call), style="cyan", markup=False)
 
             # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
             result = _gate(call, prompter, allow_shell, permission_mode)
@@ -128,7 +129,11 @@ def runagent(
                 result = registry.dispatch(ctx, call)
 
             trace.append(_render_result(result))
-            print(_render_result(result))
+            console.print(
+                _render_result(result),
+                style="red" if result.is_error else "green",
+                markup=False,
+            )
             results.append(result)
 
         # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
