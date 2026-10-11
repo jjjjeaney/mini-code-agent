@@ -1,31 +1,46 @@
-"""权限模式：用户指定的那一档，以及判定要用的两个类型。
+"""权限模式：用户指定的那一档，以及判定要用的几个类型。
 
-三种模式管的都是"改文件的工具要不要一个个问"：
+四档，和 Claude Code 同名同义：
 
-- `accept edit`：默认同意。模型改文件不再逐个确认——给"我知道它在改什么、别老打断我"
-  的时候用
-- `default`：要用户确认。每次改文件都停下来问一句
-- `plan`：默认拒绝。计划模式——只读，先让模型把打算怎么做讲清楚，再切出去执行
+- `default`：改文件和跑命令都停下来问
+- `accept edits`：改文件不问（自动放行），跑命令仍然要问
+- `plan`：不给改文件——计划模式，先让模型把打算怎么做讲清楚，再切出去执行
+- `bypass permissions`：什么都不问
 
-bash 不在这三档里：**不论什么模式都要用户确认**（除非压根没开 shell——那时先弹一句询问、
-答完才发现跑不了，是白问）。一条命令会干什么，用户事先看不出来（沙箱挡的是它碰不到
-宿主机，不是它做的事对不对），所以它不跟着模式走。
+**bypass permissions 是唯一一档把用户从回路里拿掉的**，所以它必须显式开（命令行给），不该
+有快捷键在会话里循环切进来。开了之后模型跑命令不再经过用户，而命令能改项目里任何文件、
+也能把 `.env` 读进上下文（见 known-issues A1 / A2）。它放行的只是"要不要问"这一层——工具
+自己的闸门（围栏、符号链接、敏感路径、读-before-写、改前备份）照样管用：权限不是授权，
+批准过的事也不该能写出围栏。
 
-这些是**默认**答案：模式定的是"不问的时候怎么办"，具体到某一次调用还可能被别的条件
-改成要问（比如路径在不在围栏里）。这个模块管两件事：把用户敲的档位解析成规范值，
-以及判定要用的请求/结果两个类型；判定逻辑本身在 decide_permission 里。
+bash 跟不跟档位走，看档位：`default` 和 `accept edits` 下它一律要问（一条命令会干什么，
+用户事先看不出来），`bypass permissions` 下不问，`plan` 下仍然要问——那一格还没定，见
+known-issues F2。
+
+这些是**默认**答案：模式定的是"不问的时候怎么办"，具体到某一次调用还可能被别的条件改成
+要问（比如本会话批过的文件就不再问，见 Grants）。这个模块管三件事：把用户敲的档位解析成
+规范值、判定要用的请求/结果两个类型、以及本会话已经批过的调用；判定逻辑本身在
+decide_permission 里，它不认识 Grants。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Literal, get_args
 
-# 三个档位。参数标注、parse_permission_mode 的返回值、报错里列出的可选值都指向这一处，
-# 以后想加第四档只改这里。
-PermissionMode = Literal["accept edit", "default", "plan"]
+# 四个档位。参数标注、parse_permission_mode 的返回值、报错里列出的可选值都指向这一处，
+# 以后想加第五档只改这里。
+PermissionMode = Literal["accept edits", "bypass permissions", "default", "plan"]
 
 PERMISSION_MODES: tuple[PermissionMode, ...] = get_args(PermissionMode)
+
+# 命令行上省事的短写法。**整词匹配**（归一化之后），不做前缀——`bypass` 是这一档的约定
+# 短名，`bypas` 不是。键也留着归一化之后的样子（没有空格、小写）。
+SHORT_FORMS: dict[str, PermissionMode] = {
+    "accept": "accept edits",
+    "bypass": "bypass permissions",
+}
 
 
 # 会改磁盘的那几个工具。模式判定（哪一档管它们）和"该给用户看改动还是看参数"都按这一份
@@ -47,9 +62,9 @@ class PermissionDecision:
 def parse_permission_mode(value: str) -> PermissionMode:
     """把用户敲的那一档解析成规范值。
 
-    `accept edit` 中间有个空格，命令行上敲起来别扭，所以这几种写法都算同一个：
-    `accept edit`、`accept_edit`、`accept-edit`、`acceptedit`——比的是"只留下字母数字、
-    并转成小写"之后的样子，因此大小写和空格对数都不计较。
+    有两档的名字中间带着空格，命令行上敲起来别扭，所以这几种写法都算同一个：
+    `accept edits`、`accept_edits`、`accept-edits`、`acceptEdits`——比的是"只留下字母数字、
+    并转成小写"之后的样子，因此大小写和空格对数都不计较。`bypass permissions` 同理。
 
     看不懂的词直接报错，并把可选值列出来。**不比默认值兜底**：兜底的后果是用户以为
     切到了某一档、实际在另一档上跑，那种误解不该由默认值来消化。
@@ -60,8 +75,11 @@ def parse_permission_mode(value: str) -> PermissionMode:
     for mode in PERMISSION_MODES:
         if squashed == mode.replace(" ", ""):
             return mode
+    if squashed in SHORT_FORMS:
+        return SHORT_FORMS[squashed]
     options = "、".join(f"{mode!r}" for mode in PERMISSION_MODES)
-    raise ValueError(f"{value!r} 不是权限模式。可选：{options}")
+    shorts = "、".join(f"{name!r}" for name in SHORT_FORMS)
+    raise ValueError(f"{value!r} 不是权限模式。可选：{options}（短写法：{shorts}）")
 
 
 def decide_permission(
@@ -69,12 +87,13 @@ def decide_permission(
 ) -> PermissionDecision:
     """判一次调用该不该放行：allow / deny / ask。
 
-    - bash 得开了 shell 才谈得上问。没开的话它本来就会报"没开命令执行"，没必要先弹一句
-      询问、再让人发现跑不了——直接放行，把那句报错留给工具自己去说
-    - bash **不论哪一档都要问用户**。一条命令会干什么，用户事先看不出来；档位管的是
-      "改文件那类动作用不用一个个问"，管不到它
+    - `bypass permissions` 一律放行，最先短路。它是唯一一档不把用户放进回路的——但也只管
+      "要不要问"这一层：工具自己的闸门（围栏、敏感路径、读-before-写）不归它管
+    - bash：`default` / `accept edits` / `plan` 下都要问用户（一条命令会干什么，用户事先
+      看不出来）。没开 shell 时直接放行——它本来就会报"没开命令执行"，先弹一句询问、答完
+      才发现跑不了，是白问
     - 其余的工具一律放行——读文件、列目录、搜索本来就只受路径闸门管，逐个问没人受得了
-    - 改文件的那几个（EDIT_TOOLS）看档位：`accept edit` 放行、`default` 问、`plan` 拒绝
+    - 改文件的那几个（EDIT_TOOLS）看档位：`accept edits` 放行、`default` 问、`plan` 拒绝
 
     "ask" 不是答案，是"这事得问用户"；真的去问、以及用户说不行之后怎么办，在 harness 那层。
 
@@ -83,14 +102,59 @@ def decide_permission(
     """
     mode = parse_permission_mode(permission_mode)
 
+    if mode == "bypass permissions":
+        return PermissionDecision("allow", "")
+
     if request.tool_name == "bash":
         if not allow_shell:
             return PermissionDecision("allow", "")
         return PermissionDecision("ask", "跑命令要用户确认")
+
     if request.tool_name not in EDIT_TOOLS:
         return PermissionDecision("allow", "")
-    if mode == "accept edit":
+
+    if mode == "accept edits":
         return PermissionDecision("allow", "")
     if mode == "plan":
         return PermissionDecision("deny", "plan 模式只读，不给改文件")
     return PermissionDecision("ask", "改文件要用户确认")
+
+
+def _grant_key(request: PermissionRequest) -> tuple[str, str] | None:
+    """这次调用能不能被记住；能的话，键是什么。
+
+    只有改文件的那几个、而且带了 path 的才记。路径要**归一化**：同一个文件模型可能写成
+    a.py、./a.py、src/../a.py，不归一化就会重复问——重复问是安全的那一侧，但很烦。
+    normpath 只做字符串归约，不碰文件系统、也不判围栏（那是工具的事）；两边都用它，
+    写法的差异就抹平了。
+    """
+    if request.tool_name not in EDIT_TOOLS:
+        return None
+    path = request.tool_args.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    return request.tool_name, os.path.normpath(path)
+
+
+@dataclass
+class Grants:
+    """本会话里用户说过"别再问了"的那些调用。进程退出就没了，不落盘。
+
+    键是 (工具名, 路径)。按工具名记太宽了——"允许 write_file"等于允许写**任何**文件，
+    比逐次问还危险；按路径记才最小可用：同一个文件连着改几处只问一次，换个文件再问。
+
+    只记改文件那几个：bash 不在内——命令之间差异太大，按整条记没意义，按程序名
+    （git / pytest）记又太粗，而它是唯一没有 diff 可看的调用，逐条点头是对的。
+    """
+
+    entries: set[tuple[str, str]] = field(default_factory=set)
+
+    def covers(self, request: PermissionRequest) -> bool:
+        key = _grant_key(request)
+        return key is not None and key in self.entries
+
+    def remember(self, request: PermissionRequest) -> None:
+        """记下这次批准。记不了的（比如 bash）就当没说——调用方不必先判能不能记。"""
+        key = _grant_key(request)
+        if key is not None:
+            self.entries.add(key)

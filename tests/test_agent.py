@@ -5,8 +5,9 @@ from __future__ import annotations
 import pytest
 
 from mini_code_agent.core.agent import runagent
-from mini_code_agent.permissions import PermissionRequest
+from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompting import make_ask_user
+from mini_code_agent.prompts import Answer
 from mini_code_agent.providers.base import ModelResponse, ToolCall
 from mini_code_agent.tools import Tool, ToolContext, ToolRegistry, default_tools
 
@@ -196,22 +197,29 @@ def test_running_out_of_steps_ends_with_a_result_not_an_answer(registry):
 class RecordingPrompter:
     """记下问了什么、按剧本回答。四个方法都得有——harness 按工具类别挑一个调。"""
 
-    def __init__(self, answer: bool = True) -> None:
-        self.answer = answer
+    def __init__(
+        self, allowed: bool = True, remember: bool = False, note: str = ""
+    ) -> None:
+        self.allowed = allowed
+        self.remember = remember
+        self.note = note
         self.tools: list[PermissionRequest] = []
 
-    def confirm_command(self, command: str) -> bool:
+    def confirm_command(self, command: str) -> Answer:
         # harness 现在不直接调这一条：bash 也走 confirm_tool，那行命令由 prompter 自己
         # 认出来（见 prompting.py）。协议要求实现它，所以留着。
-        return self.answer
+        return self._answer()
 
-    def confirm_tool(self, request: PermissionRequest) -> bool:
+    def confirm_tool(self, request: PermissionRequest) -> Answer:
         self.tools.append(request)
-        return self.answer
+        return self._answer()
 
-    def confirm_edit(self, request: PermissionRequest) -> bool:
+    def confirm_edit(self, request: PermissionRequest) -> Answer:
         self.tools.append(request)
-        return self.answer
+        return self._answer()
+
+    def _answer(self) -> Answer:
+        return Answer(self.allowed, remember=self.remember, note=self.note)
 
     def single_choice(self, question: str, options: list[str]) -> str:
         return options[0]
@@ -243,7 +251,7 @@ def test_a_read_only_tool_is_not_asked():
     assert prompter.tools == []
 
 
-def test_an_edit_tool_runs_without_asking_in_accept_edit_mode():
+def test_an_edit_tool_runs_without_asking_in_accept_edits_mode():
     log: list[str] = []
     prompter = RecordingPrompter()
     provider = ScriptedProvider([tool_turn("t1", "edit_file", {}), text_turn("改好了")])
@@ -252,7 +260,7 @@ def test_an_edit_tool_runs_without_asking_in_accept_edit_mode():
         "改一下",
         provider,
         gated_registry("edit_file", log),
-        permission_mode="accept edit",
+        permission_mode="accept edits",
         prompter=prompter,
     )
 
@@ -283,7 +291,7 @@ def test_an_edit_tool_is_denied_in_plan_mode():
 
 def test_default_mode_asks_before_editing_and_runs_when_allowed():
     log: list[str] = []
-    prompter = RecordingPrompter(answer=True)
+    prompter = RecordingPrompter(allowed=True)
     provider = ScriptedProvider(
         [tool_turn("t1", "edit_file", {"path": "a.txt"}), text_turn("改好了")]
     )
@@ -296,7 +304,7 @@ def test_default_mode_asks_before_editing_and_runs_when_allowed():
 
 def test_a_no_from_the_user_stops_the_tool():
     log: list[str] = []
-    prompter = RecordingPrompter(answer=False)
+    prompter = RecordingPrompter(allowed=False)
     provider = ScriptedProvider(
         [tool_turn("t1", "edit_file", {"path": "a.txt"}), text_turn("好，不动它")]
     )
@@ -308,10 +316,10 @@ def test_a_no_from_the_user_stops_the_tool():
     assert "用户拒绝" in result.trace[1]
 
 
-def test_bash_always_asks_even_in_accept_edit_mode():
+def test_bash_always_asks_even_in_accept_edits_mode():
     """档位管的是改文件那类动作，管不到跑命令。"""
     log: list[str] = []
-    prompter = RecordingPrompter(answer=True)
+    prompter = RecordingPrompter(allowed=True)
     provider = ScriptedProvider(
         [tool_turn("t1", "bash", {"command": "pytest -q"}), text_turn("跑完了")]
     )
@@ -321,7 +329,7 @@ def test_bash_always_asks_even_in_accept_edit_mode():
         provider,
         gated_registry("bash", log),
         allow_shell=True,
-        permission_mode="accept edit",
+        permission_mode="accept edits",
         prompter=prompter,
     )
 
@@ -332,13 +340,51 @@ def test_bash_always_asks_even_in_accept_edit_mode():
 def test_bash_is_not_even_asked_when_shell_is_off():
     """没开 shell 的话它本来就跑不了。先弹一句询问、答完才发现跑不了，那是白问。"""
     log: list[str] = []
-    prompter = RecordingPrompter(answer=True)
+    prompter = RecordingPrompter(allowed=True)
     provider = ScriptedProvider([tool_turn("t1", "bash", {"command": "ls"}), text_turn("好")])
 
     runagent("跑个测试", provider, gated_registry("bash", log), prompter=prompter)
 
     assert prompter.tools == []  # 没问
     assert log == ["bash"]  # 工具照跑，"没开命令执行"那句话由它自己说
+
+
+def test_bypass_permissions_asks_nothing():
+    """唯一一档不把用户放进回路。那个 prompter 会答"不准"，但它不该轮得到被问。"""
+    log: list[str] = []
+    prompter = RecordingPrompter(allowed=False)
+    provider = ScriptedProvider([tool_turn("t1", "edit_file", {}), text_turn("好")])
+
+    runagent(
+        "改一下",
+        provider,
+        gated_registry("edit_file", log),
+        permission_mode="bypass permissions",
+        prompter=prompter,
+    )
+
+    assert prompter.tools == []
+    assert log == ["edit_file"]
+
+
+def test_bypass_permissions_lets_commands_through_too():
+    log: list[str] = []
+    prompter = RecordingPrompter(allowed=False)
+    provider = ScriptedProvider(
+        [tool_turn("t1", "bash", {"command": "pytest -q"}), text_turn("好")]
+    )
+
+    runagent(
+        "跑个测试",
+        provider,
+        gated_registry("bash", log),
+        allow_shell=True,
+        permission_mode="bypass permissions",
+        prompter=prompter,
+    )
+
+    assert prompter.tools == []
+    assert log == ["bash"]
 
 
 def test_without_a_prompter_the_ask_path_denies():
@@ -367,3 +413,156 @@ def test_the_model_can_ask_the_user_and_gets_the_answer_back():
 
     assert result.trace[1] == "← ask_user: 选项A"  # RecordingPrompter 挑第一个
     assert result.final == "好"
+
+
+class TestGrants:
+    """本会话批过的调用不再问——粒度是 (工具, 路径)。"""
+
+    def two_edits(self, first: str, second: str) -> ScriptedProvider:
+        return ScriptedProvider(
+            [
+                tool_turn("t1", "edit_file", {"path": first}),
+                tool_turn("t2", "edit_file", {"path": second}),
+                text_turn("好"),
+            ]
+        )
+
+    def test_a_remembered_file_is_not_asked_again(self):
+        log: list[str] = []
+        prompter = RecordingPrompter(allowed=True, remember=True)
+
+        runagent(
+            "改两次",
+            self.two_edits("a.txt", "a.txt"),
+            gated_registry("edit_file", log),
+            prompter=prompter,
+            max_steps=3,
+        )
+
+        assert len(prompter.tools) == 1  # 只问了一次
+        assert log == ["edit_file", "edit_file"]  # 两次都真跑了
+
+    def test_the_grant_covers_that_file_only(self):
+        log: list[str] = []
+        prompter = RecordingPrompter(allowed=True, remember=True)
+
+        runagent(
+            "改两个文件",
+            self.two_edits("a.txt", "b.txt"),
+            gated_registry("edit_file", log),
+            prompter=prompter,
+            max_steps=3,
+        )
+
+        assert [r.tool_args["path"] for r in prompter.tools] == ["a.txt", "b.txt"]
+
+    def test_the_path_is_normalized_before_remembering(self):
+        """a.txt / ./a.txt / src/../a.txt 是同一个文件，不该为写法差异再问一次。"""
+        log: list[str] = []
+        prompter = RecordingPrompter(allowed=True, remember=True)
+
+        runagent(
+            "改同一个文件",
+            self.two_edits("a.txt", "./a.txt"),
+            gated_registry("edit_file", log),
+            prompter=prompter,
+            max_steps=3,
+        )
+
+        assert len(prompter.tools) == 1
+
+    def test_a_grant_cannot_override_plan_mode(self):
+        """plan 是 deny，Grants 只能把 ask 变成 allow——翻不了盘。"""
+        log: list[str] = []
+        prompter = RecordingPrompter(allowed=True, remember=True)
+        provider = ScriptedProvider(
+            [tool_turn("t1", "edit_file", {"path": "a.txt"}), text_turn("好")]
+        )
+
+        result = runagent(
+            "改一下",
+            provider,
+            gated_registry("edit_file", log),
+            permission_mode="plan",
+            prompter=prompter,
+        )
+
+        assert log == []
+        assert prompter.tools == []  # 连问都没问
+        assert blocked_blocks(result)[0]["is_error"] is True
+
+    def test_grants_do_not_leak_between_runs(self):
+        """不传 grants 就是空的：两次 runagent 各问各的（记忆得由调用方带着走）。"""
+        log: list[str] = []
+        prompter = RecordingPrompter(allowed=True, remember=True)
+
+        for _ in range(2):
+            runagent(
+                "改一下",
+                self.two_edits("a.txt", "a.txt"),
+                gated_registry("edit_file", log),
+                prompter=prompter,
+                max_steps=2,
+            )
+
+        assert len(prompter.tools) == 2
+
+    def test_a_shared_grants_object_carries_across_runs(self):
+        """传同一份 Grants 就不问了——CLI 就是建一次、每轮传同一份。"""
+        log: list[str] = []
+        grants = Grants()
+        prompter = RecordingPrompter(allowed=True, remember=True)
+
+        for _ in range(2):
+            runagent(
+                "改一下",
+                self.two_edits("a.txt", "a.txt"),
+                gated_registry("edit_file", log),
+                prompter=prompter,
+                grants=grants,
+                max_steps=2,
+            )
+
+        assert len(prompter.tools) == 1
+
+    def test_a_command_is_never_remembered(self):
+        """bash 那条没有"别再问"这一档：按整条命令记没意义，按程序名记又太粗。"""
+        grants = Grants()
+        command = PermissionRequest(tool_name="bash", tool_args={"command": "ls"})
+
+        grants.remember(command)
+
+        assert grants.covers(command) is False
+
+    def test_a_refusal_does_not_grant_anything(self):
+        """记住的前提是放行：一个"拒绝但记住"的答案不该把文件记进去。"""
+        log: list[str] = []
+        grants = Grants()
+        prompter = RecordingPrompter(allowed=False, remember=True)
+        provider = ScriptedProvider(
+            [tool_turn("t1", "edit_file", {"path": "a.txt"}), text_turn("好")]
+        )
+
+        runagent(
+            "改一下",
+            provider,
+            gated_registry("edit_file", log),
+            prompter=prompter,
+            grants=grants,
+        )
+
+        assert grants.entries == set()
+        assert log == []
+
+    def test_the_users_reason_is_carried_back_to_the_model(self):
+        """用户写下的理由比我们替他猜的准，原样回给模型。"""
+        log: list[str] = []
+        prompter = RecordingPrompter(allowed=False, note="改 bar.py 而不是这个")
+        provider = ScriptedProvider(
+            [tool_turn("t1", "edit_file", {"path": "a.txt"}), text_turn("好")]
+        )
+
+        result = runagent("改一下", provider, gated_registry("edit_file", log), prompter=prompter)
+
+        assert "改 bar.py 而不是这个" in result.trace[1]
+        assert log == []

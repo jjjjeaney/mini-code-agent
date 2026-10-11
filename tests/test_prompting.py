@@ -19,7 +19,7 @@ from mini_code_agent.prompting import (
     preview_edit,
     preview_tool,
 )
-from mini_code_agent.prompts import NobodyToAskError, NullPrompter
+from mini_code_agent.prompts import Answer, NobodyToAskError, NullPrompter
 from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools import ToolContext, ToolRegistry
 
@@ -155,18 +155,18 @@ class TestInterpretChoice:
 
 class TestTerminalPrompter:
     def test_a_yes_goes_through(self, monkeypatch):
-        monkeypatch.setattr(prompting.typer, "confirm", lambda *a, **k: True)
+        monkeypatch.setattr(prompting.typer, "prompt", answering("y"))
 
-        assert TerminalPrompter().confirm_command("pytest -q") is True
+        assert TerminalPrompter().confirm_command("pytest -q").allowed is True
 
     def test_a_no_goes_through(self, monkeypatch):
-        monkeypatch.setattr(prompting.typer, "confirm", lambda *a, **k: False)
+        monkeypatch.setattr(prompting.typer, "prompt", answering("n"))
 
-        assert TerminalPrompter().confirm_tool(request("bash", command="ls")) is False
+        assert TerminalPrompter().confirm_tool(request("bash", command="ls")).allowed is False
 
     def test_bash_is_shown_as_a_command_line(self, monkeypatch, capsys):
         """bash 从 confirm_tool 进来，渲染的却是那行命令——分派是 prompter 自己做的。"""
-        monkeypatch.setattr(prompting.typer, "confirm", lambda *a, **k: True)
+        monkeypatch.setattr(prompting.typer, "prompt", answering("y"))
 
         TerminalPrompter().confirm_tool(request("bash", command="pytest -q"))
 
@@ -174,7 +174,7 @@ class TestTerminalPrompter:
 
     def test_the_preview_goes_to_stderr_not_stdout(self, monkeypatch, capsys):
         """stdout 留给最终答案：`mca "..." > out.txt` 不该收到提示。"""
-        monkeypatch.setattr(prompting.typer, "confirm", lambda *a, **k: True)
+        monkeypatch.setattr(prompting.typer, "prompt", answering("y"))
 
         TerminalPrompter().confirm_command("pytest -q")
 
@@ -184,9 +184,43 @@ class TestTerminalPrompter:
 
     def test_an_interrupt_is_a_no_not_an_exit(self, monkeypatch):
         """Ctrl+C / 输入流断了：拒绝这一次，别把整个会话掀了。"""
-        monkeypatch.setattr(prompting.typer, "confirm", aborting)
+        monkeypatch.setattr(prompting.typer, "prompt", aborting)
 
-        assert TerminalPrompter().confirm_edit(request("edit_file", path="a.txt")) is False
+        answer = TerminalPrompter().confirm_edit(request("edit_file", path="a.txt"))
+
+        assert answer.allowed is False
+
+    def test_editing_offers_a_remember_option(self, monkeypatch):
+        """改文件那一档可以答"本会话这个文件别再问了"。"""
+        monkeypatch.setattr(prompting.typer, "prompt", answering("a"))
+
+        answer = TerminalPrompter().confirm_edit(request("edit_file", path="a.txt"))
+
+        assert answer.allowed is True
+        assert answer.remember is True
+
+    def test_a_command_does_not_offer_it(self, monkeypatch, capsys):
+        monkeypatch.setattr(prompting.typer, "prompt", answering("a"))
+
+        answer = TerminalPrompter().confirm_command("pytest -q")
+
+        assert answer.remember is False
+        assert "本会话" not in capsys.readouterr().err  # 提示里也不该出现这一档
+
+    def test_a_written_reason_comes_back_as_a_note(self, monkeypatch):
+        """不是那三个键的输入，当作用户把理由写下来了——那算拒绝，理由带回去。"""
+        monkeypatch.setattr(prompting.typer, "prompt", answering("改 bar.py 而不是这个"))
+
+        answer = TerminalPrompter().confirm_edit(request("edit_file", path="a.txt"))
+
+        assert answer.allowed is False
+        assert answer.note == "改 bar.py 而不是这个"
+
+    def test_an_empty_answer_is_asked_again(self, monkeypatch):
+        """直接回车不算回答：放行这种事不该有一个顺手敲过去就过的默认值。"""
+        monkeypatch.setattr(prompting.typer, "prompt", answering("", "y"))
+
+        assert TerminalPrompter().confirm_command("pytest -q").allowed is True
 
     def test_single_choice_returns_the_picked_option(self, monkeypatch):
         monkeypatch.setattr(prompting.typer, "prompt", answering("2"))
@@ -213,14 +247,14 @@ class FixedPrompter:
         self.answer = answer
         self.asked: list[tuple[str, list[str]]] = []
 
-    def confirm_command(self, command: str) -> bool:
-        return True
+    def confirm_command(self, command: str) -> Answer:
+        return Answer(True)
 
-    def confirm_tool(self, request: PermissionRequest) -> bool:
-        return True
+    def confirm_tool(self, request: PermissionRequest) -> Answer:
+        return Answer(True)
 
-    def confirm_edit(self, request: PermissionRequest) -> bool:
-        return True
+    def confirm_edit(self, request: PermissionRequest) -> Answer:
+        return Answer(True)
 
     def single_choice(self, question: str, options: list[str]) -> str:
         self.asked.append((question, list(options)))

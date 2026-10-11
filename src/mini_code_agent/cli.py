@@ -8,7 +8,7 @@ import typer
 
 from mini_code_agent.console import console
 from mini_code_agent.core.agent import runagent
-from mini_code_agent.permissions import parse_permission_mode
+from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.providers.anthropic import AnthropicProvider
 from mini_code_agent.tools import default_tools
@@ -23,7 +23,11 @@ def main_command(
     shell: bool = typer.Option(
         False, "--shell", help="允许 agent 执行命令（跑在一次性 docker 容器里）"
     ),
-    permission_mode: str = typer.Option("default","--permission_mode", help=""),
+    permission_mode: str = typer.Option(
+        "default",
+        "--permission_mode",
+        help=f"权限档位：{' / '.join(PERMISSION_MODES)}（accept / bypass 是短写法）",
+    ),
 ) -> None:
     """把指令交给 agent，把最终回复打印到标准输出。"""
     prompt = prompt.strip()
@@ -33,9 +37,22 @@ def main_command(
         # 在门口就把错字拦住。跑起来才发现档位不对的话，那时已经有工具调用被放行了。
         raise typer.BadParameter(str(exc), param_hint="--permission_mode") from None
 
+    if permission_mode == "bypass permissions":
+        # 唯一一档把用户从回路里拿掉。开的时候说一声，别让它悄悄生效——它不是常驻设置，
+        # 是这一次运行的选择。
+        console.print(
+            "⚠ bypass permissions：什么都不问。模型跑命令不再经过你，"
+            "而命令能改项目里任何文件、也能把 .env 读进上下文。",
+            style="bold red",
+            markup=False,
+        )
+
     # prompter 建一次、两个分支共用：它的答案以后要带"这一次会话别再问了"这种记忆，
     # 每轮新建一个的话那份记忆就丢了。
     prompter = TerminalPrompter()
+    # "本会话这个别再问了"记在这儿。和 prompter 一样得建在循环外面——runagent 每轮新建，
+    # 放里面的话下一轮就忘了，等于每轮都重新问一遍。
+    grants = Grants()
     # ask_user 只在"有人可问"的时候才存在，所以它不在 default_tools() 里，在这儿装进来。
     registry = default_tools()
     registry.register(make_ask_user(prompter))
@@ -50,6 +67,7 @@ def main_command(
             allow_shell=shell,
             permission_mode=permission_mode,
             prompter=prompter,
+            grants=grants,
         )
         if result.final is None:
             typer.echo(
@@ -75,6 +93,7 @@ def main_command(
                     allow_shell=shell,
                     permission_mode=permission_mode,
                     prompter=prompter,
+                    grants=grants,
                 )
                 console.print(f"\n{result.final}", markup=False)
         except (typer.Abort, EOFError, KeyboardInterrupt):

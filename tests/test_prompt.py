@@ -7,7 +7,7 @@ from collections.abc import Sequence
 import pytest
 
 from mini_code_agent.permissions import PermissionRequest
-from mini_code_agent.prompts import NobodyToAskError, NullPrompter
+from mini_code_agent.prompts import Answer, NobodyToAskError, NullPrompter
 from mini_code_agent.tools.base import ToolContext
 
 
@@ -19,9 +19,9 @@ class TestNullPrompter:
     def test_it_answers_no_to_the_three_guards(self):
         prompter = NullPrompter()
 
-        assert prompter.confirm_command("pytest -q") is False
-        assert prompter.confirm_tool(request()) is False
-        assert prompter.confirm_edit(request("edit_file")) is False
+        assert prompter.confirm_command("pytest -q").allowed is False
+        assert prompter.confirm_tool(request()).allowed is False
+        assert prompter.confirm_edit(request("edit_file")).allowed is False
 
     def test_a_question_raises_instead_of_picking_an_answer(self):
         """没有缺省答案就不能替用户挑一个——那是替他做了决定。"""
@@ -45,17 +45,17 @@ class FakePrompter:
     def __init__(self) -> None:
         self.asked: list[str] = []
 
-    def confirm_command(self, command: str) -> bool:
+    def confirm_command(self, command: str) -> Answer:
         self.asked.append(command)
-        return True
+        return Answer(True)
 
-    def confirm_tool(self, request: PermissionRequest) -> bool:
+    def confirm_tool(self, request: PermissionRequest) -> Answer:
         self.asked.append(request.tool_name)
-        return True
+        return Answer(True)
 
-    def confirm_edit(self, request: PermissionRequest) -> bool:
+    def confirm_edit(self, request: PermissionRequest) -> Answer:
         self.asked.append(request.tool_name)
-        return False
+        return Answer(False)
 
     def single_choice(self, question: str, options: Sequence[str]) -> str:
         self.asked.append(question)
@@ -75,7 +75,7 @@ class TestItIsNotPartOfTheToolLayer:
         """harness 只认协议：换一个实现进来就够了，不用经过 ToolContext。"""
         fake = FakePrompter()
 
-        assert fake.confirm_command("pytest -q") is True
-        assert fake.confirm_tool(request()) is True
-        assert fake.confirm_edit(request("edit_file")) is False
+        assert fake.confirm_command("pytest -q").allowed is True
+        assert fake.confirm_tool(request()).allowed is True
+        assert fake.confirm_edit(request("edit_file")).allowed is False
         assert fake.single_choice("用哪个？", ["a", "b"]) == "a"

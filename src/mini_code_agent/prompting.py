@@ -22,7 +22,7 @@ from typing import Any
 import typer
 
 from mini_code_agent.permissions import PermissionRequest
-from mini_code_agent.prompts import NobodyToAskError, Prompter
+from mini_code_agent.prompts import Answer, NobodyToAskError, Prompter
 from mini_code_agent.tools.base import Tool, ToolContext
 from mini_code_agent.tools.safety import truncate_text
 
@@ -153,18 +153,18 @@ class TerminalPrompter:
     没有构造参数、不存状态：它只做两件事——把该看的给人看，把答案读回来。
     """
 
-    def confirm_command(self, command: str) -> bool:
-        return self._yes_no(preview_command(command))
+    def confirm_command(self, command: str) -> Answer:
+        return self._ask(preview_command(command))
 
-    def confirm_tool(self, request: PermissionRequest) -> bool:
+    def confirm_tool(self, request: PermissionRequest) -> Answer:
         # bash 走这一条进来，但要看的是那行命令本身、不是它前面那串参数——分派留在
         # prompter 里，harness 就不必知道"命令藏在 args 的哪个键上"。
         if request.tool_name == "bash":
             return self.confirm_command(str(request.tool_args.get("command", "")))
-        return self._yes_no(preview_tool(request))
+        return self._ask(preview_tool(request))
 
-    def confirm_edit(self, request: PermissionRequest) -> bool:
-        return self._yes_no(preview_edit(request))
+    def confirm_edit(self, request: PermissionRequest) -> Answer:
+        return self._ask(preview_edit(request), remember_option=True)
 
     def single_choice(self, question: str, options: Sequence[str]) -> str:
         typer.echo(f"? {question}", err=True)
@@ -183,15 +183,37 @@ class TerminalPrompter:
                 return answer
             typer.echo("没听懂，再输一次。", err=True)
 
-    def _yes_no(self, preview: str) -> bool:
+    def _ask(self, preview: str, remember_option: bool = False) -> Answer:
+        """把预览摆出来，读一个回答。
+
+        改文件那一档多一个 `a`（本会话这个文件别再问了）。**直接回车不算回答**：放行这种
+        事不该有一个"顺手敲过去就过"的默认值。不是那三个键的其它输入，当成用户把理由写了
+        下来——那就算拒绝，那句话会被带回给模型。
+        """
         typer.echo(preview, err=True)
-        try:
-            return typer.confirm("放行吗？", default=False, err=True)
-        except typer.Abort:
-            # Ctrl+C 或者输入流断了：这一次不批准。别把它升级成"结束整个会话"——
-            # 用户想退出时该在提示符那一层按 Ctrl+C。
-            typer.echo("（没有回答，按拒绝处理）", err=True)
-            return False
+        keys = "[y] 是  [n] 否" + ("  [a] 本会话这个文件别再问" if remember_option else "")
+        hint = f"放行吗？{keys}（也可以直接写下理由，那算拒绝）"
+
+        while True:
+            try:
+                raw = typer.prompt(hint, default="", show_default=False, err=True)
+            except typer.Abort:
+                # Ctrl+C 或者输入流断了：这一次不批准。别把它升级成"结束整个会话"——
+                # 用户想退出时该在提示符那一层按 Ctrl+C。
+                typer.echo("（没有回答，按拒绝处理）", err=True)
+                return Answer(False)
+
+            text = str(raw).strip()
+            lowered = text.lower()
+            if lowered in ("y", "yes"):
+                return Answer(True)
+            if lowered in ("n", "no"):
+                return Answer(False)
+            if remember_option and lowered in ("a", "always"):
+                return Answer(True, remember=True)
+            if text:
+                return Answer(False, note=text)
+            typer.echo(f"没听懂，回 y / n{(' / a' if remember_option else '')}。", err=True)
 
 
 def make_ask_user(prompter: Prompter) -> Tool:

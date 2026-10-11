@@ -10,7 +10,8 @@ prompting.py 里，那一层才 import typer。
 四种问法分两类：
 
 - `confirm_command` / `confirm_tool` / `confirm_edit` 是**守卫**：策略判了"要问"才轮到
-  它们，答案只有是/否。问不问由调用方（harness）决定，不由被问的东西决定——模型跳不过去
+  它们。问不问由调用方（harness）决定，不由被问的东西决定——模型跳不过去。答案见 `Answer`：
+  除了准 / 不准，改文件那一档还能答"本会话这个文件别再问了"
 - `single_choice` 是**模型主动**想问用户：在若干选项里挑一个
 
 "该不该问"不在这儿判（那是 decide_permission 的事）。这儿只管怎么问、拿到答案之后
@@ -20,6 +21,7 @@ prompting.py 里，那一层才 import typer。
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -35,6 +37,22 @@ class NobodyToAskError(Exception):
     """
 
 
+@dataclass
+class Answer:
+    """用户对一次"要不要放行"的回答。
+
+    remember 只在 allowed 为真时有意义：用户答"本会话这个别再问了"。记多久、记成什么粒度
+    是调用方的事（见 permissions.py 的 Grants），answer 这边只负责把话说清楚。
+
+    note 是用户补的那句话——拒绝的时候尤其有用（"改 bar.py 而不是这个"）。它会被拼进回给
+    模型的结果里，比一句干巴巴的"用户拒绝了"有用得多。
+    """
+
+    allowed: bool
+    remember: bool = False
+    note: str = ""
+
+
 class Prompter(Protocol):
     """把四个问题摆给用户的方式。
 
@@ -42,17 +60,25 @@ class Prompter(Protocol):
     "该不该问"不是。
     """
 
-    def confirm_command(self, command: str) -> bool:
-        """让用户决定跑不跑这条命令。给的就是那条命令本身。"""
+    def confirm_command(self, command: str) -> Answer:
+        """让用户决定跑不跑这条命令。给的就是那条命令本身。
+
+        **不给"别再问了"那一档**：命令之间差异太大，记住其中一条没什么意义，而它又是唯一
+        没有 diff 可看的调用，逐条点头是对的。
+        """
         ...
 
-    def confirm_tool(self, request: PermissionRequest) -> bool:
+    def confirm_tool(self, request: PermissionRequest) -> Answer:
         """让用户决定放不放行这次工具调用。不认得类别的那些走这一条。"""
         ...
 
-    def confirm_edit(self, request: PermissionRequest) -> bool:
+    def confirm_edit(self, request: PermissionRequest) -> Answer:
         """让用户看一眼改动，决定改不改。和上面那条分开，是因为这里该渲染的是 diff，
-        不是参数本身。"""
+        不是参数本身。
+
+        只有这一档提供 `remember`：改动是同一条路径上的重复劳动，用户说一句"这个文件
+        别再问"很自然。
+        """
         ...
 
     def single_choice(self, question: str, options: Sequence[str]) -> str:
@@ -74,14 +100,14 @@ class NullPrompter:
     做了决定。
     """
 
-    def confirm_command(self, command: str) -> bool:
-        return False
+    def confirm_command(self, command: str) -> Answer:
+        return Answer(False)
 
-    def confirm_tool(self, request: PermissionRequest) -> bool:
-        return False
+    def confirm_tool(self, request: PermissionRequest) -> Answer:
+        return Answer(False)
 
-    def confirm_edit(self, request: PermissionRequest) -> bool:
-        return False
+    def confirm_edit(self, request: PermissionRequest) -> Answer:
+        return Answer(False)
 
     def single_choice(self, question: str, options: Sequence[str]) -> str:
         raise NobodyToAskError(
