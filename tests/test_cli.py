@@ -128,6 +128,29 @@ def test_exit_stops_before_calling_the_model(monkeypatch, tmp_path):
     assert provider.calls == []
 
 
+def test_a_command_line_never_reaches_the_model(monkeypatch, tmp_path):
+    """`/` 开头的那几行由程序处理：不发给模型，也不进 transcript。"""
+    provider = ScriptedProvider([text_turn("嗯")])
+
+    session = run_loop(monkeypatch, provider, ["/hlep", "/help", "正经问一句", "/exit"], tmp_path)
+
+    assert len(provider.calls) == 1
+    assert provider.calls[0][0]["content"] == "正经问一句"
+    # 命令是用户对程序说的话，不是对话的一部分——接上历史时不该看见它
+    _, _, stored = load(tmp_path, session.id)
+    assert [m["role"] for m in stored] == ["user", "assistant"]
+    assert stored[0]["content"] == "正经问一句"
+
+
+def test_switching_the_mode_lands_on_the_next_turn(monkeypatch, tmp_path):
+    """`/permission_mode` 改的是循环每轮现读的那份，所以换完这一句就该按新档走。"""
+    provider = ScriptedProvider([text_turn("嗯")])
+
+    run_loop(monkeypatch, provider, ["/permission_mode plan", "看看再说", "/exit"], tmp_path)
+
+    assert provider.systems == [build_system_prompt(tmp_path, "plan")]
+
+
 def test_the_transcript_lands_on_disk(monkeypatch, tmp_path):
     """循环跑完，这几轮说的话得能在盘上读回来。"""
     provider = ScriptedProvider([text_turn("嗯")])

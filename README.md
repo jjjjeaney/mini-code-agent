@@ -28,6 +28,12 @@ cp .env.example .env
 uv run mini-code-agent "用一句话解释什么是闭包"
 ```
 
+不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型，`/help` 列出有哪些（`/permission_mode` 换权限档位、`/exit` 退出）。
+
+```bash
+uv run mini-code-agent
+```
+
 ## 测试
 
 `tests/test_anthropic_provider.py` 是真实接口冒烟测试，会实际发起请求并产生费用；`.env` 里缺少任一变量时整组跳过。`tests/test_agent.py` 和 `tests/test_tools.py` 用假 provider 驱动，完全不联网。
