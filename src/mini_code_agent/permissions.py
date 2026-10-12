@@ -184,3 +184,7 @@ class Grants:
         key = _grant_key(request)
         if key is not None:
             self.entries.add(key)
+
+    def clear(self) -> None:
+        """把这一会话批过的全忘掉。之后同一个文件会重新问你——只会多问，不会少问。"""
+        self.entries.clear()

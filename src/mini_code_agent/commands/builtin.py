@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mini_code_agent.commands.base import Command, CommandContext, CommandOutcome
 from mini_code_agent.permissions import PERMISSION_MODES, parse_permission_mode
+from mini_code_agent.summarizing import MAX_HISTORY_CHARS, total_chars
 
 # 只在类型标注里用得上，而且那边（registry）反过来要 import 这儿——真去 import 就成环了。
 # 标注本身是懒的（`from __future__ import annotations`），不 import 也跑得起来。
@@ -30,6 +32,15 @@ GLOSS: dict[str, str] = {
 # 差得太远。
 # 按 PERMISSION_MODES 推出来，以后加第五档不必记得回来改这儿。
 SWITCHABLE: tuple[str, ...] = tuple(m for m in PERMISSION_MODES if m != "bypass permissions")
+
+
+def _relative(path: Path, cwd: Path) -> str:
+    """能相对就相对。状态行里一条绝对路径要占掉半屏，而 cwd 本来就印在上面一行。"""
+    try:
+        return str(path.relative_to(cwd))
+    except ValueError:
+        # 不在 cwd 底下（接的是别的目录的会话之类）——那就照实印，别硬凑一个相对路径。
+        return str(path)
 
 
 def make_help(commands: Commands) -> Command:
@@ -101,6 +112,87 @@ def make_permission_mode() -> Command:
         run=run,
         summary="看当前的权限档位，或者换一档",
         usage="[档位]",
+    )
+
+
+def make_status() -> Command:
+    """把这个循环现在的样子摊开：在哪儿跑、什么档位、历史多长、接的哪次会话。
+
+    报的全是**循环自己手里**的东西。**不印模型名**：那是 provider 的，而 Provider 协议
+    （providers/base.py）故意只声明了 complete 这一个方法——为了一行状态去扩那个接口，等于
+    让所有假 provider（测试里那些）都跟着多背一个字段，不值当。真要看模型，命令行和 .env
+    里就是。
+    """
+
+    def run(ctx: CommandContext, arg: str) -> CommandOutcome:
+        session = ctx.session
+        mode = ctx.state.permission_mode
+        shell = "开（跑在一次性容器里，跑完就删）" if ctx.allow_shell else "关（--shell 才打开）"
+        used = total_chars(ctx.state.messages)
+        # 压过没有，用户看不出来——但它决定了模型还记不记得住开头的那些事。
+        compacted = "；前面那段已经压成摘要了" if session.has_summary else ""
+
+        ctx.console.print(f"工作目录：{ctx.cwd}", markup=False)
+        ctx.console.print(f"权限档位：{mode}（{GLOSS.get(mode, '')}）", markup=False)
+        ctx.console.print(f"命令执行：{shell}", markup=False)
+        ctx.console.print(
+            f"会话文件：{_relative(session.path, ctx.cwd)}（落盘 {session.written} 条消息）",
+            markup=False,
+        )
+        ctx.console.print(
+            f"历史大小：{len(ctx.state.messages)} 条 / {used:,} 字符"
+            f"（到 {MAX_HISTORY_CHARS:,} 才压）{compacted}",
+            markup=False,
+        )
+        return "handled"
+
+    return Command(name="status", run=run, summary="看在哪儿跑、什么档位、历史多长")
+
+
+def make_grants() -> Command:
+    """看这一会话批准过什么，或者全清掉。
+
+    **看得见自己批准过什么是它存在的全部理由**：Grants 平时只往里加、不往外看，想反悔只能
+    重启进程。而"人是最后一道闸门"这个前提，靠的恰恰是不糊里糊涂地把闸门放开——尤其在
+    accept edits 档下，一整个文件的改动就这么静悄悄地不再问了。
+    """
+
+    def run(ctx: CommandContext, arg: str) -> CommandOutcome:
+        entries = sorted(ctx.grants.entries)
+        if arg == "clear":
+            if not entries:
+                ctx.console.print("本来就是空的。", style="dim", markup=False)
+                return "handled"
+            ctx.grants.clear()
+            ctx.console.print(f"清掉了 {len(entries)} 条，之后同一个文件会重新问你。", markup=False)
+            return "handled"
+        if arg:
+            # 不兜底：参数认不出来就说一句，别猜他想干嘛。status 那条也一样。
+            ctx.console.print(f"不认识的参数：{arg!r}（只认 clear）", style="red", markup=False)
+            return "handled"
+
+        if not entries:
+            ctx.console.print("这一会话里还没有批准过什么。", markup=False)
+            ctx.console.print(
+                "（改文件时选 a 才会记在这儿；bash 从来不记——它是逐条点头的）",
+                style="dim",
+                markup=False,
+            )
+            return "handled"
+
+        ctx.console.print("本会话里你批准过、不再问的调用（进程退出就没了）：\n", markup=False)
+        # 工具名都是 ASCII，ljust 能对齐；路径那边对齐不了（中文宽度不一），不勉强。
+        width = max(len(tool) for tool, _ in entries)
+        for tool, path in entries:
+            ctx.console.print(f"  {tool.ljust(width)}  {path}", markup=False)
+        ctx.console.print("\n（/grants clear 可以全清掉）", style="dim", markup=False)
+        return "handled"
+
+    return Command(
+        name="grants",
+        run=run,
+        summary="看这一会话批准过什么、不再问了；或者清掉",
+        usage="[clear]",
     )
 
 

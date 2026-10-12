@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
 from mini_code_agent import cli
 from mini_code_agent.memory import Memory, write
-from mini_code_agent.permissions import Grants
+from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompts import NullPrompter
 from mini_code_agent.providers.base import ModelResponse, ToolCall
 from mini_code_agent.sessions import Session, load, start
@@ -50,6 +52,7 @@ def run_loop(
     session: Session | None = None,
     messages: list[dict] | None = None,
     registry: ToolRegistry | None = None,
+    grants: Grants | None = None,
 ) -> Session:
     """喂一串「用户输入」，把交互循环跑起来。最后一句给 /exit 收尾。"""
     answers = iter(lines)
@@ -64,7 +67,7 @@ def run_loop(
         allow_shell=False,
         permission_mode="default",
         prompter=NullPrompter(),
-        grants=Grants(),
+        grants=grants if grants is not None else Grants(),
     )
     return session
 
@@ -149,6 +152,28 @@ def test_switching_the_mode_lands_on_the_next_turn(monkeypatch, tmp_path):
     run_loop(monkeypatch, provider, ["/permission_mode plan", "看看再说", "/exit"], tmp_path)
 
     assert provider.systems == [build_system_prompt(tmp_path, "plan")]
+
+
+def test_status_reports_the_live_loop(monkeypatch, tmp_path, capsys):
+    """`/status` 拿到的是循环里那份会话和历史，不是一份副本。"""
+    provider = ScriptedProvider([])
+
+    session = run_loop(monkeypatch, provider, ["/status", "/exit"], tmp_path)
+
+    out = capsys.readouterr().out
+    assert f"工作目录：{tmp_path}" in out
+    assert session.id in out  # 报告的正是这次落盘的那个会话文件
+    assert provider.calls == []  # 状态是程序答的，没往模型那儿跑一趟
+
+
+def test_grants_reports_what_the_loop_has_approved(monkeypatch, tmp_path, capsys):
+    """`/grants` 看的是传进循环的那个 Grants——这一会话真的批过什么，它就知道什么。"""
+    grants = Grants()
+    grants.remember(PermissionRequest(tool_name="write_file", tool_args={"path": "src/a.py"}))
+
+    run_loop(monkeypatch, ScriptedProvider([]), ["/grants", "/exit"], tmp_path, grants=grants)
+
+    assert os.path.normpath("src/a.py") in capsys.readouterr().out
 
 
 def test_the_transcript_lands_on_disk(monkeypatch, tmp_path):

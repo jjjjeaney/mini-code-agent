@@ -5,7 +5,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from mini_code_agent.commands.base import Command, CommandContext, Outcome, split_command
-from mini_code_agent.commands.builtin import make_exit, make_help, make_permission_mode
+from mini_code_agent.commands.builtin import (
+    make_exit,
+    make_grants,
+    make_help,
+    make_permission_mode,
+    make_status,
+)
 
 
 class Commands:
@@ -70,10 +76,13 @@ def default_commands() -> Commands:
     每次调用都返回新实例，跟 default_tools() 一个道理：调用方想再注册自己的命令时，
     不会污染到别人手里那份。
 
-    顺序就是 `/help` 里的顺序，所以 `/help` 放第一条。
+    顺序就是 `/help` 里的顺序，所以 `/help` 放第一条。`/status` 跟在 `/permission_mode` 后面
+    ——两条都是"我现在在哪一档"那一类，看完档位顺手下一条就是它。
     """
     commands = Commands()
     commands.register(make_help(commands))
     commands.register(make_permission_mode())
+    commands.register(make_status())
+    commands.register(make_grants())
     commands.register(make_exit())
     return commands

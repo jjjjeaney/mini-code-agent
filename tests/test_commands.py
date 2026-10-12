@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from mini_code_agent.commands import (
@@ -14,10 +17,37 @@ from mini_code_agent.commands import (
 from mini_code_agent.commands.base import split_command
 from mini_code_agent.commands.builtin import make_help
 from mini_code_agent.console import console
+from mini_code_agent.permissions import Grants, PermissionRequest
+from mini_code_agent.sessions import Session
+from mini_code_agent.summarizing import MAX_HISTORY_CHARS
 
 
-def make_ctx(mode: str = "default") -> CommandContext:
-    return CommandContext(console=console, state=ChatState(permission_mode=mode))
+def make_ctx(
+    mode: str = "default",
+    *,
+    cwd: Path | None = None,
+    allow_shell: bool = False,
+    session: Session | None = None,
+    grants: Grants | None = None,
+    messages: list[dict] | None = None,
+) -> CommandContext:
+    """一份手边的东西。全给上默认值，测哪一块就只改哪一块。"""
+    return CommandContext(
+        console=console,
+        state=ChatState(permission_mode=mode, messages=list(messages or [])),
+        cwd=cwd or Path("proj"),
+        allow_shell=allow_shell,
+        session=session or Session(id="s1", path=Path("proj/.agent/sessions/s1.jsonl")),
+        grants=grants if grants is not None else Grants(),
+    )
+
+
+def approved(*paths: str, tool: str = "write_file") -> Grants:
+    """一份"本会话批过这几个文件"的 Grants，走的是真的 remember（所以键是归一化过的）。"""
+    grants = Grants()
+    for path in paths:
+        grants.remember(PermissionRequest(tool_name=tool, tool_args={"path": path}))
+    return grants
 
 
 def a_command(name: str, **kwargs) -> Command:
@@ -53,7 +83,7 @@ class TestHelp:
         default_commands().dispatch("/help", make_ctx())
 
         out = capsys.readouterr().out
-        for name in ("/help", "/permission_mode", "/exit"):
+        for name in ("/help", "/permission_mode", "/status", "/grants", "/exit"):
             assert name in out
         assert "/quit" in out  # 别名也列出来，不然没人知道它存在
 
@@ -111,6 +141,83 @@ class TestPermissionMode:
         default_commands().dispatch("/permission_mode plan", ctx)
 
         assert "已经是" in capsys.readouterr().out
+
+
+class TestStatus:
+    def test_it_reports_where_it_runs_and_under_what(self, capsys, tmp_path):
+        default_commands().dispatch("/status", make_ctx("plan", cwd=tmp_path))
+
+        out = capsys.readouterr().out
+        assert f"工作目录：{tmp_path}" in out
+        assert "权限档位：plan" in out
+        assert "只读" in out  # 档位附了它意味着什么
+
+    @pytest.mark.parametrize("allow_shell, expected", [(True, "开"), (False, "关")])
+    def test_it_says_whether_commands_can_run(self, capsys, allow_shell, expected):
+        default_commands().dispatch("/status", make_ctx(allow_shell=allow_shell))
+
+        assert f"命令执行：{expected}" in capsys.readouterr().out
+
+    def test_it_reports_the_session_and_how_much_history_there_is(self, capsys):
+        session = Session(id="abcd", path=Path("proj/.agent/sessions/abcd.jsonl"), written=7)
+        ctx = make_ctx(session=session, messages=[{"role": "user", "content": "x" * 100}])
+
+        default_commands().dispatch("/status", ctx)
+
+        out = capsys.readouterr().out
+        assert "会话文件：.agent" in out  # 相对 cwd 印，不占半屏
+        assert "abcd.jsonl" in out
+        assert "落盘 7 条消息" in out
+        assert "历史大小：1 条" in out
+        assert f"{MAX_HISTORY_CHARS:,} 才压" in out
+
+    def test_it_says_when_the_history_has_been_compacted(self, capsys):
+        """压过没有，光看对话是看不出来的——但它决定了开头那些事模型还记不记得住。"""
+        session = Session(id="s1", path=Path("s1.jsonl"), has_summary=True)
+
+        default_commands().dispatch("/status", make_ctx(session=session))
+
+        assert "已经压成摘要了" in capsys.readouterr().out
+
+    def test_it_says_nothing_about_summaries_when_there_were_none(self, capsys):
+        default_commands().dispatch("/status", make_ctx())
+
+        assert "摘要" not in capsys.readouterr().out
+
+
+class TestGrants:
+    def test_it_lists_what_has_been_approved(self, capsys):
+        default_commands().dispatch("/grants", make_ctx(grants=approved("src/a.py", "src/b.py")))
+
+        out = capsys.readouterr().out
+        assert "write_file" in out
+        # 键里的路径是归一化过的（Windows 上是反斜杠），照着那个形式断言
+        assert os.path.normpath("src/a.py") in out
+        assert os.path.normpath("src/b.py") in out
+
+    def test_it_says_so_when_nothing_has_been_approved(self, capsys):
+        default_commands().dispatch("/grants", make_ctx())
+
+        assert "还没有批准过" in capsys.readouterr().out
+
+    def test_clear_empties_it(self, capsys):
+        """清的是循环里那个 Grants 本身，不是它的一份副本——所以下一轮真的会重新问。"""
+        grants = approved("src/a.py")
+
+        default_commands().dispatch("/grants clear", make_ctx(grants=grants))
+
+        assert grants.entries == set()
+        assert "清掉了 1 条" in capsys.readouterr().out
+
+    def test_clear_on_an_empty_one_says_so(self, capsys):
+        default_commands().dispatch("/grants clear", make_ctx())
+
+        assert "本来就是空的" in capsys.readouterr().out
+
+    def test_an_argument_other_than_clear_is_refused(self, capsys):
+        default_commands().dispatch("/grants nope", make_ctx())
+
+        assert "只认 clear" in capsys.readouterr().out
 
 
 class TestExit:

@@ -64,9 +64,9 @@ def _chat(
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
     **每轮重拼一次 system prompt**：记忆和 `AGENTS.md` 都可能在中途变（模型刚 `remember` 了
-    一条），拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位同理——`/permission_mode`
-    也能中途换，所以它从参数挪进了 `state`，和提示词一起每轮现读；`permission_mode` 这个形参
-    只是这次的**起始档位**。
+    一条），拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位和历史同理——前者
+    `/permission_mode` 能换，后者 `/status` 要报它多长，所以这两个从局部量挪进了 `state`，
+    和提示词一起每轮现读。传进来的 `permission_mode` 和 `messages` 只是这次运行的**起始值**。
 
     这一行先过命令表（见 commands/）：认出来的命令就地办掉、**不发给模型**，也不落盘——
     命令是用户对程序说的话，不是对话的一部分，接上历史时不该看见它。
@@ -74,10 +74,17 @@ def _chat(
     抽成函数是为了能测——`main_command` 里写死了 `AnthropicProvider()`，塞不进假的；这里收
     一个 provider 进来，测试就能拿剧本化的假 provider 跑两轮，看第二轮有没有带上第一轮。
     """
-    state = ChatState(permission_mode=permission_mode)
-    ctx = CommandContext(console=console, state=state)
-    # 建一次就够：命令表在循环里不变。它抓着的 state 是上面那个盒子——命令改档位改的就是
-    # 循环每轮现读的那份。
+    state = ChatState(permission_mode=permission_mode, messages=messages)
+    ctx = CommandContext(
+        console=console,
+        state=state,
+        cwd=cwd,
+        allow_shell=allow_shell,
+        session=session,
+        grants=grants,
+    )
+    # 建一次就够：命令表在循环里不变。它抓着的 ctx / state 都是上面那两个活着的对象——
+    # 命令改档位、看历史、清批准，动到的都是循环这一轮真要用的那份。
     commands = default_commands()
     try:
         while True:
@@ -90,7 +97,7 @@ def _chat(
             if outcome == "handled":
                 continue
             # 太长就压一次再发。放在轮与轮之间，不放进 runagent——理由见 _compact。
-            messages = _compact(messages, provider, session)
+            state.messages = _compact(state.messages, provider, session)
             system = build_system_prompt(cwd, state.permission_mode)
             result = runagent(
                 line,
@@ -102,12 +109,12 @@ def _chat(
                 permission_mode=state.permission_mode,
                 prompter=prompter,
                 grants=grants,
-                messages=messages,
+                messages=state.messages,
             )
             # 落盘、接下历史——两边要的是同一批东西：这一轮新增的那几条。
             # 长度得在 messages 被换掉**之前**取。
-            session.append(result.messages[len(messages) :])
-            messages = result.messages
+            session.append(result.messages[len(state.messages) :])
+            state.messages = result.messages
             if result.final is None:
                 typer.echo(
                     f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
