@@ -970,7 +970,7 @@ def _commit_change(
         recorded = ctx.read_state.entries.get(target)
         if recorded is None:
             raise StaleReadError(
-                f"{raw!r} 已经存在，但你还没读过它。先读一遍再改——"
+                f"{raw!r} 已经存在，但你还没读过它。你必须先使用read_file工具读一遍完整文件"
                 f"不然会把一份你从没看过的内容整个盖掉。"
             )
         recorded_mtime, recorded_size = recorded
@@ -980,7 +980,7 @@ def _commit_change(
         if current.st_mtime_ns != recorded_mtime or current.st_size != recorded_size:
             raise StaleReadError(
                 f"{raw!r} 在你读过之后被改过了（可能是别的程序，也可能是你自己另一次操作）。"
-                f"先重读一遍，再改。"
+                f"先把文件完整重读一遍，再改。"
             )
 
     def backup_existing() -> Path:
