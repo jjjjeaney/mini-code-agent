@@ -60,7 +60,9 @@ SENSITIVE_FILE_PATTERNS = (
 
 # 敏感目录：里面的东西一律不给读。.git 单列出来，是因为它的 config 里经常嵌着
 # 带 token 的 remote URL——那是很常见的一种泄露。
-SENSITIVE_DIRS = {".git", ".ssh", ".aws", ".gnupg"}
+# 连读都不许的地方。`.agent` 是自己人写的（改前备份、会话 transcript），但里面装的是**模型
+# 看过的一切**——包括命令输出里涂黑那层漏掉的密钥。所以这儿不看"谁写的"，只看"可能有什么"。
+SENSITIVE_DIRS = {".agent", ".git", ".ssh", ".aws", ".gnupg"}
 
 class OutOfSandboxError(Exception):
     """模型要访问的路径落在了允许的目录之外。

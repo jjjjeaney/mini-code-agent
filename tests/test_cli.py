@@ -1,4 +1,4 @@
-"""cli 交互循环的测试：多轮之间把历史接下去。全部本地执行——假 provider、假输入。"""
+"""cli 交互循环的测试：多轮之间把历史接下去、并落盘。全部本地执行——假 provider、假输入。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from mini_code_agent import cli
 from mini_code_agent.permissions import Grants
 from mini_code_agent.prompts import NullPrompter
 from mini_code_agent.providers.base import ModelResponse
+from mini_code_agent.sessions import load, start
 from mini_code_agent.tools import ToolRegistry
 
 SYSTEM = "你是一个 coding agent。"
@@ -31,7 +32,7 @@ def text_turn(text: str) -> ModelResponse:
     )
 
 
-def run_loop(monkeypatch, provider: ScriptedProvider, lines: list[str]) -> None:
+def run_loop(monkeypatch, provider: ScriptedProvider, lines: list[str], tmp_path) -> None:
     """喂一串「用户输入」，把交互循环跑起来。最后一句给 /exit 收尾。"""
     answers = iter(lines)
     monkeypatch.setattr(cli.typer, "prompt", lambda *args, **kwargs: next(answers))
@@ -39,7 +40,9 @@ def run_loop(monkeypatch, provider: ScriptedProvider, lines: list[str]) -> None:
         provider,
         ToolRegistry([]),
         SYSTEM,
-        cwd=None,
+        start(tmp_path, permission_mode="default", allow_shell=False),
+        [],
+        cwd=tmp_path,
         allow_shell=False,
         permission_mode="default",
         prompter=NullPrompter(),
@@ -47,10 +50,10 @@ def run_loop(monkeypatch, provider: ScriptedProvider, lines: list[str]) -> None:
     )
 
 
-def test_the_loop_carries_the_conversation(monkeypatch):
+def test_the_loop_carries_the_conversation(monkeypatch, tmp_path):
     provider = ScriptedProvider([text_turn("嗯"), text_turn("接着说")])
 
-    run_loop(monkeypatch, provider, ["第一句", "第二句", "/exit"])
+    run_loop(monkeypatch, provider, ["第一句", "第二句", "/exit"], tmp_path)
 
     assert len(provider.calls) == 2
     # 第二轮带着第一轮：user / assistant / user
@@ -58,26 +61,39 @@ def test_the_loop_carries_the_conversation(monkeypatch):
     assert provider.calls[1][0]["content"] == "第一句"
 
 
-def test_the_system_prompt_goes_out_on_every_turn(monkeypatch):
+def test_the_system_prompt_goes_out_on_every_turn(monkeypatch, tmp_path):
     provider = ScriptedProvider([text_turn("嗯"), text_turn("嗯")])
 
-    run_loop(monkeypatch, provider, ["一", "二", "/exit"])
+    run_loop(monkeypatch, provider, ["一", "二", "/exit"], tmp_path)
 
     assert provider.systems == [SYSTEM, SYSTEM]
 
 
-def test_a_blank_line_is_not_a_turn(monkeypatch):
+def test_a_blank_line_is_not_a_turn(monkeypatch, tmp_path):
     provider = ScriptedProvider([text_turn("嗯")])
 
-    run_loop(monkeypatch, provider, ["", "   ", "正经问一句", "/exit"])
+    run_loop(monkeypatch, provider, ["", "   ", "正经问一句", "/exit"], tmp_path)
 
     assert len(provider.calls) == 1
     assert provider.calls[0][0]["content"] == "正经问一句"
 
 
-def test_exit_stops_before_calling_the_model(monkeypatch):
+def test_exit_stops_before_calling_the_model(monkeypatch, tmp_path):
     provider = ScriptedProvider([])
 
-    run_loop(monkeypatch, provider, ["/exit"])
+    run_loop(monkeypatch, provider, ["/exit"], tmp_path)
 
     assert provider.calls == []
+
+
+def test_the_transcript_lands_on_disk(monkeypatch, tmp_path):
+    """循环跑完，这几轮说的话得能在盘上读回来。"""
+    provider = ScriptedProvider([text_turn("嗯")])
+
+    run_loop(monkeypatch, provider, ["第一句", "/exit"], tmp_path)
+
+    _, meta, messages = load(tmp_path)
+
+    assert meta["permission_mode"] == "default"
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    assert messages[0]["content"] == "第一句"

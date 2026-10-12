@@ -341,6 +341,16 @@ class TestReadFile:
         with pytest.raises(SensitiveFileError):
             read_file({"path": ".git/config"}, ctx)
 
+    def test_a_file_inside_agent_is_refused(self, project, ctx):
+        """.agent 里是自己人写的（改前备份、会话 transcript），但装的正是模型看过的一切。"""
+        (project / ".agent" / "sessions").mkdir(parents=True)
+        (project / ".agent" / "sessions" / "20261011-233012.jsonl").write_text(
+            "{}", encoding="utf-8"
+        )
+
+        with pytest.raises(SensitiveFileError):
+            read_file({"path": ".agent/sessions/20261011-233012.jsonl"}, ctx)
+
     def test_a_normal_file_is_still_readable(self, project, ctx):
         (project / "app.py").write_text("print(1)", encoding="utf-8")
 

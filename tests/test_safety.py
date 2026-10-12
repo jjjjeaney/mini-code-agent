@@ -279,6 +279,12 @@ class TestIsSensitive:
         assert is_sensitive(Path(".git/config")) is True
         assert is_sensitive(Path(".git/objects/ab/cdef")) is True
 
+    def test_anything_inside_agent_is_sensitive(self):
+        """自己人写的也得拦：改前备份和会话 transcript 里装的是模型看过的一切，包括命令
+        输出里涂黑那层漏掉的密钥。"""
+        assert is_sensitive(Path(".agent/.history/main.py.20261011-2330")) is True
+        assert is_sensitive(Path(".agent/sessions/20261011-233012.jsonl")) is True
+
     def test_normal_source_files_are_not_sensitive(self):
         for name in ("main.py", "README.md", "pyproject.toml", "src/core/agent.py"):
             assert is_sensitive(Path(name)) is False
