@@ -105,3 +105,90 @@ def test_a_blank_line_is_skipped(tmp_path):
     _, _, messages = load(tmp_path, session.id)
 
     assert len(messages) == 1
+
+
+class TestSummaries:
+    """压缩是有损的，所以文件里留一条标注；剪枝发生在加载时。"""
+
+    def six_messages(self, session) -> None:
+        session.append([{"role": "user", "content": f"第 {i} 句"} for i in range(6)])
+
+    def test_a_summary_prunes_what_loads(self, tmp_path):
+        session = a_session(tmp_path)
+        session.append(
+            [
+                {"role": "user", "content": "第一句"},
+                {"role": "assistant", "content": [{"type": "text", "text": "好"}]},
+            ]
+        )
+        session.record_summary(2, "前面聊了第一句")
+        session.append([{"role": "user", "content": "第二句"}])
+
+        _, _, messages = load(tmp_path, session.id)
+
+        assert "前面聊了第一句" in messages[0]["content"]
+        assert messages[1]["content"] == "第二句"
+        assert len(messages) == 2
+
+    def test_only_the_covered_part_is_pruned(self, tmp_path):
+        """剪掉的是摘要盖住的那几条，留着的**一条都不能少**。
+
+        （up_to 要是记成"文件里一共写过多少条"，留下的会被一起剪掉——这条就是钉那个。）
+        """
+        session = a_session(tmp_path)
+        self.six_messages(session)
+
+        session.record_summary(4, "前四句的摘要")
+
+        _, _, messages = load(tmp_path, session.id)
+
+        assert len(messages) == 3  # 摘要 + 留着的两条
+        assert [message["content"] for message in messages[1:]] == ["第 4 句", "第 5 句"]
+
+    def test_a_second_summary_accounts_for_the_first(self, tmp_path):
+        """第二次压缩时，内存那份开头已经顶着一条合成的摘要——它不是文件里的消息，得扣一格。"""
+        first = a_session(tmp_path)
+        self.six_messages(first)
+        first.record_summary(4, "第一次")
+
+        # 接着上一次：内存里是 [摘要, 第4句, 第5句]
+        session, _, messages = load(tmp_path, first.id)
+        messages.append({"role": "user", "content": "第 6 句"})
+        session.append([{"role": "user", "content": "第 6 句"}])
+        session.record_summary(3, "第二次")  # 摘要 + 第4句 + 第5句
+
+        _, _, messages = load(tmp_path, session.id)
+
+        assert len(messages) == 2  # 新摘要 + 第 6 句
+        assert "第二次" in messages[0]["content"]
+        assert messages[1]["content"] == "第 6 句"
+
+    def test_a_summary_does_not_delete_anything_from_the_file(self, tmp_path):
+        """剪枝是加载时的事——文件里一条不删，人还能翻。"""
+        session = a_session(tmp_path)
+        session.append([{"role": "user", "content": "第一句"}])
+
+        session.record_summary(1, "压过了")
+
+        assert "第一句" in session.path.read_text(encoding="utf-8")
+
+    def test_written_counts_every_message_line(self, tmp_path):
+        session = a_session(tmp_path)
+        session.append([{"role": "user", "content": "一"}])
+        session.record_summary(1, "压")
+        session.append([{"role": "user", "content": "二"}])
+
+        assert session.written == 2
+        assert load(tmp_path, session.id)[0].written == 2
+
+    def test_the_last_summary_wins(self, tmp_path):
+        """第二条摘要压的那段历史里已经含了第一条，所以只认最后一条。"""
+        session = a_session(tmp_path)
+        self.six_messages(session)
+        session.record_summary(2, "第一次")
+        session.record_summary(4, "第二次")
+
+        _, _, messages = load(tmp_path, session.id)
+
+        assert "第二次" in messages[0]["content"]
+        assert not any("第一次" in str(message.get("content")) for message in messages)

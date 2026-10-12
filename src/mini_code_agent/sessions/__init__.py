@@ -3,6 +3,13 @@
 跨会话的长期事实不在这里，见 memory。
 """
 
-from mini_code_agent.sessions.transcript import SESSIONS_DIR, Session, latest, load, start
+from mini_code_agent.sessions.transcript import (
+    SESSIONS_DIR,
+    Session,
+    latest,
+    load,
+    start,
+    summary_message,
+)
 
-__all__ = ["SESSIONS_DIR", "Session", "latest", "load", "start"]
+__all__ = ["SESSIONS_DIR", "Session", "latest", "load", "start", "summary_message"]

@@ -13,11 +13,38 @@ from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.prompts import Prompter
 from mini_code_agent.providers.anthropic import AnthropicProvider
 from mini_code_agent.providers.base import Provider
-from mini_code_agent.sessions import Session, load, start
+from mini_code_agent.sessions import Session, load, start, summary_message
+from mini_code_agent.summarizing import cut_point, summarize
 from mini_code_agent.system_prompt import build_system_prompt
 from mini_code_agent.tools import ToolRegistry, default_tools
 
 app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
+
+
+def _compact(messages: list[dict], provider: Provider, session: Session) -> list[dict]:
+    """历史太长就压一次：把旧的那段换成一段摘要，并记进会话。
+
+    放在**轮与轮之间**做，不放 runagent 里：那边有个前提——"返回的 messages = 传进去的 +
+    追加的那几条"（下面就是靠 result.messages[len(messages):] 落盘的）。压缩会改掉前缀，
+    正好把这个前提破坏掉。
+
+    摘要调不动就当没压，照常跑这一轮——绝不能因为压缩把会话卡死。
+    """
+    cut = cut_point(messages)
+    if cut is None:
+        return messages
+    try:
+        summary = summarize(messages[:cut], provider)
+    except Exception as exc:
+        # 网络、限流、模型抽风——都只是"这次没压成"，不是会话的错。
+        console.print(f"（前面的对话没能压成摘要：{type(exc).__name__}，这次先不压）", style="dim")
+        return messages
+    if not summary:
+        return messages
+
+    session.record_summary(cut, summary)
+    console.print(f"（把前面 {cut} 条消息压成了一段摘要）", style="dim", markup=False)
+    return [summary_message(summary), *messages[cut:]]
 
 
 def _chat(
@@ -45,6 +72,8 @@ def _chat(
                 continue
             if line == "/exit":
                 break
+            # 太长就压一次再发。放在轮与轮之间，不放进 runagent——理由见 _compact。
+            messages = _compact(messages, provider, session)
             result = runagent(
                 line,
                 provider,
@@ -146,6 +175,8 @@ def main_command(
     if prompt:
         # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
         console.print(f"> {prompt}", style="bold", markup=False)
+        # 接上来的历史可能已经很长了，先压一次再发。
+        history = _compact(history, provider, session)
         result = runagent(
             prompt,
             provider,
