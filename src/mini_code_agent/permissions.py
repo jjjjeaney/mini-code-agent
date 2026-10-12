@@ -47,6 +47,10 @@ SHORT_FORMS: dict[str, PermissionMode] = {
 # 名单分——两处各写一份迟早会漂。
 EDIT_TOOLS = ("write_file", "edit_file", "replace_lines")
 
+# 仓库里放"规矩"的那个文件：system_prompt.py 会把它的原文拼进 system prompt。改它要用户点头，
+# **即使在 accept edits 档下**——它是"以后每一次都生效"的东西，和改一行代码不是一类。
+RULES_FILE = "AGENTS.md"
+
 
 @dataclass
 class PermissionRequest:
@@ -94,6 +98,8 @@ def decide_permission(
       才发现跑不了，是白问
     - 其余的工具一律放行——读文件、列目录、搜索本来就只受路径闸门管，逐个问没人受得了
     - 改文件的那几个（EDIT_TOOLS）看档位：`accept edits` 放行、`default` 问、`plan` 拒绝
+    - 有一个例外：改**规矩文件**（AGENTS.md）在 `accept edits` 下也要问——那是"以后每一次
+      都生效"的东西，和改一行代码不是一类
 
     "ask" 不是答案，是"这事得问用户"；真的去问、以及用户说不行之后怎么办，在 harness 那层。
 
@@ -113,11 +119,26 @@ def decide_permission(
     if request.tool_name not in EDIT_TOOLS:
         return PermissionDecision("allow", "")
 
-    if mode == "accept edits":
-        return PermissionDecision("allow", "")
     if mode == "plan":
         return PermissionDecision("deny", "plan 模式只读，不给改文件")
+    if is_rules_file(request):
+        # 排在 plan 后面：plan 是"拒"，比"问"更严，不该被这条翻过来。
+        return PermissionDecision("ask", f"改 {RULES_FILE} 要确认——它是以后每次都生效的规矩")
+    if mode == "accept edits":
+        return PermissionDecision("allow", "")
     return PermissionDecision("ask", "改文件要用户确认")
+
+
+def is_rules_file(request: PermissionRequest) -> bool:
+    """这次调用是不是在改那个"规矩文件"（AGENTS.md）。
+
+    只比文件名、不分大小写。宁可多问一次——Windows 上 `agents.md` 和 `AGENTS.md` 本来就是
+    同一个文件，在 Linux 上多问一次也只是问一次。
+    """
+    path = request.tool_args.get("path")
+    if not isinstance(path, str) or not path:
+        return False
+    return os.path.basename(os.path.normpath(path)).lower() == RULES_FILE.lower()
 
 
 def _grant_key(request: PermissionRequest) -> tuple[str, str] | None:

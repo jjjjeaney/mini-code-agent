@@ -9,6 +9,7 @@ from mini_code_agent.permissions import (
     PERMISSION_MODES,
     PermissionRequest,
     decide_permission,
+    is_rules_file,
     parse_permission_mode,
 )
 
@@ -173,3 +174,46 @@ class TestDecidePermission:
         decision = decide_permission(request("edit_file"), SHELL_ON, "plan")
 
         assert "plan" in decision.message
+
+
+class TestTheRulesFile:
+    """AGENTS.md 是"以后每次都生效"的东西，所以 accept edits 下也要问。"""
+
+    def test_editing_it_asks_even_in_accept_edits_mode(self):
+        decision = decide_permission(
+            request("write_file", path="AGENTS.md"), SHELL_ON, "accept edits"
+        )
+
+        assert decision.decision == "ask"
+        assert "AGENTS.md" in decision.message
+
+    def test_other_files_are_still_auto_accepted(self):
+        decision = decide_permission(request("write_file", path="app.py"), SHELL_ON, "accept edits")
+
+        assert decision.decision == "allow"
+
+    def test_plan_still_denies_it(self):
+        """plan 是"拒"，比"问"更严，不该被这条翻过来。"""
+        decision = decide_permission(request("write_file", path="AGENTS.md"), SHELL_ON, "plan")
+
+        assert decision.decision == "deny"
+
+    def test_bypass_does_not_care(self):
+        """bypass 的意思就是什么都不问，这一条也不例外。"""
+        decision = decide_permission(
+            request("write_file", path="AGENTS.md"), SHELL_ON, "bypass permissions"
+        )
+
+        assert decision.decision == "allow"
+
+    def test_the_name_is_matched_loosely(self):
+        """写法不同、大小写不同都算同一个文件；多问一次是安全的那一侧。"""
+        for path in ("AGENTS.md", "./AGENTS.md", "docs/AGENTS.md", "agents.md"):
+            assert is_rules_file(request("edit_file", path=path)) is True, path
+
+    def test_a_lookalike_is_not_it(self):
+        for path in ("AGENTSX.md", "app.py", "AGENTS"):
+            assert is_rules_file(request("edit_file", path=path)) is False, path
+
+    def test_a_request_without_a_path_is_not_it(self):
+        assert is_rules_file(request("edit_file")) is False

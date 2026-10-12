@@ -10,10 +10,64 @@ from mini_code_agent.console import console
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
+from mini_code_agent.prompts import Prompter
 from mini_code_agent.providers.anthropic import AnthropicProvider
-from mini_code_agent.tools import default_tools
+from mini_code_agent.providers.base import Provider
+from mini_code_agent.system_prompt import build_system_prompt
+from mini_code_agent.tools import ToolRegistry, default_tools
 
 app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
+
+
+def _chat(
+    provider: Provider,
+    registry: ToolRegistry,
+    system: str,
+    *,
+    cwd: Path | None,
+    allow_shell: bool,
+    permission_mode: str,
+    prompter: Prompter,
+    grants: Grants,
+) -> None:
+    """交互循环：读一行、跑一轮、把消息接下去。
+
+    抽成函数是为了能测——`main_command` 里写死了 `AnthropicProvider()`，塞不进假的；这里收
+    一个 provider 进来，测试就能拿剧本化的假 provider 跑两轮，看第二轮有没有带上第一轮。
+    """
+    messages: list[dict] = []
+    try:
+        while True:
+            line = typer.prompt("> ").strip()
+            if not line:
+                continue
+            if line == "/exit":
+                break
+            result = runagent(
+                line,
+                provider,
+                registry,
+                system=system,
+                cwd=cwd,
+                allow_shell=allow_shell,
+                permission_mode=permission_mode,
+                prompter=prompter,
+                grants=grants,
+                messages=messages,
+            )
+            # 历史接下去：下一轮要带上这一轮说过的话。
+            messages = result.messages
+            if result.final is None:
+                typer.echo(
+                    f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
+                    err=True,
+                )
+                continue
+            console.print(f"\n{result.final}", markup=False)
+    except (typer.Abort, EOFError, KeyboardInterrupt):
+        # Ctrl+C / Ctrl+D 都当正常退出。打断时提示符后面没有换行，先补一个，
+        # 免得 bye 紧跟在 "^C" 后面。
+        typer.echo()
 
 
 @app.command()
@@ -56,13 +110,18 @@ def main_command(
     # ask_user 只在"有人可问"的时候才存在，所以它不在 default_tools() 里，在这儿装进来。
     registry = default_tools()
     registry.register(make_ask_user(prompter))
+    # provider 和 system prompt 也各建一次：一次运行一个 HTTP 客户端、一份提示词。
+    # 档位中途换不了，所以 system 不用每轮重拼。
+    provider = AnthropicProvider()
+    system = build_system_prompt(cwd or Path.cwd(), permission_mode)
     if prompt:
         # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
         console.print(f"> {prompt}", style="bold", markup=False)
         result = runagent(
             prompt,
-            AnthropicProvider(),
+            provider,
             registry,
+            system=system,
             cwd=cwd,
             allow_shell=shell,
             permission_mode=permission_mode,
@@ -77,30 +136,18 @@ def main_command(
             raise typer.Exit(code=1)
         console.print(f"\n{result.final}", markup=False)
         return
-    else:
-        try:
-            while True:
-                line = typer.prompt("> ").strip()
-                if not line:
-                    continue
-                if line == "/exit":
-                    break
-                result = runagent(
-                    line,
-                    AnthropicProvider(),
-                    registry,
-                    cwd=cwd,
-                    allow_shell=shell,
-                    permission_mode=permission_mode,
-                    prompter=prompter,
-                    grants=grants,
-                )
-                console.print(f"\n{result.final}", markup=False)
-        except (typer.Abort, EOFError, KeyboardInterrupt):
-            # Ctrl+C / Ctrl+D 都当正常退出。打断时提示符后面没有换行，先补一个，
-            # 免得 bye 紧跟在 "^C" 后面。
-            typer.echo()
-        print("bye")
+
+    _chat(
+        provider,
+        registry,
+        system,
+        cwd=cwd,
+        allow_shell=shell,
+        permission_mode=permission_mode,
+        prompter=prompter,
+        grants=grants,
+    )
+    print("bye")
 
 
 if __name__ == "__main__":

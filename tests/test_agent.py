@@ -73,7 +73,9 @@ def test_stops_after_a_plain_reply(registry):
 
     assert result.final == "你好"
     assert result.trace == ["你好"]
-    assert [m["role"] for m in result.messages] == ["user"]
+    # 最后那条回复也进 messages——不然 result.messages 结尾是用户那侧，拿它接着聊就丢了
+    # 模型说过的话。
+    assert [m["role"] for m in result.messages] == ["user", "assistant"]
     assert len(provider.calls) == 1
 
 
@@ -101,7 +103,7 @@ def test_tool_call_is_executed_and_fed_back(registry):
     result = runagent("1+2 等于几", provider, registry)
 
     assert result.final == "3"
-    assert [m["role"] for m in result.messages] == ["user", "assistant", "user"]
+    assert [m["role"] for m in result.messages] == ["user", "assistant", "user", "assistant"]
 
 
 def test_tool_result_points_back_at_the_tool_use(registry):
@@ -183,15 +185,18 @@ def test_a_failing_tool_shows_up_as_an_error_line(registry):
     assert result.final == "换个办法"
 
 
-def test_running_out_of_steps_ends_with_a_result_not_an_answer(registry):
+def test_running_out_of_steps_asks_the_model_to_wrap_up(registry):
+    """用满步数后不再打一句固定话，而是再问一次模型、把它的回复当 final。"""
     script = [tool_turn(f"toolu_{i}", "add", {"a": i, "b": i}) for i in range(3)]
-    provider = ScriptedProvider(script)
+    provider = ScriptedProvider([*script, text_turn("就这样吧")])
 
     result = runagent("没完没了", provider, registry, max_steps=3)
 
-    assert result.final is None
-    assert len(result.trace) == 6
-    assert result.trace[-1].startswith("← add: ")
+    assert result.final == "就这样吧"
+    assert result.trace[-1] == "就这样吧"
+    assert len(provider.calls) == 4  # 三次工具 + 收尾那次
+    # 收尾那次不该带工具：模型手里没工具可调，就只能出文本。
+    assert provider.calls[-1]["tools"] is None
 
 
 class RecordingPrompter:
@@ -566,3 +571,36 @@ class TestGrants:
 
         assert "改 bar.py 而不是这个" in result.trace[1]
         assert log == []
+
+
+class TestMultiTurn:
+    """把上一次的 result.messages 传回来，就接着聊。"""
+
+    def test_the_second_turn_carries_the_first(self, registry):
+        first = ScriptedProvider([text_turn("记住了")])
+        result = runagent("我叫什么来着？", first, registry)
+
+        second = ScriptedProvider([text_turn("那我记着")])
+        runagent("那再说一遍", second, registry, messages=result.messages)
+
+        sent = second.calls[0]["messages"]
+        assert [m["role"] for m in sent] == ["user", "assistant", "user"]
+        assert sent[0]["content"] == "我叫什么来着？"
+        assert sent[1]["content"][0]["text"] == "记住了"
+        assert sent[2]["content"] == "那再说一遍"
+
+    def test_the_history_handed_in_is_not_touched(self, registry):
+        """传进去的那份不该被就地改——调用方还指着它呢。"""
+        result = runagent("第一句", ScriptedProvider([text_turn("好")]), registry)
+        before = list(result.messages)
+
+        runagent("第二句", ScriptedProvider([text_turn("嗯")]), registry, messages=result.messages)
+
+        assert result.messages == before
+
+    def test_without_history_it_starts_fresh(self, registry):
+        provider = ScriptedProvider([text_turn("好")])
+
+        runagent("就这一句", provider, registry)
+
+        assert [m["role"] for m in provider.calls[0]["messages"]] == ["user"]

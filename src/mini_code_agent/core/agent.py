@@ -108,6 +108,7 @@ def runagent(
     permission_mode: str = "default",
     prompter: Prompter | None = None,
     grants: Grants | None = None,
+    messages: list[dict[str, Any]] | None = None,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -116,14 +117,17 @@ def runagent(
     专门用来打印给人看。
     不传 registry 就用 default_tools() 装好的那套内置工具。
 
-    permission_mode 是权限档位（三档见 permissions.py），决定改文件的工具要不要问；
+    permission_mode 是权限档位（四档见 permissions.py），决定什么要问用户；
     prompter 是"问用户"的方式，不传就用一律拒绝的那个——非交互的跑法不该挂在提示符上。
     grants 记的是本会话已经批过的调用，**要在多轮之间共用一份**（所以建在 CLI 那一层，
     不在这儿新建）——不传就是空的，等于每轮都重新问。
+    messages 是之前几轮的消息：把上一次的 result.messages 传回来就接着聊，不传就是新会话。
+    传进来那份**不会**被就地改——返回的是新的一份。
     """
     registry = registry if registry is not None else default_tools()
     tools = registry.schemas()
-    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    # 新拼一份，别就地改调用方手里那份。
+    messages = [*(messages or []), {"role": "user", "content": prompt}]
     trace: list[str] = []
     final: str | None = None
     # prompter 不放进 ctx：问用户不是工具的能力，确认是这一层在调工具之前发的。
@@ -137,6 +141,9 @@ def runagent(
             final = response.text
             if final is not None:
                 trace.append(final)
+                # 这一条也要进 messages：不然 result.messages 结尾是用户那侧，拿它接着聊就
+                # 丢了模型最后说的话。
+                messages.append({"role": "assistant", "content": response.assistant_content})
             break
 
         # assistant 这轮的内容要原样回填：tool_use 块藏在里面，模型靠它认领结果。
@@ -169,5 +176,7 @@ def runagent(
         messages.append({"role": "user", "content": instruction})
         response = provider.complete(messages, system=system)
         final = response.text
-        trace.append(final)
+        if final is not None:
+            trace.append(final)
+            messages.append({"role": "assistant", "content": response.assistant_content})
     return AgentResult(final=final, trace=trace, messages=messages)
