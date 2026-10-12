@@ -66,6 +66,15 @@ class ShellDisabledError(ToolShellError):
     """这个 agent 没开命令执行能力（ToolContext.allow_shell 是 False）。"""
 
 
+class DangerousCommandError(ToolShellError):
+    """命令落在危险命令黑名单上。命令没有执行过。
+
+    和 ShellDisabledError 都是"根本没跑"，但原因不同：那个是能力没开，这个是**判断它不该跑**。
+    它是启发式（见 safety.py 的 DENY_PATTERNS），不是边界——但模型收到它就该换个做法，而不是
+    改写成别的样子再试。
+    """
+
+
 class DockerUnavailableError(ToolShellError):
     """docker 用不了：命令没找到，或者 daemon 没起来。命令没有执行过。"""
 

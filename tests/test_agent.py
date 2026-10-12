@@ -10,6 +10,7 @@ from mini_code_agent.prompting import make_ask_user
 from mini_code_agent.prompts import Answer
 from mini_code_agent.providers.base import ModelResponse, ToolCall
 from mini_code_agent.tools import Tool, ToolContext, ToolRegistry, default_tools
+from mini_code_agent.tools.shell import SHELL_SCHEMA, bash
 
 ADD_SCHEMA = {
     "type": "object",
@@ -649,3 +650,24 @@ class TestTrimming:
 
         # 第八次请求时手上只有八条结果，正好是"最近八条"，一条都不该折
         assert folded_blocks(provider.calls[7]["messages"]) == []
+
+
+def test_a_dangerous_command_is_refused_even_after_the_user_says_yes():
+    """权限闸门管"要不要问"、工具自己的闸门管"能不能做"——点了头也能被拒。
+
+    顺序就是这么定的：先问用户（同意或拒绝都是他的决定），然后工具再判。好处是用户能在
+    trace 里看见模型试过什么；代价是他可能白点一次头。
+    """
+    prompter = RecordingPrompter(allowed=True)
+    provider = ScriptedProvider(
+        [tool_turn("t1", "bash", {"command": "rm -rf /"}), text_turn("好")]
+    )
+    registry = ToolRegistry([Tool(name="bash", description="", fn=bash, params=SHELL_SCHEMA)])
+
+    result = runagent(
+        "删掉根目录", provider, registry, allow_shell=True, prompter=prompter, max_steps=1
+    )
+
+    assert [r.tool_name for r in prompter.tools] == ["bash"]  # 先问过用户
+    assert result.trace[1].startswith("✗ bash: ")  # 但工具照样拒
+    assert "黑名单" in result.trace[1]

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from mini_code_agent.tools.base import ShellDisabledError, ToolContext
+from mini_code_agent.tools.base import DangerousCommandError, ShellDisabledError, ToolContext
 from mini_code_agent.tools.shell import (
     DEFAULT_IMAGE,
     DEFAULT_TIMEOUT_SECONDS,
@@ -68,6 +68,15 @@ class TestBashGuards:
     def test_a_non_string_command_is_rejected(self, shell_ctx):
         with pytest.raises(ValueError, match="非空"):
             bash({"command": 123}, shell_ctx)
+
+    def test_a_dangerous_command_is_refused_before_anything_runs(self, shell_ctx):
+        """黑名单在工具里、在起容器之前——所以这条不需要 docker，也不需要真有危险。"""
+        with pytest.raises(DangerousCommandError, match="黑名单"):
+            bash({"command": "rm -rf /"}, shell_ctx)
+
+    def test_the_refusal_names_the_rule(self, shell_ctx):
+        with pytest.raises(DangerousCommandError, match="格式化或抹掉设备"):
+            bash({"command": "mkfs.ext4 /dev/sda1"}, shell_ctx)
 
 
 def _mounts(argv: list[str]) -> list[str]:

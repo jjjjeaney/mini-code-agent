@@ -18,11 +18,12 @@ from typing import Any
 
 from mini_code_agent.tools.base import (
     ContainerStartFailedError,
+    DangerousCommandError,
     DockerUnavailableError,
     ShellDisabledError,
     ToolContext,
 )
-from mini_code_agent.tools.safety import redact_sensitive
+from mini_code_agent.tools.safety import deny_reason, redact_sensitive
 
 # 沙箱镜像：仓库根目录那个 Dockerfile 构建出来的（python:3.12-slim 加 git）。带 git 是为了
 # 模型能读本地历史（status / diff / log）——写历史那条路本来就被挡着，见下面 .git 的只读挂载。
@@ -63,6 +64,9 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     路径会拿 --cidfile 里的 id 去 docker rm -f。（实测过：杀掉客户端之后容器还在。）
 
     输出会先涂黑（含密钥关键词的整行换掉），再按上限截断。
+
+    命令先过一道危险命令黑名单（`safety.py` 的 `DENY_PATTERNS`）：命中就直接拒，不执行。
+    那是**启发式、不是边界**——边界是下面这个容器。
     """
     if not ctx.allow_shell:
         raise ShellDisabledError(
@@ -73,6 +77,16 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     command = kwargs["command"]
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command 得是非空的字符串。")
+
+    # 危险命令黑名单。放在这儿（工具的闸门里）意味着它**在权限闸门之后**：用户先被问过、
+    # 点了头，这儿照样能拒——"批准"不等于"这件事就安全"，和路径围栏、读-before-写一个道理。
+    # 好处是用户能看见模型试过什么（那条命令会在 trace 里），坏处是他可能白点一次头。
+    denied = deny_reason(command)
+    if denied is not None:
+        raise DangerousCommandError(
+            f"这条命令被危险命令黑名单拦下了（{denied}），没有执行过。"
+            f"换个不危险的做法；别改写成别的样子再试。"
+        )
 
     timeout = _timeout(kwargs.get("timeout_seconds"))
 

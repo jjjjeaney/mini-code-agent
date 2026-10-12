@@ -11,10 +11,13 @@
 限额：单次读多大的文件、留多少字符给模型上下文。
 
 过滤：列目录时哪些文件/目录根本不给模型看。
+
+命令：一条危险命令黑名单。挡的是"顺手就来一下"的那类极度危险动作，**不是边界**。
 """
 
 from __future__ import annotations
 
+import re
 from fnmatch import fnmatchcase
 from pathlib import Path
 
@@ -248,6 +251,75 @@ SENSITIVE_OUTPUT_PATTERNS = (
 )
 
 REDACTED = "[已涂黑]"
+
+# 危险命令黑名单：命中就拒，不再问用户（调用点在 shell.py，在权限闸门**之后**）。
+#
+# **这是启发式，不是边界。** 命令是文本，绕开它有一百种写法（引号、变量、base64、拆成两条）。
+# 真正的边界是容器：只读根、无网络、非 root、只有项目目录可写、跑完就删，还有 `.git` 的只读挂载。
+#
+# 收什么、不收什么，标准只有一条：**后果不可逆，而且是整块地毁**。
+#
+#   1. 把整个项目毁掉——那是容器里唯一可写的地方，而且大部分没有备份
+#   2. 不可逆地丢掉没提交的工作——这几条不经过文件工具，`.agent/.history` 兜不住
+#   3. 设备级破坏 / 拿到宿主机或 root——现在够不着，留着防沙箱参数被改
+#   4. 把容器拖死——`--pids-limit` 兜着，同上
+#
+# **一般的删文件、删目录不收。** `rm -rf build/`、`rm -rf node_modules`、`rm foo.py` 都是正常
+# 干活，拦它们只会把黑名单变成噪音。这不是猜的：按"参数里带 `/` 就拦"写，`rm -rf build/` 会被
+# 误伤，而真正要命的 `rm -rf /workspace` 反而漏掉——所以下面每条都精确到"打到根上"。
+DENY_PATTERNS: tuple[tuple[str, str], ...] = (
+    # 1. 把整个项目毁掉
+    (
+        "删项目根目录（rm -r 打到 /、/workspace、.、..、* 或 $PWD）",
+        r"\brm\s+(?:-\S+\s+)*-\S*[rR]\S*(?:\s+-\S+)*\s+"
+        r"(?:/(?:workspace)?/?|\.\.?/?|\./\*|\*|\$\{?PWD\}?)(?=\s|$)",
+    ),
+    (
+        "删系统目录（rm -r 打到 /etc、/usr 这类）",
+        r"\brm\s+(?:-\S+\s+)*-\S*[rR]\S*(?:\s+-\S+)*\s+"
+        r"/(?:etc|usr|var|root|boot|lib|bin|sbin|opt|srv|home)(?:/\S*)?(?=\s|$)",
+    ),
+    (
+        "删掉 git 仓库目录（.git）",
+        r"\brm\s+(?:-\S+\s+)*-\S*[rR]\S*(?:\s+-\S+)*\s+\.git(?:/\S*)?(?=\s|$)",
+    ),
+    ("把项目根整个 find -delete 掉", r"\bfind\s+(?:\.|/workspace)/?\s*(?:-\w+\s+)?-delete\b"),
+    # 2. 不可逆地丢掉没提交的工作（这几条没有备份兜底）
+    ("清掉未跟踪文件（git clean -f）", r"\bgit\s+clean\b[^|;&]*-[A-Za-z]*f[A-Za-z]*(?=\s|$)"),
+    ("丢弃工作区改动（git reset --hard）", r"\bgit\s+reset\s+--hard\b"),
+    (
+        "丢弃工作区改动（git checkout/restore 打到 .）",
+        r"\bgit\s+(?:checkout|restore)\s+(?:--\s+)?\.(?:/\S*)?(?=\s|$)",
+    ),
+    ("强推（git push --force）", r"\bgit\s+push\b[^|;&]*(?:--force\b|\s-f(?=\s|$))"),
+    ("重写历史（git filter-branch / filter-repo）", r"\bgit\s+filter-(?:branch|repo)\b"),
+    # 3. 设备级破坏（容器里够不着，防沙箱参数被改）
+    ("格式化或抹掉设备（mkfs / wipefs）", r"\b(?:mkfs(?:\.\w+)?|wipefs)\b"),
+    ("直写块设备（dd of=/dev/…）", r"\bdd\b[^|;&]*\bof\s*=\s*/dev/"),
+    # 4. 拿到宿主机或 root（同上）
+    ("拿特权起容器或摸 docker.sock", r"\bdocker\b[^|;&]*--privileged\b|docker\.sock"),
+    (
+        "把宿主机根挂进容器",
+        r"\bdocker\b[^|;&]*(?:-v|--volume)\s+/|--mount\b[^|;&]*(?:src|source)\s*=\s*/",
+    ),
+    ("提权（sudo / su / pkexec）", r"\b(?:sudo|su|pkexec)\b"),
+    # 5. 把容器拖死（pids-limit 兜着，留着防参数被改）
+    ("下载就执行（curl / wget | sh）", r"\b(?:curl|wget)\b[^|;&]*\|\s*(?:ba)?sh\b"),
+    ("fork bomb", r":\(\)\s*\{.*\|.*&.*\}"),
+)
+
+
+def deny_reason(command: str) -> str | None:
+    """这条命令在黑名单上吗？命中就返回那条规则的名字，没有就 None。
+
+    比之前先把命令**整成一行**：行尾续行的反斜杠去掉、换行折成空格。不然 `rm -rf \\` 换行 `/`
+    这种写法能溜过去——正则里的 `.` 不跨行。
+    """
+    flattened = " ".join(re.sub(r"\\\s*\n", " ", command).split())
+    for name, pattern in DENY_PATTERNS:
+        if re.search(pattern, flattened):
+            return name
+    return None
 
 
 def redact_sensitive(text: str) -> tuple[str, int]:
