@@ -1,6 +1,7 @@
 """system prompt 怎么拼。
 
-三段：固定的那段（身份 + 做事的约定）、当前档位那一句、以及仓库里 `AGENTS.md` 的原文。
+四段：固定的那段（身份 + 做事的约定）、当前档位那一句、仓库里 `AGENTS.md` 的原文、以及长期
+记忆的清单（`docs/memory-design.md`）。
 
 单独一个模块，是因为它要读盘、要认识档位，而 `core/agent.py` 只该拿到一个现成的字符串。
 它是个纯函数——给定 cwd 和档位就有确定的输出，测起来不用起 agent。
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from mini_code_agent.memory import index_text as memory_index
 from mini_code_agent.permissions import RULES_FILE, parse_permission_mode
 from mini_code_agent.tools.safety import truncate_text
 
@@ -49,6 +51,17 @@ def build_system_prompt(cwd: Path, permission_mode: str) -> str:
     rules = _read_rules(cwd)
     if rules:
         parts.append(f"项目自己的规矩（来自 {RULES_FILE}，要遵守）：\n\n{rules}")
+    index = memory_index(cwd)
+    if index:
+        # 只有清单，正文靠 read_memory 按需取——这段每轮都要发，也要稳（缓存前缀）。
+        # 口气是命令式的：光把清单摆出来，模型不会主动去取（实测过），得明说"动手之前先扫
+        # 一遍"。这也解释了为什么不能只列出来就算完。
+        parts.append(
+            "你有一份长期记忆（清单在下面，每条只有名字和一句话）。**动手之前先扫一遍**："
+            "只要跟手头这件事沾一点边，就先用 read_memory 把正文读出来再决定怎么做——"
+            "一句话的描述不够，别照着它猜。\n\n"
+            f"{index}"
+        )
     return "\n\n".join(parts)
 
 

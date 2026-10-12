@@ -26,6 +26,7 @@ from mini_code_agent.tools.files import (
     replace_lines,
     write_file,
 )
+from mini_code_agent.tools.memory import READ_MEMORY_SCHEMA, read_memory
 from mini_code_agent.tools.shell import SHELL_SCHEMA, bash
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
@@ -127,6 +128,15 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_file,
                 params=READ_FILE_SCHEMA,
+            ),
+            Tool(
+                name="read_memory",
+                description=(
+                    "按名字取一条**长期记忆**的正文。清单在系统提示里；跟手头这件事沾边的，"
+                    "下手之前先取出来——清单上那一句话不够，别照着它猜。"
+                ),
+                fn=read_memory,
+                params=READ_MEMORY_SCHEMA,
             ),
             Tool(
                 name="write_file",

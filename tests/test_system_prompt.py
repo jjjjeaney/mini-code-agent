@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import PERMISSION_MODES
 from mini_code_agent.system_prompt import build_system_prompt
 
@@ -65,3 +66,22 @@ def test_an_empty_rules_file_is_skipped(tmp_path):
     (tmp_path / "AGENTS.md").write_text("   \n", encoding="utf-8")
 
     assert "AGENTS.md" not in build_system_prompt(tmp_path, "default")
+
+
+def test_the_memory_section_tells_it_to_look_before_working(tmp_path):
+    """光把清单摆出来模型不会主动取（实测）——所以那句得是"动手之前先扫一遍"这种口气。"""
+    write(
+        tmp_path,
+        Memory(name="tabs-for-indent", description="缩进用 tab", type="user", body="按这个来"),
+    )
+
+    text = build_system_prompt(tmp_path, "default")
+
+    assert "tabs-for-indent" in text  # 清单进来了
+    assert "按这个来" not in text  # 正文没进来——那要按需取
+    assert "先扫一遍" in text  # 而且得催它去取
+    assert "read_memory" in text
+
+
+def test_no_memories_means_no_memory_section(tmp_path):
+    assert "长期记忆" not in build_system_prompt(tmp_path, "default")

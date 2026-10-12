@@ -188,6 +188,7 @@ class TestDefaultTools:
             "list_files",
             "project_tree",
             "read_file",
+            "read_memory",
             "write_file",
             "edit_file",
             "replace_lines",
