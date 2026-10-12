@@ -50,7 +50,6 @@ def _compact(messages: list[dict], provider: Provider, session: Session) -> list
 def _chat(
     provider: Provider,
     registry: ToolRegistry,
-    system: str,
     session: Session,
     messages: list[dict],
     *,
@@ -61,6 +60,10 @@ def _chat(
     grants: Grants,
 ) -> None:
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
+
+    **每轮重拼一次 system prompt**：记忆和 `AGENTS.md` 都可能在中途变（模型刚 `remember` 了
+    一条），拼一次用到底的话，这一轮记下的东西要重启进程才看得见。（档位倒是变不了，它现在
+    还是启动参数。）
 
     抽成函数是为了能测——`main_command` 里写死了 `AnthropicProvider()`，塞不进假的；这里收
     一个 provider 进来，测试就能拿剧本化的假 provider 跑两轮，看第二轮有没有带上第一轮。
@@ -74,6 +77,7 @@ def _chat(
                 break
             # 太长就压一次再发。放在轮与轮之间，不放进 runagent——理由见 _compact。
             messages = _compact(messages, provider, session)
+            system = build_system_prompt(cwd, permission_mode)
             result = runagent(
                 line,
                 provider,
@@ -147,8 +151,6 @@ def main_command(
     # ask_user 只在"有人可问"的时候才存在，所以它不在 default_tools() 里，在这儿装进来。
     registry = default_tools()
     registry.register(make_ask_user(prompter))
-    # provider 和 system prompt 也各建一次：一次运行一个 HTTP 客户端、一份提示词。
-    # 档位中途换不了，所以 system 不用每轮重拼。
     workdir = cwd or Path.cwd()
     # 会话：接着上一次，或者开一个新的。两个分支共用同一份落盘。**放在 provider 前面**——
     # 接不上的时候该报的是"没有这个会话"，而不是别的什么。
@@ -168,10 +170,9 @@ def main_command(
         )
     else:
         session = start(workdir, permission_mode=permission_mode, allow_shell=shell)
-    # provider 和 system prompt 各建一次：一次运行一个 HTTP 客户端、一份提示词。
-    # 档位中途换不了，所以 system 不用每轮重拼。
+    # provider 建一次就够（一次运行一个 HTTP 客户端）。system prompt 不在这儿建：一次性那条
+    # 分支现拼一份，交互那条每轮重拼——记忆会中途变，见 _chat。
     provider = AnthropicProvider()
-    system = build_system_prompt(workdir, permission_mode)
     if prompt:
         # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
         console.print(f"> {prompt}", style="bold", markup=False)
@@ -181,7 +182,7 @@ def main_command(
             prompt,
             provider,
             registry,
-            system=system,
+            system=build_system_prompt(workdir, permission_mode),
             cwd=workdir,
             allow_shell=shell,
             permission_mode=permission_mode,
@@ -203,7 +204,6 @@ def main_command(
     _chat(
         provider,
         registry,
-        system,
         session,
         history,
         cwd=workdir,

@@ -217,3 +217,21 @@ class TestTheRulesFile:
 
     def test_a_request_without_a_path_is_not_it(self):
         assert is_rules_file(request("edit_file")) is False
+
+
+class TestTheRememberRule:
+    """写长期记忆不论哪一档都要问——它是"以后每次会话都生效"的东西。"""
+
+    @pytest.mark.parametrize("mode", ["default", "accept edits", "plan"])
+    def test_it_asks_in_every_mode(self, mode):
+        assert decide_permission(request("remember"), SHELL_ON, mode).decision == "ask"
+
+    def test_bypass_does_not_care(self):
+        """bypass 的意思就是什么都不问，这一条也不例外。"""
+        decision = decide_permission(request("remember"), SHELL_ON, "bypass permissions")
+
+        assert decision.decision == "allow"
+
+    def test_reading_a_memory_is_not_gated(self):
+        """读记忆是普通的读，跟读文件一样不该问。"""
+        assert decide_permission(request("read_memory"), SHELL_ON, "default").decision == "allow"

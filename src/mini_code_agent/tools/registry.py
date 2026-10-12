@@ -26,7 +26,12 @@ from mini_code_agent.tools.files import (
     replace_lines,
     write_file,
 )
-from mini_code_agent.tools.memory import READ_MEMORY_SCHEMA, read_memory
+from mini_code_agent.tools.memory import (
+    READ_MEMORY_SCHEMA,
+    REMEMBER_SCHEMA,
+    read_memory,
+    remember,
+)
 from mini_code_agent.tools.shell import SHELL_SCHEMA, bash
 from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
 
@@ -137,6 +142,16 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_memory,
                 params=READ_MEMORY_SCHEMA,
+            ),
+            Tool(
+                name="remember",
+                description=(
+                    "把一条**长期记忆**记下来，以后每次会话都带着它。只记跨会话还成立的事："
+                    "用户的偏好和习惯、这个项目的约定和边界、外部资源的指针。这一次任务的内容"
+                    "别记——那些在会话记录里。写之前会先问用户。"
+                ),
+                fn=remember,
+                params=REMEMBER_SCHEMA,
             ),
             Tool(
                 name="write_file",

@@ -7,7 +7,7 @@ import pytest
 from mini_code_agent.memory import index_text, names, read, write
 from mini_code_agent.memory.store import INDEX_NAME, Memory
 from mini_code_agent.tools.base import ToolContext
-from mini_code_agent.tools.memory import read_memory
+from mini_code_agent.tools.memory import read_memory, remember
 
 
 def a_memory(name: str = "tabs-for-indent", **overrides) -> Memory:
@@ -143,3 +143,53 @@ class TestTheTool:
         """交给 dispatch 变成模型看得见的结果，它才知道自己拼错了名字。"""
         with pytest.raises(FileNotFoundError):
             read_memory({"name": "nope"}, ToolContext(cwd=tmp_path))
+
+
+class TestTheRememberTool:
+    def a_call(self, tmp_path, **overrides) -> str:
+        fields = {
+            "name": "uv-for-tests",
+            "description": "跑测试一律 uv run --no-sync",
+            "type": "project",
+            "body": "同步失败时会返回 0，所以验证一律加 --no-sync。",
+            **overrides,
+        }
+        return remember(fields, ToolContext(cwd=tmp_path))
+
+    def test_it_writes_the_memory(self, tmp_path):
+        message = self.a_call(tmp_path)
+
+        memory = read(tmp_path, "uv-for-tests")
+        assert memory.type == "project"
+        assert memory.body == "同步失败时会返回 0，所以验证一律加 --no-sync。"
+        assert "uv-for-tests" in message
+
+    def test_the_source_is_set_here_not_by_the_model(self, tmp_path):
+        """记忆是谁写的，不该让写它的模型自己填——那是给人看的置信度标记。"""
+        self.a_call(tmp_path, source="user")
+
+        assert read(tmp_path, "uv-for-tests").source == "agent"
+
+    def test_the_index_is_rebuilt(self, tmp_path):
+        self.a_call(tmp_path)
+
+        assert "uv-for-tests" in index_text(tmp_path)
+
+    def test_writing_the_same_name_twice_overwrites(self, tmp_path):
+        self.a_call(tmp_path, body="旧的说法")
+        self.a_call(tmp_path, body="新的说法")
+
+        assert read(tmp_path, "uv-for-tests").body == "新的说法"
+        assert len(names(tmp_path)) == 1
+
+    def test_a_bad_type_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="type"):
+            self.a_call(tmp_path, type="nope")
+
+    def test_a_bad_name_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="不是有效的记忆名"):
+            self.a_call(tmp_path, name="../evil")
+
+    def test_an_empty_body_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="正文是空的"):
+            self.a_call(tmp_path, body="  ")

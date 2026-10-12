@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from mini_code_agent import cli
+from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants
 from mini_code_agent.prompts import NullPrompter
-from mini_code_agent.providers.base import ModelResponse
+from mini_code_agent.providers.base import ModelResponse, ToolCall
 from mini_code_agent.sessions import Session, load, start
-from mini_code_agent.tools import ToolRegistry
-
-SYSTEM = "你是一个 coding agent。"
+from mini_code_agent.system_prompt import build_system_prompt
+from mini_code_agent.tools import Tool, ToolRegistry
 
 
 class ScriptedProvider:
@@ -32,6 +32,15 @@ def text_turn(text: str) -> ModelResponse:
     )
 
 
+def tool_turn(call_id: str, name: str, arguments: dict) -> ModelResponse:
+    return ModelResponse(
+        text=None,
+        tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)],
+        assistant_content=[{"type": "tool_use", "id": call_id, "name": name, "input": arguments}],
+        stop_reason="tool_use",
+    )
+
+
 def run_loop(
     monkeypatch,
     provider: ScriptedProvider,
@@ -40,6 +49,7 @@ def run_loop(
     *,
     session: Session | None = None,
     messages: list[dict] | None = None,
+    registry: ToolRegistry | None = None,
 ) -> Session:
     """喂一串「用户输入」，把交互循环跑起来。最后一句给 /exit 收尾。"""
     answers = iter(lines)
@@ -47,8 +57,7 @@ def run_loop(
     session = session or start(tmp_path, permission_mode="default", allow_shell=False)
     cli._chat(
         provider,
-        ToolRegistry([]),
-        SYSTEM,
+        registry or ToolRegistry([]),
         session,
         [] if messages is None else messages,
         cwd=tmp_path,
@@ -76,7 +85,30 @@ def test_the_system_prompt_goes_out_on_every_turn(monkeypatch, tmp_path):
 
     run_loop(monkeypatch, provider, ["一", "二", "/exit"], tmp_path)
 
-    assert provider.systems == [SYSTEM, SYSTEM]
+    expected = build_system_prompt(tmp_path, "default")
+    assert provider.systems == [expected, expected]
+
+
+def test_a_memory_written_mid_run_shows_up_next_turn(monkeypatch, tmp_path):
+    """模型这一轮记了一条，下一轮的提示词里就该有它——所以每轮重拼一次。
+
+    （一轮内部不重拼：`runagent` 那一串步骤用的是同一份，所以这一轮记的东西要**下一轮**
+    才看得见——工具返回的话也是这么说的。）
+    """
+
+    def scribble(kwargs: dict, ctx) -> str:
+        write(ctx.cwd, Memory(name="fresh-note", description="刚记的", type="user", body="正文"))
+        return "记下了"
+
+    registry = ToolRegistry([Tool(name="scribble", description="", fn=scribble, params={})])
+    provider = ScriptedProvider(
+        [tool_turn("t1", "scribble", {}), text_turn("接着说"), text_turn("嗯")]
+    )
+
+    run_loop(monkeypatch, provider, ["记一条", "再说一句", "/exit"], tmp_path, registry=registry)
+
+    assert "fresh-note" not in provider.systems[0]  # 第一轮（包括它内部那几步）还没有
+    assert "fresh-note" in provider.systems[-1]  # 第二轮就有了
 
 
 def test_a_blank_line_is_not_a_turn(monkeypatch, tmp_path):

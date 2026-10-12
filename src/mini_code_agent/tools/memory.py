@@ -1,19 +1,21 @@
-"""读长期记忆的工具：按名字取一条记忆的正文。
+"""长期记忆的两个工具：读一条的正文，和记一条新的。
 
 清单（名字 + 一行描述）在 system prompt 里，模型看着它挑；正文可能不短，所以按需取。
 
-**不走 read_file**：记忆在 `.agent/` 下面，那是敏感目录，文件工具读不到——那是刻意的
-（`.agent` 里还有会话流水和改前原件）。这个工具是 harness 自己开的一道门，只认 `<名字>.md`
-这种形状，也就顺带挡掉了"顺着路径跑到别处去"。
+**都不走 read_file / write_file**：记忆在 `.agent/` 下面，那是敏感目录，文件工具够不着——那是
+刻意的（`.agent` 里还有会话流水和改前原件）。这两个工具是 harness 自己开的一道门，只认
+`<名字>.md` 这种形状，顺带挡掉了路径穿越。
 
-只读不写。写入那一侧要经用户批准（见 `docs/memory-design.md` 第四节），是另一件事。
+写的那条还要过权限闸门（`permissions.py` 里"写记忆一律要问"）：记忆是**以后每次会话都生效**的
+东西，和改 `AGENTS.md` 一个道理，不该悄悄写进去。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from mini_code_agent.memory import read
+from mini_code_agent.memory import Memory, read, write
+from mini_code_agent.memory.store import TYPES
 from mini_code_agent.tools.base import ToolContext
 
 READ_MEMORY_SCHEMA: dict[str, Any] = {
@@ -24,7 +26,58 @@ READ_MEMORY_SCHEMA: dict[str, Any] = {
     "required": ["name"],
 }
 
+REMEMBER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": (
+                "记忆的名字：小写字母、数字、连字符，一眼看出是什么，比如 uv-for-tests"
+            ),
+        },
+        "description": {
+            "type": "string",
+            "description": (
+                "一句话说清这条是什么。它进系统提示的清单，下次只靠这一句判断要不要取正文"
+            ),
+        },
+        "type": {
+            "type": "string",
+            "enum": list(TYPES),
+            "description": (
+                "user=关于用户的偏好习惯；project=这个项目的约定、命令、边界；"
+                "reference=外部指针（文档地址、服务在哪儿）"
+            ),
+        },
+        "body": {
+            "type": "string",
+            "description": "正文。写能再查证的事实：具体路径、具体命令、为什么这么定",
+        },
+    },
+    "required": ["name", "description", "type", "body"],
+}
+
 
 def read_memory(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """按名字取一条记忆的正文。"""
     return read(ctx.cwd, kwargs["name"]).body
+
+
+def remember(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+    """记一条长期记忆。
+
+    `source` 由这里定死成 `agent`——记忆是谁写的这件事不该让写它的模型自己填，那是给人看的
+    置信度标记。
+    """
+    memory = Memory(
+        name=kwargs["name"],
+        description=kwargs["description"],
+        type=kwargs["type"],
+        body=kwargs["body"],
+        source="agent",
+    )
+    write(ctx.cwd, memory)
+    return (
+        f"记下了 {memory.name}（type={memory.type}）。"
+        "下一轮起它就出现在清单里，同时被写进 .agent/memory/。"
+    )

@@ -100,6 +100,8 @@ def decide_permission(
     - 改文件的那几个（EDIT_TOOLS）看档位：`accept edits` 放行、`default` 问、`plan` 拒绝
     - 有一个例外：改**规矩文件**（AGENTS.md）在 `accept edits` 下也要问——那是"以后每一次
       都生效"的东西，和改一行代码不是一类
+    - 还有一个：**写长期记忆**（remember）不论哪一档都要问。同理——它也是"以后每次会话都
+      生效"的，模型悄悄给自己立规矩比改错一行代码严重
 
     "ask" 不是答案，是"这事得问用户"；真的去问、以及用户说不行之后怎么办，在 harness 那层。
 
@@ -110,6 +112,9 @@ def decide_permission(
 
     if mode == "bypass permissions":
         return PermissionDecision("allow", "")
+
+    if request.tool_name == "remember":
+        return PermissionDecision("ask", "写长期记忆要用户确认")
 
     if request.tool_name == "bash":
         if not allow_shell:

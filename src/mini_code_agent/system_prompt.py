@@ -43,8 +43,9 @@ _MODE_HINTS = {
 def build_system_prompt(cwd: Path, permission_mode: str) -> str:
     """拼一份 system prompt。
 
-    调用方**建一次、每轮传同一份**：前提是档位在一次运行里不会变（现在没有中途换档的入口）。
-    哪天加了切换档位，这份就得跟着重建。
+    交互那条路**每轮重拼一次**：记忆和 `AGENTS.md` 都可能中途变（模型刚 `remember` 了一条），
+    拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位倒是变不了（现在还没有中途
+    换档的入口）——哪天加了，这份照样得跟着重建。
     """
     mode = parse_permission_mode(permission_mode)
     parts = [_BASE, _MODE_HINTS[mode]]
