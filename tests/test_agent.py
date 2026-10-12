@@ -604,3 +604,48 @@ class TestMultiTurn:
         runagent("就这一句", provider, registry)
 
         assert [m["role"] for m in provider.calls[0]["messages"]] == ["user"]
+
+
+def folded_blocks(messages: list[dict]) -> list[dict]:
+    """这份 messages 里被折掉的工具结果。"""
+    return [
+        block
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if block.get("type") == "tool_result" and "折叠" in str(block.get("content"))
+    ]
+
+
+class TestTrimming:
+    """旧的、长的工具结果发出去之前折掉——但留下的那份还是完整的。"""
+
+    def a_dump_registry(self) -> ToolRegistry:
+        def dump(kwargs: dict, ctx: ToolContext) -> str:
+            return "x" * 3000
+
+        return ToolRegistry([Tool(name="dump", description="", fn=dump, params={})])
+
+    def nine_dumps(self) -> ScriptedProvider:
+        return ScriptedProvider(
+            [*(tool_turn(f"t{i}", "dump", {}) for i in range(9)), text_turn("好了")]
+        )
+
+    def test_what_is_sent_is_folded_but_what_is_kept_is_whole(self):
+        provider = self.nine_dumps()
+
+        result = runagent("读九次", provider, self.a_dump_registry(), max_steps=9)
+
+        # 发出去的最后那次里，最旧的那条折了（一共九条，最近八条留着）
+        assert len(folded_blocks(provider.calls[-1]["messages"])) == 1
+        # 而 returned 的这份（也就是落盘的那份）一条都没折
+        assert folded_blocks(result.messages) == []
+        assert result.messages[2]["content"][0]["content"] == "x" * 3000
+
+    def test_nothing_is_folded_while_the_history_is_short(self):
+        provider = self.nine_dumps()
+
+        runagent("读九次", provider, self.a_dump_registry(), max_steps=9)
+
+        # 第八次请求时手上只有八条结果，正好是"最近八条"，一条都不该折
+        assert folded_blocks(provider.calls[7]["messages"]) == []

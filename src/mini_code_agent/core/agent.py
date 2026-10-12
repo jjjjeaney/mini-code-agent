@@ -12,6 +12,7 @@ from mini_code_agent.permissions import EDIT_TOOLS, Grants, PermissionRequest, d
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
 from mini_code_agent.providers.base import Provider, ToolCall
 from mini_code_agent.tools import ToolContext, ToolRegistry, ToolResult, default_tools
+from mini_code_agent.trimming import fold_old_tool_results
 
 
 @dataclass
@@ -134,8 +135,27 @@ def runagent(
     prompter = prompter if prompter is not None else NullPrompter()
     grants = grants if grants is not None else Grants()
     ctx = ToolContext(cwd or Path.cwd(), allow_shell=allow_shell)
+    reported_folding = False
+
+    def sending() -> list[dict[str, Any]]:
+        """该发出去的那一份：旧的、长的工具结果折掉，顺手报一次账。
+
+        `messages` 本身留着完整的——会话文件和 result.messages 都得是全的；折的只是这一次
+        请求发出去的那份。报账只报一次（每步都报会吵），但每步都得重算：历史在长。
+        """
+        nonlocal reported_folding
+        trimmed = fold_old_tool_results(messages)
+        if trimmed.count and not reported_folding:
+            console.print(
+                f"（折叠了 {trimmed.count} 条旧的工具结果，约 {trimmed.chars} 字符）",
+                style="dim",
+                markup=False,
+            )
+            reported_folding = True
+        return trimmed.messages
+
     for _ in range(max_steps):
-        response = provider.complete(messages, tools=tools, system=system)
+        response = provider.complete(sending(), tools=tools, system=system)
 
         if not response.tool_calls:
             final = response.text
@@ -174,7 +194,7 @@ def runagent(
     if final is None:
         instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"
         messages.append({"role": "user", "content": instruction})
-        response = provider.complete(messages, system=system)
+        response = provider.complete(sending(), system=system)
         final = response.text
         if final is not None:
             trace.append(final)
