@@ -51,7 +51,10 @@ REMEMBER_SCHEMA: dict[str, Any] = {
         },
         "body": {
             "type": "string",
-            "description": "正文。写能再查证的事实：具体路径、具体命令、为什么这么定",
+            "description": (
+                "正文。写能再查证的事实：具体路径、具体命令、为什么这么定，"
+                "并且**点出依据**（哪份文件、哪条命令、什么时候的事）——以后好核实它还算不算数"
+            ),
         },
     },
     "required": ["name", "description", "type", "body"],

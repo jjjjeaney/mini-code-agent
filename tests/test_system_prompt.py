@@ -81,6 +81,7 @@ def test_the_memory_section_tells_it_to_look_before_working(tmp_path):
     assert "按这个来" not in text  # 正文没进来——那要按需取
     assert "先扫一遍" in text  # 而且得催它去取
     assert "read_memory" in text
+    assert "以眼前的为准" in text  # 记忆是快照：跟现状对不上时以现状为准
 
 
 def test_no_memories_means_no_memory_section(tmp_path):
