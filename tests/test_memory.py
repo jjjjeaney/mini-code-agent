@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from mini_code_agent.memory import index_text, names, read, write
-from mini_code_agent.memory.store import INDEX_NAME, Memory
+from mini_code_agent.memory import index_text, names, read, sync_index, write
+from mini_code_agent.memory.store import INDEX_NAME, Memory, memory_dir, render
 from mini_code_agent.tools.base import ToolContext
 from mini_code_agent.tools.memory import read_memory, remember
 
@@ -129,6 +129,46 @@ class TestTheIndex:
 
         assert "tabs-for-indent" in text
         assert "broken" not in text
+
+
+class TestSyncIndex:
+    """磁盘上那份索引会漂——手工加、手工删都不经过 write()。启动时对一次。"""
+
+    def hand_write(self, tmp_path, name: str = "hand-made") -> None:
+        directory = memory_dir(tmp_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.md").write_text(render(a_memory(name=name)), encoding="utf-8")
+
+    def disk_index(self, tmp_path) -> str:
+        return (memory_dir(tmp_path) / INDEX_NAME).read_text(encoding="utf-8")
+
+    def test_a_hand_added_memory_lands_in_the_index(self, tmp_path):
+        self.hand_write(tmp_path)
+
+        assert sync_index(tmp_path) is True
+
+        assert "hand-made" in self.disk_index(tmp_path)
+
+    def test_a_hand_deleted_memory_leaves_the_index(self, tmp_path):
+        write(tmp_path, a_memory(name="aaa"))
+        write(tmp_path, a_memory(name="bbb"))
+        (memory_dir(tmp_path) / "aaa.md").unlink()
+
+        assert sync_index(tmp_path) is True
+
+        assert "aaa" not in self.disk_index(tmp_path)
+        assert "bbb" in self.disk_index(tmp_path)
+
+    def test_it_does_nothing_when_already_in_sync(self, tmp_path):
+        """稳态下一个字节都不动——不然每次启动都重写一遍。"""
+        write(tmp_path, a_memory())
+
+        assert sync_index(tmp_path) is False
+
+    def test_no_directory_means_nothing_happens(self, tmp_path):
+        """不因为跑一次 agent，就在别人项目里造一个 .agent/memory/。"""
+        assert sync_index(tmp_path) is False
+        assert not (tmp_path / ".agent").exists()
 
 
 class TestTheTool:

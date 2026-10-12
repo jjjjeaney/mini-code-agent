@@ -4,8 +4,10 @@
 
 - 每条记忆一个文件，`frontmatter + 正文`。frontmatter 是**手工可读的几行**，不引 YAML——
   值都是简单标量，split 一次冒号就够了（描述里带冒号也切得对，因为只切第一个）。
-- **索引不手工维护**：每次写完重扫一遍目录重排。增量改会漂，重扫不会，而且这点量很便宜。
-  排序是固定的（按名字），所以只动到变了的那几行——这对 system prompt 的缓存前缀很重要。
+- **索引不手工维护**：写完重扫一遍目录重排。增量改会漂，重扫不会，而且这点量很便宜。排序是
+  固定的（按名字），所以只动到变了的那几行——这对 system prompt 的缓存前缀很重要。
+- **手工加/删记忆也会让它漂**（那条路不经过 `write()`），所以启动时还会对一次
+  （`sync_index`）——只在真不一样时才写。
 - **提示词里那份索引是现算的**（`index_text()` 每次扫文件），磁盘上那个 `MEMORY.md` 只是给
   人翻的副本——所以它旧了也不影响模型，倒是反过来：手工加一个文件、还没重建索引，下次
   拼提示词就已经能看见它了。
@@ -82,21 +84,33 @@ def read(cwd: Path, name: str) -> Memory:
 
 
 def write(cwd: Path, memory: Memory) -> Path:
-    """写一条（覆盖同名的），然后重建索引。"""
+    """写一条（覆盖同名的），然后让索引跟上。"""
     _validate(memory)
     directory = memory_dir(cwd)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{memory.name}.md"
     path.write_text(render(memory), encoding="utf-8")
-    rebuild_index(cwd)
+    sync_index(cwd)
     return path
 
 
-def rebuild_index(cwd: Path) -> None:
-    """重扫目录、重写索引。没有记忆时也写（内容为空）——目录自己说明自己。"""
+def sync_index(cwd: Path) -> bool:
+    """让磁盘上那份索引跟目录里实际有什么对齐；写了返回 True。
+
+    **只在真的不一样时才写**：手工加过、删过记忆之后它会漂（模型那边不受影响——它看的是现算
+    的 `index_text()`），启动时对一次就够，稳态下一个字节都不动。
+
+    目录压根不存在就直接返回：不因为跑一次 agent，就在别人项目里造一个 `.agent/memory/`。
+    """
     directory = memory_dir(cwd)
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / INDEX_NAME).write_text(index_text(cwd), encoding="utf-8")
+    if not directory.is_dir():
+        return False
+    text = index_text(cwd)
+    index = directory / INDEX_NAME
+    if index.is_file() and index.read_text(encoding="utf-8") == text:
+        return False
+    index.write_text(text, encoding="utf-8")
+    return True
 
 
 def index_text(cwd: Path) -> str:
