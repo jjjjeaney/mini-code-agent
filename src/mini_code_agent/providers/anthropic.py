@@ -191,5 +191,7 @@ class AnthropicProvider:
             # 用量原样带出去，别在这儿算、也别在这儿判断——这一层不认识"省钱"这件事。
             # 谁想看谁看（主循环会打一行出来）。
             input_tokens=usage.input_tokens or 0,
+            output_tokens=usage.output_tokens or 0,
             cache_read_input_tokens=usage.cache_read_input_tokens or 0,
+            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
         )

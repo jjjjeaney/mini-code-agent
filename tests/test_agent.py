@@ -692,6 +692,7 @@ def test_the_usage_line_is_printed_for_every_request(capsys):
                 assistant_content=[{"type": "text", "text": "好"}],
                 stop_reason="end_turn",
                 input_tokens=100,
+                output_tokens=250,
                 cache_read_input_tokens=900,
             )
         ]
@@ -700,17 +701,39 @@ def test_the_usage_line_is_printed_for_every_request(capsys):
     runagent("问一句", provider, ToolRegistry([]))
 
     out = capsys.readouterr().out
-    assert "缓存 900" in out
-    assert "原价 100" in out
+    # 总输入是**加出来的** 1,000，不是那 100——三个字段不重叠，这一行就是为把账看对。
+    assert "输入 1,000（原价 100 + 缓存命中 900）· 输出 250" in out
+
+
+def test_the_cache_write_shows_up_when_there_is_one(capsys):
+    """cache_creation 是往缓存里新写的那部分。这个后端是自动前缀缓存，常态是 0——
+    真写了就得看得见，那是要按更贵的价算的一笔。"""
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                text="好",
+                assistant_content=[{"type": "text", "text": "好"}],
+                stop_reason="end_turn",
+                input_tokens=0,
+                output_tokens=10,
+                cache_creation_input_tokens=2_000,
+            )
+        ]
+    )
+
+    runagent("问一句", provider, ToolRegistry([]))
+
+    out = capsys.readouterr().out
+    assert "输入 2,000（原价 0 + 新写缓存 2,000）· 输出 10" in out
 
 
 def test_no_usage_line_when_the_backend_reports_nothing(capsys):
-    """两个数都是 0 就不吭声——那是假 provider，不是"命中 0"，别拿噪音骗自己。"""
+    """全是 0 就不吭声——那是假 provider，不是"这一发真的没花钱"，别拿噪音骗自己。"""
     provider = ScriptedProvider([text_turn("好")])
 
     runagent("问一句", provider, ToolRegistry([]))
 
-    assert "输入 token" not in capsys.readouterr().out
+    assert "这一发" not in capsys.readouterr().out
 
 
 class ProviderThatFails:

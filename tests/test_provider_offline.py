@@ -41,16 +41,23 @@ def a_response(
     text: str = "好",
     *,
     input_tokens: int | None = 0,
+    output_tokens: int | None = 0,
     cached: int | None = 0,
+    written: int | None = 0,
 ) -> SimpleNamespace:
     """一次响应，形状只保留 provider 会读的那几样。
 
-    用量那两个字段默认给 None 也行——SDK 里的类型就是 `int | None`，provider 得把它兜成 0。
+    用量那四个字段默认给 None 也行——SDK 里的类型就是 `int | None`，provider 得把它兜成 0。
     """
     return SimpleNamespace(
         content=[SimpleNamespace(type="text", text=text)],
         stop_reason=stop_reason,
-        usage=SimpleNamespace(input_tokens=input_tokens, cache_read_input_tokens=cached),
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=cached,
+            cache_creation_input_tokens=written,
+        ),
     )
 
 
@@ -147,22 +154,30 @@ class TestOutputLimitEscalation:
 class TestUsage:
     """用量原样带出去——这一层不判断"省没省钱"，只把数交上去（主循环会打一行出来）。"""
 
-    def test_it_carries_the_token_counts_out(self):
-        provider = a_provider(a_response(input_tokens=120, cached=880))
+    def test_it_carries_all_four_counts_out(self):
+        provider = a_provider(
+            a_response(input_tokens=120, output_tokens=34, cached=880, written=56)
+        )
 
         result = provider.complete([{"role": "user", "content": "问"}])
 
         assert result.input_tokens == 120
+        assert result.output_tokens == 34
         assert result.cache_read_input_tokens == 880
+        assert result.cache_creation_input_tokens == 56
 
     def test_a_null_count_becomes_zero(self):
-        """SDK 里这两个字段是 `int | None`，None 得落到 0——不然上层一相加就炸。"""
-        provider = a_provider(a_response(input_tokens=None, cached=None))
+        """SDK 里那几个字段是 `int | None`，None 得落到 0——不然上层一相加就炸。"""
+        provider = a_provider(
+            a_response(input_tokens=None, output_tokens=None, cached=None, written=None)
+        )
 
         result = provider.complete([{"role": "user", "content": "问"}])
 
         assert result.input_tokens == 0
+        assert result.output_tokens == 0
         assert result.cache_read_input_tokens == 0
+        assert result.cache_creation_input_tokens == 0
 
 
 class TestErrors:

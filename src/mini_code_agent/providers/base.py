@@ -56,11 +56,21 @@ class ModelResponse:
 
     # 这一发的用量。默认 0 是为了让假 provider（测试里那一堆）不用管它，真后端一定会填。
     #
-    # 两个字段**不重叠**：input_tokens 是没走缓存的那部分，cache_read_input_tokens 是命中的
-    # 那部分，所以这次请求的总输入 = 两者相加。这是 Anthropic 的 usage 语义，而打的后端
-    # （DeepSeek）是自动前缀缓存——命中多少只看后一个数，请求里不用传任何东西。
+    # **输入那三个字段不重叠**：input_tokens 是没走缓存的那部分，cache_read 是命中的，
+    # cache_creation 是往缓存里新写的——**三个加起来**才是这次请求的输入。这是 Anthropic 的
+    # usage 语义。打的后端（DeepSeek）是自动前缀缓存：请求里不用传任何东西，命中多少只看
+    # cache_read（所以 cache_creation 常态是 0，那一段是留给"哪天真的手动写缓存"的）。
+    #
+    # output_tokens 是生成的那部分。算钱的话它通常比谁都重——单价一般是输入的好几倍。
     input_tokens: int = 0
     cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    output_tokens: int = 0
+
+    # **没有 server_tool_use**：SDK 里那不是 token，是"服务端工具跑了几次"
+    # （ServerToolUsage 就两个字段：web_search_requests / web_fetch_requests）。而且这个后端
+    # 不提供服务端工具——本项目的 web_search / web_fetch 是**客户端**工具，在 tools/web.py 里，
+    # 它们花的 token 混在正常的输入输出里。哪天用上真 Anthropic 的 server tool 再说。
 
 
 class Provider(Protocol):

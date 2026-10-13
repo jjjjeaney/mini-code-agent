@@ -41,6 +41,34 @@ class AgentResult:
     error: str | None = None
 
 
+def _usage_note(response: ModelResponse) -> str:
+    """把这一发的用量写成一行。
+
+    输入那三个数**不重叠**（见 ModelResponse 的注释）：input_tokens 是没走缓存的，cache_read
+    是命中的，cache_creation 是往缓存里新写的——**三个加起来**才是这次请求的输入。所以总输入
+    得算出来给它看：只写"输入 12,000 · 缓存 8,000"，很容易被读成后者是前者的子集，那就把账
+    看错了（而这一行的全部意义就是把账看对）。
+
+    缓存那两截**只在真发生时提**。这个后端是自动前缀缓存，常态下 cache_creation 是 0，每次都
+    印一个 0 只是噪音。
+    """
+    parts = []
+    if response.cache_read_input_tokens:
+        parts.append(f"缓存命中 {response.cache_read_input_tokens:,}")
+    if response.cache_creation_input_tokens:
+        parts.append(f"新写缓存 {response.cache_creation_input_tokens:,}")
+
+    size = (
+        response.input_tokens
+        + response.cache_read_input_tokens
+        + response.cache_creation_input_tokens
+    )
+    if not parts:
+        return f"输入 {size:,} · 输出 {response.output_tokens:,}"
+    breakdown = " + ".join([f"原价 {response.input_tokens:,}", *parts])
+    return f"输入 {size:,}（{breakdown}）· 输出 {response.output_tokens:,}"
+
+
 def _as_text(value: Any) -> str:
     """压成一行文本。非字符串走 JSON，这样一来换行会被转义，不会把流水账冲散。"""
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
@@ -183,15 +211,13 @@ def runagent(
         应该只增不减；要是中间被什么东西改动了开头（比如折叠旧工具结果，它改的正好是消息列表
         前排），命中就会从那个位置往后全部掉成 0。这一行就是为看这件事打的。
         """
+
         response = provider.complete(sent, **kwargs)
-        # 两个数都是 0 就不吭声——那是假 provider（测试里那些），不是"命中 0"。
-        if response.input_tokens or response.cache_read_input_tokens:
-            console.print(
-                f"（这一发输入 token：缓存 {response.cache_read_input_tokens:,}，"
-                f"原价 {response.input_tokens:,}）",
-                style="dim",
-                markup=False,
-            )
+        used = (response.input_tokens, response.output_tokens, response.cache_read_input_tokens)
+        # 全是 0 就不吭声——那是假 provider（测试里那些），不是"这一发真的没花钱"。
+        if not any(used):
+            return response
+        console.print(f"（这一发 token：{_usage_note(response)}）", style="dim", markup=False)
         return response
 
     def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
