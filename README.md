@@ -20,7 +20,7 @@ cp .env.example .env
 | --- | --- |
 | `DEEPSEEK_API_KEY` | 接口密钥 |
 | `DEEPSEEK_ANTHROPIC_BASE_URL` | Anthropic 兼容端点地址 |
-| `TAVILY_API_KEY` | Tavily 联网搜索密钥，`web_search` 工具用；不配的话只有这一个工具不可用 |
+| `TAVILY_API_KEY` | Tavily 联网密钥，`web_search` 和 `web_fetch` 两个工具用；不配的话这两个都不可用 |
 
 ## 使用
 

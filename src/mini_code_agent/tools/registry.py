@@ -33,7 +33,7 @@ from mini_code_agent.tools.memory import (
     remember,
 )
 from mini_code_agent.tools.shell import SHELL_SCHEMA, bash
-from mini_code_agent.tools.web import WEB_SEARCH_SCHEMA, web_search
+from mini_code_agent.tools.web import WEB_FETCH_SCHEMA, WEB_SEARCH_SCHEMA, web_fetch, web_search
 
 
 class ToolRegistry:
@@ -218,10 +218,21 @@ def default_tools() -> ToolRegistry:
                 name="web_search",
                 description=(
                     "联网搜索。遇到你不确定、可能已过时、或需要查证的事实时用它，"
-                    "比如近期新闻、最新版本号、人物近况。返回若干条结果的标题、链接和摘要。"
+                    "比如近期新闻、最新版本号、人物近况。返回若干条结果的标题、链接和摘要；"
+                    "要读其中某一条的正文，把它的链接交给 web_fetch。"
                 ),
                 fn=web_search,
                 params=WEB_SEARCH_SCHEMA,
+            ),
+            Tool(
+                name="web_fetch",
+                description=(
+                    "打开一个具体的网页，把正文取回来。**先用 web_search 找到链接**，再用它细读"
+                    "那一页——搜索给的摘要常常不够，要照着做的步骤、要抄的代码都在正文里。"
+                    "一次一个链接。"
+                ),
+                fn=web_fetch,
+                params=WEB_FETCH_SCHEMA,
             ),
         ]
     )

@@ -197,6 +197,7 @@ class TestDefaultTools:
             "glob",
             "grep",
             "web_search",
+            "web_fetch",
         ]
 
     def test_echo_schema_requires_text(self):
