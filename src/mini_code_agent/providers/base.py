@@ -28,6 +28,14 @@ class ModelResponse:
     assistant_content: list[dict[str, Any]] | None = None
     stop_reason: str | None = None
 
+    # 这一发的用量。默认 0 是为了让假 provider（测试里那一堆）不用管它，真后端一定会填。
+    #
+    # 两个字段**不重叠**：input_tokens 是没走缓存的那部分，cache_read_input_tokens 是命中的
+    # 那部分，所以这次请求的总输入 = 两者相加。这是 Anthropic 的 usage 语义，而打的后端
+    # （DeepSeek）是自动前缀缓存——命中多少只看后一个数，请求里不用传任何东西。
+    input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
 
 class Provider(Protocol):
     """agent 需要的最小后端能力：发一次请求，拿回归一化后的响应。"""

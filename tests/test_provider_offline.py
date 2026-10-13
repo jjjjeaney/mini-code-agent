@@ -11,10 +11,21 @@ from types import SimpleNamespace
 from mini_code_agent.providers.anthropic import MAX_OUTPUT_TOKENS_CEILING, AnthropicProvider
 
 
-def a_response(stop_reason: str = "end_turn", text: str = "好") -> SimpleNamespace:
-    """一次响应，形状只保留 provider 会读的那几样。"""
+def a_response(
+    stop_reason: str = "end_turn",
+    text: str = "好",
+    *,
+    input_tokens: int | None = 0,
+    cached: int | None = 0,
+) -> SimpleNamespace:
+    """一次响应，形状只保留 provider 会读的那几样。
+
+    用量那两个字段默认给 None 也行——SDK 里的类型就是 `int | None`，provider 得把它兜成 0。
+    """
     return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)], stop_reason=stop_reason
+        content=[SimpleNamespace(type="text", text=text)],
+        stop_reason=stop_reason,
+        usage=SimpleNamespace(input_tokens=input_tokens, cache_read_input_tokens=cached),
     )
 
 
@@ -103,3 +114,24 @@ class TestOutputLimitEscalation:
             MAX_OUTPUT_TOKENS_CEILING,
             1024,  # 第二次又从配置的那个默认值起步
         ]
+
+
+class TestUsage:
+    """用量原样带出去——这一层不判断"省没省钱"，只把数交上去（主循环会打一行出来）。"""
+
+    def test_it_carries_the_token_counts_out(self):
+        provider = a_provider(a_response(input_tokens=120, cached=880))
+
+        result = provider.complete([{"role": "user", "content": "问"}])
+
+        assert result.input_tokens == 120
+        assert result.cache_read_input_tokens == 880
+
+    def test_a_null_count_becomes_zero(self):
+        """SDK 里这两个字段是 `int | None`，None 得落到 0——不然上层一相加就炸。"""
+        provider = a_provider(a_response(input_tokens=None, cached=None))
+
+        result = provider.complete([{"role": "user", "content": "问"}])
+
+        assert result.input_tokens == 0
+        assert result.cache_read_input_tokens == 0

@@ -671,3 +671,38 @@ def test_a_dangerous_command_is_refused_even_after_the_user_says_yes():
     assert [r.tool_name for r in prompter.tools] == ["bash"]  # 先问过用户
     assert result.trace[1].startswith("✗ bash: ")  # 但工具照样拒
     assert "黑名单" in result.trace[1]
+
+
+def test_the_usage_line_is_printed_for_every_request(capsys):
+    """打这一行是为了看缓存有没有省到钱：后端是自动前缀缓存，命中多少只看 cache_read。
+
+    一轮里**每一发**都打，因为要看的是它们之间的变化——正常情况下后一发比前一发的开头长，
+    命中该只增不减；中间要是被什么改动了开头（折叠旧工具结果改的正好是消息列表前排），命中
+    会从那个位置往后掉成 0。
+    """
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                text="好",
+                assistant_content=[{"type": "text", "text": "好"}],
+                stop_reason="end_turn",
+                input_tokens=100,
+                cache_read_input_tokens=900,
+            )
+        ]
+    )
+
+    runagent("问一句", provider, ToolRegistry([]))
+
+    out = capsys.readouterr().out
+    assert "缓存 900" in out
+    assert "原价 100" in out
+
+
+def test_no_usage_line_when_the_backend_reports_nothing(capsys):
+    """两个数都是 0 就不吭声——那是假 provider，不是"命中 0"，别拿噪音骗自己。"""
+    provider = ScriptedProvider([text_turn("好")])
+
+    runagent("问一句", provider, ToolRegistry([]))
+
+    assert "输入 token" not in capsys.readouterr().out

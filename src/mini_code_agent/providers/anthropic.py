@@ -111,9 +111,14 @@ class AnthropicProvider:
                         arguments=block.input
                     )
                 )
+        usage = response.usage
         return ModelResponse(
             text="\n".join(text_parts) or None,
             tool_calls=tool_calls or None,
             assistant_content=assistant_content,
             stop_reason=response.stop_reason or "end_turn",
+            # 用量原样带出去，别在这儿算、也别在这儿判断——这一层不认识"省钱"这件事。
+            # 谁想看谁看（主循环会打一行出来）。
+            input_tokens=usage.input_tokens or 0,
+            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
         )

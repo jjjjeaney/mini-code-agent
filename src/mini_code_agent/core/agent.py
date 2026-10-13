@@ -10,7 +10,7 @@ from typing import Any
 from mini_code_agent.console import console
 from mini_code_agent.permissions import EDIT_TOOLS, Grants, PermissionRequest, decide_permission
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
-from mini_code_agent.providers.base import Provider, ToolCall
+from mini_code_agent.providers.base import ModelResponse, Provider, ToolCall
 from mini_code_agent.tools import ToolContext, ToolRegistry, ToolResult, default_tools
 from mini_code_agent.trimming import fold_old_tool_results
 
@@ -154,8 +154,29 @@ def runagent(
             reported_folding = True
         return trimmed.messages
 
+    def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
+        """发一发，顺手把这一发的用量打出来。
+
+        为什么要看这个：打的后端是**自动**前缀缓存——请求的**开头**和上一次一样，那一部分就
+        按便宜价算，请求里不用传任何东西。所以这一行是"缓存到底省到钱没有"的唯一观测手段。
+
+        而且要看的是**同一轮里多次请求之间**的变化：正常情况下后一发比前一发的开头长，命中
+        应该只增不减；要是中间被什么东西改动了开头（比如折叠旧工具结果，它改的正好是消息列表
+        前排），命中就会从那个位置往后全部掉成 0。这一行就是为看这件事打的。
+        """
+        response = provider.complete(sent, **kwargs)
+        # 两个数都是 0 就不吭声——那是假 provider（测试里那些），不是"命中 0"。
+        if response.input_tokens or response.cache_read_input_tokens:
+            console.print(
+                f"（这一发输入 token：缓存 {response.cache_read_input_tokens:,}，"
+                f"原价 {response.input_tokens:,}）",
+                style="dim",
+                markup=False,
+            )
+        return response
+
     for _ in range(max_steps):
-        response = provider.complete(sending(), tools=tools, system=system)
+        response = ask(sending(), tools=tools, system=system)
 
         if not response.tool_calls:
             final = response.text
@@ -194,7 +215,7 @@ def runagent(
     if final is None:
         instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"
         messages.append({"role": "user", "content": instruction})
-        response = provider.complete(sending(), system=system)
+        response = ask(sending(), system=system)
         final = response.text
         if final is not None:
             trace.append(final)
