@@ -135,10 +135,13 @@ def make_status() -> Command:
         ctx.console.print(f"工作目录：{ctx.cwd}", markup=False)
         ctx.console.print(f"权限档位：{mode}（{GLOSS.get(mode, '')}）", markup=False)
         ctx.console.print(f"命令执行：{shell}", markup=False)
-        ctx.console.print(
-            f"会话文件：{_relative(session.path, ctx.cwd)}（落盘 {session.written} 条消息）",
-            markup=False,
-        )
+        if session.opened:
+            where = f"{_relative(session.path, ctx.cwd)}（落盘 {session.written} 条消息）"
+        else:
+            # 会话是懒建的：还没说过话，盘上就没有那个文件。这时印一个不存在的路径、配一句
+            # "落盘 0 条消息"，是拿一个看起来很确切的东西骗人。
+            where = "（还没落盘——说过话才建）"
+        ctx.console.print(f"会话文件：{where}", markup=False)
         ctx.console.print(
             f"历史大小：{len(ctx.state.messages)} 条 / {used:,} 字符"
             f"（到 {MAX_HISTORY_CHARS:,} 才压）{compacted}",

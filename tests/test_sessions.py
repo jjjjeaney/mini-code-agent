@@ -2,24 +2,43 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from mini_code_agent.sessions import latest, load, start
+from mini_code_agent.sessions import SESSIONS_DIR, Session, latest, load, start
 
 
 def a_session(tmp_path, **kwargs):
     return start(tmp_path, **{"permission_mode": "default", "allow_shell": False, **kwargs})
 
 
-def test_a_new_session_writes_its_meta(tmp_path):
+def test_starting_a_session_writes_nothing(tmp_path):
+    """"开工了"不算数——第一轮真攒下消息之前，盘上不该有任何东西。
+
+    以前是启动即建，于是"打开看一眼就退出"也留下一个空文件；攒多了之后 `--continue`
+    很容易接到空壳上（它取的是最新的那个名字）。
+    """
+    session = a_session(tmp_path)
+
+    assert not (tmp_path / SESSIONS_DIR).exists()
+    assert session.opened is False
+    assert latest(tmp_path) is None
+
+
+def test_the_file_appears_with_its_meta_when_the_first_messages_land(tmp_path):
     session = a_session(tmp_path, permission_mode="plan", allow_shell=True)
 
-    _, meta, messages = load(tmp_path, session.id)
+    session.append([{"role": "user", "content": "第一句"}])
 
+    assert session.opened is True
+    lines = session.path.read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[0])["type"] == "meta"  # meta 必须是第一行
+    _, meta, messages = load(tmp_path, session.id)
     assert meta["permission_mode"] == "plan"
     assert meta["allow_shell"] is True
     assert meta["cwd"] == str(tmp_path)
-    assert messages == []
+    assert messages == [{"role": "user", "content": "第一句"}]
     assert session.path.name == f"{session.id}.jsonl"
 
 
@@ -51,13 +70,63 @@ def test_two_sessions_in_the_same_second_do_not_collide(tmp_path):
     first = a_session(tmp_path)
     second = a_session(tmp_path)
 
+    first.append([{"role": "user", "content": "先来的"}])
+    second.append([{"role": "user", "content": "后来的"}])
+
     assert second.id != first.id
-    assert first.path.read_text(encoding="utf-8") != ""  # 先来那份没被盖掉
+    assert "先来的" in first.path.read_text(encoding="utf-8")  # 先来那份没被盖掉
+    assert "后来的" in second.path.read_text(encoding="utf-8")
     assert latest(tmp_path) == second.id
 
 
+def test_the_name_is_settled_at_the_first_write_not_at_start(tmp_path):
+    """两个同秒启动的会话，在启动那一刻都还看不见对方——名字得等真写的时候再定一次。
+
+    这里把两个 Session 都按同一个苗子 id 造出来，为的是不靠"两次 start() 落在同一秒"这种
+    时钟上的运气。
+    """
+    stamp = "20260101-000000"
+    meta = {"type": "meta", "cwd": str(tmp_path)}
+    first = Session(id=stamp, path=tmp_path / SESSIONS_DIR / f"{stamp}.jsonl", meta=meta)
+    second = Session(id=stamp, path=tmp_path / SESSIONS_DIR / f"{stamp}.jsonl", meta=meta)
+
+    first.append([{"role": "user", "content": "先来的"}])
+    second.append([{"role": "user", "content": "后来的"}])
+
+    assert second.id == f"{stamp}-1"
+    # 关键的一条：后来那个没有把内容追进先来那份文件里
+    assert "后来的" not in first.path.read_text(encoding="utf-8")
+    assert "后来的" in second.path.read_text(encoding="utf-8")
+
+
+def test_appending_after_a_load_does_not_clobber_the_file(tmp_path):
+    """`load()` 回来的会话盘上已经有一份了——惰性建文件那条路不能拿 "w" 把它重来一遍。"""
+    opened = a_session(tmp_path)
+    opened.append([{"role": "user", "content": "第一句"}])
+
+    session, _, _ = load(tmp_path, opened.id)
+    session.append([{"role": "user", "content": "第二句"}])
+
+    _, _, messages = load(tmp_path, session.id)
+
+    assert [message["content"] for message in messages] == ["第一句", "第二句"]
+
+
+def test_a_session_with_nothing_in_it_is_never_the_latest(tmp_path):
+    """空壳（只剩 meta 那行）不算数——接上也没有东西可接。新代码不再造它们，但旧的还在。"""
+    real = a_session(tmp_path)
+    real.append([{"role": "user", "content": "真聊过"}])
+    # 手造一个名字更晚、但没有任何对话的残骸
+    (tmp_path / SESSIONS_DIR / "29991231-235959.jsonl").write_text(
+        '{"type": "meta", "cwd": "."}', encoding="utf-8"
+    )
+
+    assert latest(tmp_path) == real.id
+
+
 def test_load_without_an_id_takes_the_latest(tmp_path):
-    a_session(tmp_path, permission_mode="plan")
+    first = a_session(tmp_path, permission_mode="plan")
+    first.append([{"role": "user", "content": "早的"}])
     second = a_session(tmp_path)
     second.append([{"role": "user", "content": "最近的"}])
 
@@ -77,7 +146,7 @@ def test_no_sessions_at_all(tmp_path):
 
 def test_an_unknown_id_says_so(tmp_path):
     """找不到就直接报错——静默开一个新的会让人以为接上了。"""
-    a_session(tmp_path)
+    a_session(tmp_path).append([{"role": "user", "content": "一"}])
 
     with pytest.raises(FileNotFoundError, match="没有 nope 这个会话"):
         load(tmp_path, "nope")

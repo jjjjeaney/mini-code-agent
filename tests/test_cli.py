@@ -9,7 +9,7 @@ from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompts import NullPrompter
 from mini_code_agent.providers.base import ModelResponse, ToolCall
-from mini_code_agent.sessions import Session, load, start
+from mini_code_agent.sessions import SESSIONS_DIR, Session, load, start
 from mini_code_agent.system_prompt import build_system_prompt
 from mini_code_agent.tools import Tool, ToolRegistry
 
@@ -156,14 +156,24 @@ def test_switching_the_mode_lands_on_the_next_turn(monkeypatch, tmp_path):
 
 def test_status_reports_the_live_loop(monkeypatch, tmp_path, capsys):
     """`/status` 拿到的是循环里那份会话和历史，不是一份副本。"""
-    provider = ScriptedProvider([])
+    provider = ScriptedProvider([text_turn("嗯")])
 
-    session = run_loop(monkeypatch, provider, ["/status", "/exit"], tmp_path)
+    session = run_loop(monkeypatch, provider, ["你好", "/status", "/exit"], tmp_path)
 
     out = capsys.readouterr().out
     assert f"工作目录：{tmp_path}" in out
     assert session.id in out  # 报告的正是这次落盘的那个会话文件
-    assert provider.calls == []  # 状态是程序答的，没往模型那儿跑一趟
+    assert "落盘 2 条消息" in out  # 上一轮那句问和那句答
+
+
+def test_a_session_that_never_says_anything_leaves_nothing_behind(monkeypatch, tmp_path):
+    """从头到尾只用命令、一句话没说——盘上不该留下会话文件（以前会留下一个空壳）。"""
+    provider = ScriptedProvider([])
+
+    run_loop(monkeypatch, provider, ["/status", "/help", "/exit"], tmp_path)
+
+    assert provider.calls == []  # 命令是程序答的，没往模型那儿跑一趟
+    assert list((tmp_path / SESSIONS_DIR).glob("*.jsonl")) == []
 
 
 def test_grants_reports_what_the_loop_has_approved(monkeypatch, tmp_path, capsys):

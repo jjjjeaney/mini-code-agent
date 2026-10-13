@@ -42,7 +42,10 @@ def make_ctx(
         state=ChatState(permission_mode=mode, messages=list(messages or [])),
         cwd=cwd or Path("proj"),
         allow_shell=allow_shell,
-        session=session or Session(id="s1", path=Path("proj/.agent/sessions/s1.jsonl")),
+        # opened=True：这就是"盘上已经有一次会话"的样子。没落盘的那种由 /status 那条单独的
+        # 用例去测（它说的是另一句话）。
+        session=session
+        or Session(id="s1", path=Path("proj/.agent/sessions/s1.jsonl"), opened=True),
         grants=grants if grants is not None else Grants(),
         compact=compact if compact is not None else (lambda: None),
     )
@@ -165,7 +168,9 @@ class TestStatus:
         assert f"命令执行：{expected}" in capsys.readouterr().out
 
     def test_it_reports_the_session_and_how_much_history_there_is(self, capsys):
-        session = Session(id="abcd", path=Path("proj/.agent/sessions/abcd.jsonl"), written=7)
+        session = Session(
+            id="abcd", path=Path("proj/.agent/sessions/abcd.jsonl"), opened=True, written=7
+        )
         ctx = make_ctx(session=session, messages=[{"role": "user", "content": "x" * 100}])
 
         default_commands().dispatch("/status", ctx)
@@ -176,6 +181,16 @@ class TestStatus:
         assert "落盘 7 条消息" in out
         assert "历史大小：1 条" in out
         assert f"{MAX_HISTORY_CHARS:,} 才压" in out
+
+    def test_it_says_the_session_has_not_landed_yet(self, capsys):
+        """会话是懒建的：还没说过话，盘上就没有那个文件——不该印一个不存在的路径配"落盘 0 条"。"""
+        not_yet = Session(id="s1", path=Path("proj/.agent/sessions/s1.jsonl"))
+
+        default_commands().dispatch("/status", make_ctx(session=not_yet))
+
+        out = capsys.readouterr().out
+        assert "还没落盘" in out
+        assert "s1.jsonl" not in out
 
     def test_it_says_when_the_history_has_been_compacted(self, capsys):
         """压过没有，光看对话是看不出来的——但它决定了开头那些事模型还记不记得住。"""

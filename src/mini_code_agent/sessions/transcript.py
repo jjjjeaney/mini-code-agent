@@ -4,6 +4,11 @@
 
 - **一行一条**：第一行是 meta（cwd / 档位 / allow_shell / 开始时间），之后每行是一条 message，
   原样存——就是发给 API 的那个结构，不做任何加工。
+- **没说过话就不建文件**：`start()` 只算不写，第一轮真落了消息才建（见 `Session._open`）。
+  以前是启动即建，于是"打开看了一眼就退出"也留下一个空文件——它们会攒起来，而 `--continue`
+  取的是最新的那个名字，很容易接到空壳上。**文件名在第一次写的时候才定下来**，不是启动那
+  一刻：推迟的只是"写"，"占名字"得等真写的时候做，不然两个同秒启动的会话会各自以为同一个
+  名字是自己的。
 - **追加写**，不是每轮整篇重写：会话越长重写越贵，而且重写到一半崩了就全丢；追加最多丢最后
   一行。所以读的时候要**跳过解析不了的行**——一行 JSON 要么完整要么残，残的那行只可能是写
   到一半断了。
@@ -20,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,10 +45,20 @@ def summary_message(text: str) -> dict[str, Any]:
 
 @dataclass
 class Session:
-    """一次会话的落盘。id 是时间戳，path 是它那个文件。"""
+    """一次会话的落盘。id 是时间戳，path 是它那个文件。
+
+    **文件是懒建的**：`start()` 不碰磁盘，第一轮真的攒下消息才写（见 `_open`）。所以"启动过
+    但一句话没说"不会在盘上留下任何东西。
+    """
 
     id: str
     path: Path
+
+    # 落盘时要写进第一行的那个 meta。`load()` 读回来的会话没有它——那份文件里早就写过了。
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    # 文件真在盘上吗。刚 `start()` 出来是 False；`load()` 回来的、以及写过一次之后的，是 True。
+    opened: bool = False
 
     # 文件里一共写了多少条消息（不含 meta 和 summary 那两行）。
     written: int = 0
@@ -53,10 +68,32 @@ class Session:
     covered_from: int = 0
     has_summary: bool = False
 
+    def _open(self) -> None:
+        """第一次真要写之前：建目录、定下文件名、把 meta 写成第一行。只跑一次。
+
+        **名字在这里才定下来**，不是 `start()` 那一刻。不是因为我们懒，是因为两个同秒启动的
+        会话在启动时都还看不见对方——各写各的就会撞进同一个文件。等到真写的时候再按目录现在
+        的样子定一次，先来的那份就占住名字了。
+
+        meta 必须是文件的第一行，所以"建文件"和"写 meta"是同一件事，分不开。
+        """
+        if self.opened:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = _free_path(self.path.parent, self.id)
+        self.id = self.path.stem
+        self.path.write_text(json.dumps(self.meta, ensure_ascii=False) + "\n", encoding="utf-8")
+        self.opened = True
+
     def append(self, messages: Sequence[dict[str, Any]]) -> None:
-        """把这一轮新增的消息追加上去。"""
+        """把这一轮新增的消息追加上去。第一次调用会把文件（连同 meta）建出来。
+
+        空的那次不算：`runagent` 前一步就炸了的话，一条消息都没有，这时**不该**留下一个空
+        会话——没有发生过的事情不值得记一笔。
+        """
         if not messages:
             return
+        self._open()
         with self.path.open("a", encoding="utf-8") as fh:
             for message in messages:
                 fh.write(json.dumps(message, ensure_ascii=False) + "\n")
@@ -70,6 +107,7 @@ class Session:
 
         文件里那些消息**一条都不删**：完整流水留着，剪枝是加载时的事。
         """
+        self._open()
         self.covered_from += covered - (1 if self.has_summary else 0)
         self.has_summary = True
         line = {"type": "summary", "up_to": self.covered_from, "text": text}
@@ -78,11 +116,12 @@ class Session:
 
 
 def start(cwd: Path, *, permission_mode: str, allow_shell: bool) -> Session:
-    """开一次新会话：建文件、写 meta 那一行。"""
-    directory = cwd / SESSIONS_DIR
-    directory.mkdir(parents=True, exist_ok=True)
+    """开一次新会话。**不碰磁盘**——第一轮真攒下消息才建文件（见 Session._open）。
+
+    id 和 path 先按时间戳做成一个"苗子"，真落盘那一刻才定下来。在那之前，盘上什么都没有。
+    """
     started = datetime.now()
-    path = _free_path(directory, started.strftime("%Y%m%d-%H%M%S"))
+    stamp = started.strftime("%Y%m%d-%H%M%S")
     meta = {
         "type": "meta",
         "cwd": str(cwd),
@@ -90,14 +129,35 @@ def start(cwd: Path, *, permission_mode: str, allow_shell: bool) -> Session:
         "allow_shell": allow_shell,
         "started": started.isoformat(timespec="seconds"),
     }
-    path.write_text(json.dumps(meta, ensure_ascii=False) + "\n", encoding="utf-8")
-    return Session(id=path.stem, path=path)
+    return Session(id=stamp, path=cwd / SESSIONS_DIR / f"{stamp}.jsonl", meta=meta)
 
 
 def latest(cwd: Path) -> str | None:
-    """最近一次的 id；一次都没有就是 None。id 是定宽时间戳，排序就是时间序。"""
-    names = sorted(path.stem for path in (cwd / SESSIONS_DIR).glob("*.jsonl"))
-    return names[-1] if names else None
+    """最近一次**有内容**的会话的 id；一次都没有就是 None。
+
+    空文件（只剩 meta 那行）不算：它们是"建了却从没说过话"的残骸，接上也没有东西可接。
+    新代码不会再造出这种文件，但盘上以前留下的还在。
+
+    比的是**id 字符串**、不是文件路径：同一个 id 撞了会加个 `-1` 后缀，而 `"…-1.jsonl"` 和
+    `"….jsonl"` 按路径比是在 `-` 和 `.` 上分的（`-` < `.`），那样排出来 `-1` 反而更早。
+    id 是定宽时间戳，按字符串排就是时间序，撞了的那份跟在它前面那次的后面。
+    """
+    directory = cwd / SESSIONS_DIR
+    for name in sorted((path.stem for path in directory.glob("*.jsonl")), reverse=True):
+        if _has_messages(directory / f"{name}.jsonl"):
+            return name
+    return None
+
+
+def _has_messages(path: Path) -> bool:
+    """这个会话文件里有没有真正的对话。
+
+    用生成器一读到就收，不把整个文件读完——每列一次目录，每个文件都要过这一道。
+    """
+    for item in _read_lines(path):
+        if item.get("type") not in ("meta", "summary"):
+            return True
+    return False
 
 
 def load(cwd: Path, session_id: str | None = None) -> tuple[Session, dict[str, Any], list[dict]]:
@@ -138,6 +198,9 @@ def load(cwd: Path, session_id: str | None = None) -> tuple[Session, dict[str, A
         Session(
             id=session_id,
             path=path,
+            # **必须是 True**：这份文件已经在盘上了。标成 False 的话，下一次 append 会走
+            # _open 那条路，而它是拿 "w" 建文件的——把读上来的整个会话当场截掉。
+            opened=True,
             written=len(messages),
             covered_from=summary_from,
             has_summary=bool(summary),
