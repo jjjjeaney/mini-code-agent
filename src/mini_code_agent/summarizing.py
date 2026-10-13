@@ -25,7 +25,7 @@ from mini_code_agent.providers.base import Provider
 
 # 历史的字符数超过这个就压。粗算：中文约 1 字符 1 token，英文代码约 4 字符 1 token，混着算
 # 大概 2~3 字符 1 token——12 万字符大约 4~5 万 token，离窗口还远，留出压缩那次请求的余量。
-MAX_HISTORY_CHARS = 120_000
+MAX_HISTORY_CHARS = 200_000
 
 # 最近这么多轮（真正的用户轮）原样留着，只压更早的。
 KEEP_RECENT_TURNS = 6

@@ -13,6 +13,7 @@ from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompts import NullPrompter
 from mini_code_agent.providers.base import ModelResponse, ToolCall
 from mini_code_agent.sessions import SESSIONS_DIR, Session, load, start
+from mini_code_agent.summarizing import MAX_HISTORY_CHARS
 from mini_code_agent.system_prompt import build_system_prompt
 from mini_code_agent.tools import Tool, ToolRegistry
 
@@ -246,11 +247,14 @@ def test_the_transcript_lands_on_disk(monkeypatch, tmp_path):
 
 def test_a_long_history_is_compacted_before_the_turn(monkeypatch, tmp_path):
     """历史太长就先压一次再发：压出来那段顶在最前面，而且留下的那些恢复时还在。"""
+    # 每条按阈值算，不写死数字：阈值从 12 万调到 20 万之后，原来写死的 15_000 就刚好不够了
+    # （10 × 15010 ≈ 151k < 200k），这条测试会静默地退化成"什么都没压"，而断言还是那几条。
+    filler = MAX_HISTORY_CHARS // 8
     long_history = [
         message
         for i in range(10)
         for message in (
-            {"role": "user", "content": f"第 {i} 句" + "x" * 15_000},
+            {"role": "user", "content": f"第 {i} 句" + "x" * filler},
             {"role": "assistant", "content": [{"type": "text", "text": "好"}]},
         )
     ]
