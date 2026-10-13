@@ -1,12 +1,75 @@
-"""system prompt 怎么拼：固定那段 + 档位那句 + AGENTS.md。全部本地执行。"""
+"""system prompt 怎么拼：静态那半 + 会话实情 + 档位 + AGENTS.md + 记忆。全部本地执行。"""
 
 from __future__ import annotations
+
+import platform
+from datetime import date
 
 import pytest
 
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import PERMISSION_MODES
 from mini_code_agent.system_prompt import build_system_prompt
+
+
+def session_line(text: str) -> str:
+    """把"这次运行：…"那一行挑出来。
+
+    断言别直接对着整份提示词写——静态那半里什么词都可能有（`--shell`、模型、日期……），
+    撞上了就成了假通过。
+    """
+    return next(line for line in text.splitlines() if line.startswith("这次运行："))
+
+
+def test_the_session_line_says_which_day_it_is(tmp_path):
+    assert f"今天 {date.today().isoformat()}" in session_line(
+        build_system_prompt(tmp_path, "default")
+    )
+
+
+def test_the_date_carries_no_time(tmp_path):
+    """日期取到**天**。取到秒的话，这段每轮重拼都会换一个前缀——缓存从这一行往后全废。
+
+    这条钉的就是那个格式："今天 2026-10-13" 后面不能再跟东西。
+    """
+    assert f"今天 {date.today().isoformat()}，" in session_line(
+        build_system_prompt(tmp_path, "default")
+    )
+
+
+def test_the_session_line_says_which_platform(tmp_path):
+    """`bash` 在 Linux 容器里、文件工具在宿主机上——不说平台，模型给的路径会按错的那边来。"""
+    assert platform.system() in session_line(build_system_prompt(tmp_path, "default"))
+
+
+def test_the_model_is_named_when_we_know_it(tmp_path):
+    line = session_line(build_system_prompt(tmp_path, "default", "some-model-1"))
+
+    assert "模型 some-model-1" in line
+
+
+def test_no_model_is_named_when_we_do_not_know_it(tmp_path):
+    """`Provider` 协议故意只声明了 complete，取不到就不写——不猜一个填上。"""
+    line = session_line(build_system_prompt(tmp_path, "default"))
+
+    assert "模型" not in line
+
+
+def test_the_shell_is_named_only_when_the_environment_says_so(tmp_path, monkeypatch):
+    """Windows 上常常没有 `SHELL`——那就不写。与其猜一个，不如不说。"""
+    monkeypatch.setenv("SHELL", "/usr/bin/bash")
+    assert "终端 shell bash" in session_line(build_system_prompt(tmp_path, "default"))
+
+    monkeypatch.delenv("SHELL", raising=False)
+    assert "终端 shell" not in session_line(build_system_prompt(tmp_path, "default"))
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="Windows 的 shell 才带 .exe")
+def test_a_windows_shell_loses_its_extension(tmp_path, monkeypatch):
+    """Windows 上那几个 shell 带 `.exe`。取 stem 之后两边都叫 `bash`——跨平台一个名字好认。"""
+    monkeypatch.setenv("SHELL", "C:\\Program Files\\Git\\bin\\bash.exe")
+
+    assert "终端 shell bash" in session_line(build_system_prompt(tmp_path, "default"))
 
 
 def test_every_mode_gets_its_own_line(tmp_path):

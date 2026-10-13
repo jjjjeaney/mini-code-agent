@@ -7,15 +7,19 @@
   便宜价算（实测：这个项目的提示词 + 工具 schema 那一大段里，2560 个 token 走缓存、只有 236
   按原价）。所以这半写得细一点是划算的，但它**每一发都要发**，不是草稿纸——加一条就问一次
   "模型照着这条会做错什么事，不加会做错什么事"。
-- **动态的**：当前档位、仓库里 `AGENTS.md` 的原文、长期记忆的清单。按"变得越勤越靠后"排，
-  这样改一处不会把它后面的缓存全冲掉。
+- **动态的**：这次运行的实情（日期/平台/模型）、当前档位、仓库里 `AGENTS.md` 的原文、长期
+  记忆的清单。按"变得越勤越靠后"排，这样改一处不会把它后面的缓存全冲掉。
 
 单独一个模块，是因为它要读盘、要认识档位，而 `core/agent.py` 只该拿到一个现成的字符串。
-它是个纯函数——给定 cwd 和档位就有确定的输出，测起来不用起 agent。
+它只读盘和读环境（今天几号、什么平台），不碰 provider、不碰会话状态——给定 cwd、档位、
+模型就有确定的输出（同一天之内），测起来不用起 agent。
 """
 
 from __future__ import annotations
 
+import os
+import platform
+from datetime import date
 from pathlib import Path
 
 from mini_code_agent.memory import index_text as memory_index
@@ -91,19 +95,52 @@ _MODE_HINTS = {
 }
 
 
-def build_system_prompt(cwd: Path, permission_mode: str) -> str:
-    """拼一份 system prompt：静态那半 + 当前档位 + AGENTS.md + 长期记忆。
+def _session_note(model: str | None) -> str:
+    """这次运行的实情：今天几号、什么平台、什么模型。
 
-    顺序是**按"变得多勤"排的**（勤的靠后）：静态那半永远不变；档位会在会话里换
-    （`/permission_mode`），但一次运行里通常不动；`AGENTS.md` 跟着仓库走；记忆清单最勤——
-    模型每 `remember` 一条它就长一截。这样任何一处变了，它**后面**的才掉缓存，前面的照旧命中。
+    **日期取到"天"、不取到秒。** 这段每轮重拼一次，取到秒就等于每轮换一个前缀——缓存从这一
+    行往后全废。取到天的话，一天之内它一个字都不变。
+
+    平台要说，因为这个项目两边不一样：`bash` 在 Linux 容器里跑，文件工具在宿主机上（这台是
+    Windows）。不说的话，模型给路径、给命令会按错的那边来。
+
+    **shell 只在环境告诉我们的时候才写**——Windows 上常常没有 `SHELL` 这个变量，那就不写：
+    与其猜一个，不如不说。写的是 `SHELL` 的值，也就是**启动这次运行的那个** shell（通常就是
+    用户的终端，但不是的话我们也不知道）。取 `stem` 是为了跨平台一致：Windows 上那几个带
+    `.exe`，Linux 上不带，统一成 `bash` 更好认。
+
+    结尾那句是**日期真正的用处**：模型不知道自己的训练数据截止到哪天，不提醒它就容易拿"记忆
+    里的最新版本"当"现在的最新版本"答。
+    """
+    bits = [f"今天 {date.today().isoformat()}", f"宿主机 {platform.system()}"]
+    shell = os.environ.get("SHELL")
+    if shell:
+        bits.append(f"终端 shell {Path(shell).stem}")
+    if model:
+        bits.append(f"模型 {model}")
+    return (
+        f"这次运行：{'，'.join(bits)}。\n"
+        "（你的训练数据早于今天——“最新版本”“最近有什么变化”这类问题得查证，别凭记忆答。）"
+    )
+
+
+def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = None) -> str:
+    """拼一份 system prompt：静态那半 + 这次运行的实情 + 档位 + AGENTS.md + 长期记忆。
+
+    顺序是**按"变得多勤"排的**（勤的靠后）：静态那半永远不变；这次运行的实情一天一变（平台、
+    模型一次运行里不动）；档位会在会话里换（`/permission_mode`），但一次运行里通常不动；
+    `AGENTS.md` 跟着仓库走；记忆清单最勤——模型每 `remember` 一条它就长一截。这样任何一处
+    变了，它**后面**的才掉缓存，前面的照旧命中。
+
+    `model` 不给就不写那半句——**不猜**。调用方手上有真 provider 就传 `provider.model`；
+    `Provider` 协议故意只声明了 complete（见 providers/base.py），所以这里也不假设它有。
 
     交互那条路**每轮重拼一次**：记忆和 `AGENTS.md` 都可能中途变（模型刚 `remember` 了一条），
     拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位同理——`/permission_mode` 能
     中途换，所以它也得每轮现读。
     """
     mode = parse_permission_mode(permission_mode)
-    parts = [_STATIC, _MODE_HINTS[mode]]
+    parts = [_STATIC, _session_note(model), _MODE_HINTS[mode]]
     rules = _read_rules(cwd)
     if rules:
         parts.append(f"项目自己的规矩（来自 {RULES_FILE}，要遵守）：\n\n{rules}")

@@ -73,6 +73,7 @@ def _chat(
     permission_mode: str,
     prompter: Prompter,
     grants: Grants,
+    model: str | None = None,
 ) -> None:
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
@@ -125,7 +126,7 @@ def _chat(
                 continue
             # 太长就压一次再发。放在轮与轮之间，不放进 runagent——理由见 _compact。
             state.messages = _compact(state.messages, provider, session)
-            system = build_system_prompt(cwd, state.permission_mode)
+            system = build_system_prompt(cwd, state.permission_mode, model)
             result = runagent(
                 line,
                 provider,
@@ -246,7 +247,7 @@ def main_command(
             prompt,
             provider,
             registry,
-            system=build_system_prompt(workdir, permission_mode),
+            system=build_system_prompt(workdir, permission_mode, provider.model),
             cwd=workdir,
             allow_shell=shell,
             permission_mode=permission_mode,
@@ -279,6 +280,9 @@ def main_command(
         permission_mode=permission_mode,
         prompter=prompter,
         grants=grants,
+        # 提示词里要写"你是哪个模型"。**从这儿传进去，不是去 provider 里取**——Provider 协议
+        # 只声明了 complete，认得它不等于认得 model；手上这份是真的 AnthropicProvider。
+        model=provider.model,
     )
     print("bye")
 
