@@ -176,6 +176,48 @@ def test_grants_reports_what_the_loop_has_approved(monkeypatch, tmp_path, capsys
     assert os.path.normpath("src/a.py") in capsys.readouterr().out
 
 
+def test_compact_squeezes_history_that_is_nowhere_near_the_limit(monkeypatch, tmp_path):
+    """手动那一条**不看阈值**：短得自动那条路永远碰不到的历史，照样压。"""
+    short_history = [
+        message
+        for i in range(8)
+        for message in (
+            {"role": "user", "content": f"第 {i} 句"},
+            {"role": "assistant", "content": [{"type": "text", "text": "好"}]},
+        )
+    ]
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append(short_history)
+    provider = ScriptedProvider([text_turn("前面聊过八件事"), text_turn("接着说")])
+
+    run_loop(
+        monkeypatch,
+        provider,
+        ["/compact", "再来一句", "/exit"],
+        tmp_path,
+        session=session,
+        messages=short_history,
+    )
+
+    # 第一次请求是摘要那次（历史后面跟着那条摘要指令），第二次才是真正这一轮
+    assert "摘要" in provider.calls[0][-1]["content"]
+    # 这一轮发出去的历史已经压过：第一条就是那段摘要
+    assert "前面聊过八件事" in provider.calls[1][0]["content"]
+    # 而且落了盘，不是只活在这一次进程里——接上会话还能看见
+    _, _, stored = load(tmp_path, session.id)
+    assert "前面聊过八件事" in str(stored[0].get("content"))
+
+
+def test_compact_says_so_when_there_is_no_safe_place_to_cut(monkeypatch, tmp_path, capsys):
+    """轮数不够就没有合法的切点——这时候不该白调一次模型。"""
+    provider = ScriptedProvider([])
+
+    run_loop(monkeypatch, provider, ["/compact", "/exit"], tmp_path)
+
+    assert provider.calls == []
+    assert "没什么可压的" in capsys.readouterr().out
+
+
 def test_the_transcript_lands_on_disk(monkeypatch, tmp_path):
     """循环跑完，这几轮说的话得能在盘上读回来。"""
     provider = ScriptedProvider([text_turn("嗯")])

@@ -6,6 +6,7 @@ from collections.abc import Iterable
 
 from mini_code_agent.commands.base import Command, CommandContext, Outcome, split_command
 from mini_code_agent.commands.builtin import (
+    make_compact,
     make_exit,
     make_grants,
     make_help,
@@ -83,6 +84,7 @@ def default_commands() -> Commands:
     commands.register(make_help(commands))
     commands.register(make_permission_mode())
     commands.register(make_status())
+    commands.register(make_compact())
     commands.register(make_grants())
     commands.register(make_exit())
     return commands

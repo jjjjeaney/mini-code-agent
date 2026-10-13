@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -30,8 +31,12 @@ def make_ctx(
     session: Session | None = None,
     grants: Grants | None = None,
     messages: list[dict] | None = None,
+    compact: Callable[[], str | None] | None = None,
 ) -> CommandContext:
-    """一份手边的东西。全给上默认值，测哪一块就只改哪一块。"""
+    """一份手边的东西。全给上默认值，测哪一块就只改哪一块。
+
+    `compact` 默认是个"什么都不做、什么都不说"的桩——真那个要连 provider，在 cli 里。
+    """
     return CommandContext(
         console=console,
         state=ChatState(permission_mode=mode, messages=list(messages or [])),
@@ -39,6 +44,7 @@ def make_ctx(
         allow_shell=allow_shell,
         session=session or Session(id="s1", path=Path("proj/.agent/sessions/s1.jsonl")),
         grants=grants if grants is not None else Grants(),
+        compact=compact if compact is not None else (lambda: None),
     )
 
 
@@ -83,7 +89,7 @@ class TestHelp:
         default_commands().dispatch("/help", make_ctx())
 
         out = capsys.readouterr().out
-        for name in ("/help", "/permission_mode", "/status", "/grants", "/exit"):
+        for name in ("/help", "/permission_mode", "/status", "/compact", "/grants", "/exit"):
             assert name in out
         assert "/quit" in out  # 别名也列出来，不然没人知道它存在
 
@@ -183,6 +189,36 @@ class TestStatus:
         default_commands().dispatch("/status", make_ctx())
 
         assert "摘要" not in capsys.readouterr().out
+
+
+class TestCompact:
+    def test_it_runs_the_compaction(self):
+        calls: list[bool] = []
+        ctx = make_ctx(compact=lambda: calls.append(True) or None)
+
+        default_commands().dispatch("/compact", ctx)
+
+        assert calls == [True]
+
+    def test_it_stays_quiet_when_the_compaction_has_nothing_to_add(self, capsys):
+        """压成功那几行由 _compact 自己打（它知道切在第几条），命令不重复说一遍。"""
+        default_commands().dispatch("/compact", make_ctx(compact=lambda: None))
+
+        assert capsys.readouterr().out == ""
+
+    def test_it_relays_what_the_compaction_had_to_say(self, capsys):
+        default_commands().dispatch("/compact", make_ctx(compact=lambda: "没什么可压的"))
+
+        assert "没什么可压的" in capsys.readouterr().out
+
+    def test_an_argument_is_refused(self, capsys):
+        calls: list[bool] = []
+        ctx = make_ctx(compact=lambda: calls.append(True) or None)
+
+        default_commands().dispatch("/compact 随便写点什么", ctx)
+
+        assert calls == []  # 参数不对就别压——压一次是一次要花钱的模型调用
+        assert "不接受参数" in capsys.readouterr().out
 
 
 class TestGrants:

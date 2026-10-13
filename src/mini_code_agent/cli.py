@@ -16,15 +16,20 @@ from mini_code_agent.prompts import Prompter
 from mini_code_agent.providers.anthropic import AnthropicProvider
 from mini_code_agent.providers.base import Provider
 from mini_code_agent.sessions import Session, load, start, summary_message
-from mini_code_agent.summarizing import cut_point, summarize
+from mini_code_agent.summarizing import KEEP_RECENT_TURNS, cut_point, summarize
 from mini_code_agent.system_prompt import build_system_prompt
 from mini_code_agent.tools import ToolRegistry, default_tools
 
 app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
 
 
-def _compact(messages: list[dict], provider: Provider, session: Session) -> list[dict]:
-    """历史太长就压一次：把旧的那段换成一段摘要，并记进会话。
+def _compact(
+    messages: list[dict], provider: Provider, session: Session, *, force: bool = False
+) -> list[dict]:
+    """压一次：把旧的那段换成一段摘要，并记进会话。
+
+    `force=False`（默认，"轮与轮之间"那条路）是**太长才压**；`force=True` 是 `/compact`
+    ——用户点名要压，就不看长度了。两条走同一个函数，免得落盘、记账那些事各自漂出去。
 
     放在**轮与轮之间**做，不放 runagent 里：那边有个前提——"返回的 messages = 传进去的 +
     追加的那几条"（下面就是靠 result.messages[len(messages):] 落盘的）。压缩会改掉前缀，
@@ -32,9 +37,12 @@ def _compact(messages: list[dict], provider: Provider, session: Session) -> list
 
     摘要调不动就当没压，照常跑这一轮——绝不能因为压缩把会话卡死。
     """
-    cut = cut_point(messages)
+    cut = cut_point(messages, force=force)
     if cut is None:
         return messages
+    # 这底下是一次网络往返，慢起来好几秒。自动那条路上它是背景行为，手动那条路上它是用户
+    # 刚敲下去的命令——两种都不该干等着一声不吭。
+    console.print("（正在把前面的对话压成摘要…）", style="dim", markup=False)
     try:
         summary = summarize(messages[:cut], provider)
     except Exception as exc:
@@ -75,6 +83,19 @@ def _chat(
     一个 provider 进来，测试就能拿剧本化的假 provider 跑两轮，看第二轮有没有带上第一轮。
     """
     state = ChatState(permission_mode=permission_mode, messages=messages)
+
+    def compact_now() -> str | None:
+        """就地压一次，不管现在多长（`/compact` 用）。返回该跟用户补的一句话。
+
+        判"有没有可压的"用的是同一个 cut_point，所以这儿的规矩和自动那条路一模一样：切点
+        必须落在真正的用户轮上，最近几轮一律留着——区别只在于不看长度。
+        """
+        if cut_point(state.messages, force=True) is None:
+            return f"没什么可压的——最近 {KEEP_RECENT_TURNS} 轮一律原样留着，要压得先多聊几轮。"
+        # 切在第几条、成没成，_compact 自己会说；只有它没说到的那些才由这里补。
+        state.messages = _compact(state.messages, provider, session, force=True)
+        return None
+
     ctx = CommandContext(
         console=console,
         state=state,
@@ -82,6 +103,7 @@ def _chat(
         allow_shell=allow_shell,
         session=session,
         grants=grants,
+        compact=compact_now,
     )
     # 建一次就够：命令表在循环里不变。它抓着的 ctx / state 都是上面那两个活着的对象——
     # 命令改档位、看历史、清批准，动到的都是循环这一轮真要用的那份。

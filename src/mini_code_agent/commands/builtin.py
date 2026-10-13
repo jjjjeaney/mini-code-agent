@@ -149,6 +149,34 @@ def make_status() -> Command:
     return Command(name="status", run=run, summary="看在哪儿跑、什么档位、历史多长")
 
 
+def make_compact() -> Command:
+    """现在就把前面的对话压成一段摘要，不管它多长。
+
+    自动那条路只看大小（`>12 万字符` 才动手，见 summarizing.py）。这一条是"我说了算"：接下来
+    要问一件跟前面全无关的事，先让模型把前面那段收成一段摘要，不必背着整段历史走。
+
+    压的是内存里那份历史，`record_summary` 会在同一步里往会话文件记一笔（`_compact` 内部
+    做的），所以 `--resume` 接上来照样认——不是只活在这一次进程里。
+
+    **一个代价**：要是原本就没几轮、总共几百字符，摘要回来可能比原文还长，这一下会让历史
+    变大。不拦：手动入口的意思就是"我说了算"，而且这种情况本来就少见；真要拦，就得给
+    "什么时候该压"再加一条地板，那等于把手动入口又变回自动判断。
+    """
+
+    def run(ctx: CommandContext, arg: str) -> CommandOutcome:
+        if arg:
+            # 参数不对就别去压：压一次是一次要花钱的模型调用。
+            ctx.console.print(f"不接受参数（收到 {arg!r}）", style="red", markup=False)
+            return "handled"
+        note = ctx.compact()
+        if note:
+            # 压成功那几行由 _compact 自己打（它知道切在第几条、成没成），这里只说它没说到的。
+            ctx.console.print(note, style="dim", markup=False)
+        return "handled"
+
+    return Command(name="compact", run=run, summary="现在就把前面的对话压成一段摘要")
+
+
 def make_grants() -> Command:
     """看这一会话批准过什么，或者全清掉。
 

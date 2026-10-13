@@ -60,6 +60,12 @@ class CommandContext:
     session: Session
     # 本会话批过什么。指的是 _chat 里那个 Grants、不是副本——/grants clear 清的是真的那个。
     grants: Grants
+    # 就地压一次历史（别管现在多长），返回该跟用户补的一句话；None = 没什么可说的。
+    #
+    # 是个**动作**、不是某个对象：闭包里已经抓好了 provider，命令层因此到现在都不认识后端。
+    # 这里不塞 provider 是有意的——Provider 协议（providers/base.py）只声明了 complete 一个
+    # 方法，为了 commands/ 方便就去扩它，等于让所有假 provider 跟着多背字段。
+    compact: Callable[[], str | None]
 
 
 @dataclass

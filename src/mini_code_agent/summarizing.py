@@ -55,12 +55,21 @@ def cut_point(
     *,
     limit: int = MAX_HISTORY_CHARS,
     keep_turns: int = KEEP_RECENT_TURNS,
+    force: bool = False,
 ) -> int | None:
     """该压就返回切点（`messages[:cut]` 压掉，`messages[cut:]` 留着），否则 None。
 
-    返回 None 有两种情况：还没大到该压，或者轮数不够、没有安全的切点。调用方不用区分。
+    `force=True` 跳过大小那一关，`/compact` 用它——手动那一下的意思就是"不管现在多长，压
+    一次"。**最近 keep_turns 轮仍然原样留着**：那条规矩跟大小无关，它管的是"切在哪儿才合法"
+    （只有真正的用户轮上才下得了刀，见 _safe_cut）。
+
+    不把"强制"写成 `limit=0` 是有意的：那是把阈值拧成一根魔杖，万一哪次手滑把 0 传进了
+    **自动**那条路，每一轮都会把历史压一遍、对话直接毁了。具名参数手滑不出来。
+
+    返回 None 有两种情况：还没大到该压（force 时不看这条），或者轮数不够、没有安全的切点。
+    调用方不用区分。
     """
-    if total_chars(messages) <= limit:
+    if not force and total_chars(messages) <= limit:
         return None
     return _safe_cut(messages, keep_turns)
 
