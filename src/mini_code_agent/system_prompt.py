@@ -7,9 +7,9 @@
   便宜价算（实测：这个项目的提示词 + 工具 schema 那一大段里，2560 个 token 走缓存、只有 236
   按原价）。所以这半写得细一点是划算的，但它**每一发都要发**，不是草稿纸——加一条就问一次
   "模型照着这条会做错什么事，不加会做错什么事"。
-- **动态的**：这次运行的实情（日期/平台/模型）、当前档位、仓库里 `AGENTS.md` 的原文、长期
-  记忆的清单、git 状态。按"变得越勤越靠后"排，这样改一处不会把它后面的缓存全冲掉（git 状态
-  最勤——模型每改一个文件它就变，所以垫底）。
+- **动态的**：这次运行的实情（日期/平台/模型）、当前档位、从 cwd 到仓库根那几份 `AGENTS.md`
+  的原文、长期记忆的清单、git 状态。按"变得越勤越靠后"排，这样改一处不会把它后面的缓存全
+  冲掉（git 状态最勤——模型每改一个文件它就变，所以垫底）。
 
 单独一个模块，是因为它要读盘、要认识档位，而 `core/agent.py` 只该拿到一个现成的字符串。
 它只读**环境**——读盘、读几个环境变量、跑几条只读的 git 命令——不碰 provider、不碰会话状态；
@@ -255,14 +255,64 @@ def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = Non
     return "\n\n".join(parts)
 
 
+def _rule_files(cwd: Path) -> list[Path]:
+    """从 cwd 往上收集 AGENTS.md，**到仓库根为止（含）**。仓库根在前、cwd 在后。
+
+    找不到 `.git`（不在仓库里）就只给 cwd 那一份——**不往上走**。这一条是刻意的：往上读就是
+    读 cwd 之外，而这个项目的围栏本来只有一句话，"只能碰 cwd 之内"。见下面 _read_rules。
+    """
+    chain = [cwd.resolve(), *cwd.resolve().parents]
+    stop = 1  # 不在仓库里：只读 cwd 那份（跟没这个功能时一样）
+    for index, directory in enumerate(chain):
+        # `.git` 可能是目录（普通仓库）也可能是文件（worktree / submodule），exists 两种都认。
+        if (directory / ".git").exists():
+            stop = index + 1  # 连仓库根那一层一起读
+            break
+    return [directory / RULES_FILE for directory in reversed(chain[:stop])]
+
+
 def _read_rules(cwd: Path) -> str:
-    """读规矩文件。没有它是常态，不该因此报错；读不出来要说一声，别让它悄悄失效。"""
+    """把从 cwd 到仓库根这一路上所有的 AGENTS.md 拼成一段。**越靠后的越贴近当前目录。**
+
+    为什么往上读：项目落在子目录里的时候（monorepo、或者就一层子目录），规矩写在仓库根上写
+    一次就够，不用每个子目录抄一份。
+
+    为什么**到仓库根就停**：往上读是读 cwd 之外，围栏那条线本来是"只能碰 cwd 之内"。而
+    AGENTS.md 特殊——它不是给模型"读"的，是**直接进 system prompt** 的，所以"谁能往上级目录
+    写一个 AGENTS.md，谁就能给这个 agent 下指令"。停在仓库根，这个面就收在这个仓库里（不到
+    文件系统根，`C:\\Users\\<你>\\AGENTS.md` 那种就不会被卷进来）。
+
+    找不到 `.git` 就只读 cwd 那一份，等于这条功能不存在。
+
+    读不出来要说一声，别让它悄悄失效——用户以为规矩生效了、其实没有，那是骗人。哪一份出问题
+    就把哪一份的路径报出来（多份的时候不说是哪一份，等于没说）。
+    """
+    found = []
+    for path in _rule_files(cwd):
+        label = os.path.relpath(path, cwd)
+        text = _read_one(path, label)
+        if text:
+            found.append((label, text))
+
+    if not found:
+        return ""
+    if len(found) == 1:
+        # 只有一份就不标路径——跟没这个功能时的输出一模一样，不白多两行。
+        return found[0][1]
+    # 多份时每一份都标清楚，并说明顺序：模型得知道哪条更贴近眼前这个目录。
+    # 末尾那个空行不能省——不然第一个 `###` 会跟引导句挤成一段（`head` 不参与下面那次 join）。
+    head = "从工作目录往上到仓库根，每一层的都在下面，**越靠后的越贴近当前目录**：\n\n"
+    return head + "\n\n".join(f"### {label}\n\n{text}" for label, text in found)
+
+
+def _read_one(path: Path, label: str) -> str:
+    """读一份规矩文件。没有它是常态，不该因此报错；读不出来要说一声，别让它悄悄失效。"""
     try:
-        text = (cwd / RULES_FILE).read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return ""
     except UnicodeDecodeError:
-        return f"（{RULES_FILE} 在，但不是 UTF-8，读不出来。）"
+        return f"（{label} 在，但不是 UTF-8，读不出来。）"
     except OSError as exc:
-        return f"（{RULES_FILE} 读不出来：{exc}）"
+        return f"（{label} 读不出来：{exc}）"
     return truncate_text(text.strip())

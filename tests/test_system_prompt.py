@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import subprocess
 from datetime import date
@@ -236,6 +237,95 @@ def test_an_empty_rules_file_is_skipped(tmp_path):
     (tmp_path / "AGENTS.md").write_text("   \n", encoding="utf-8")
 
     assert "AGENTS.md" not in build_system_prompt(tmp_path, "default")
+
+
+class TestRulesWalkUp:
+    """从 cwd 往上收集 AGENTS.md，到**仓库根**为止，多的拼起来。"""
+
+    def test_it_collects_every_level_from_the_root_down(self, repo):
+        """两份都拼上，而且**根上的在前**——越靠后越贴近当前目录。"""
+        (repo / "AGENTS.md").write_text("根上的规矩\n", encoding="utf-8")
+        sub = repo / "packages" / "api"
+        sub.mkdir(parents=True)
+        (sub / "AGENTS.md").write_text("子目录的规矩\n", encoding="utf-8")
+
+        text = build_system_prompt(sub, "default")
+
+        assert "根上的规矩" in text
+        assert "子目录的规矩" in text
+        assert text.index("根上的规矩") < text.index("子目录的规矩")
+        assert "越靠后的越贴近当前目录" in text  # 顺序得说明白，不然模型没法判
+        # 引导句和第一个标题之间要有空行——不然 markdown 会把标题吸进上一段
+        assert "：\n\n### " in text
+
+    def test_each_block_says_how_far_up_it_came_from(self, repo):
+        (repo / "AGENTS.md").write_text("根上的\n", encoding="utf-8")
+        sub = repo / "sub"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("这层的\n", encoding="utf-8")
+
+        text = build_system_prompt(sub, "default")
+
+        assert f"### {os.path.join('..', 'AGENTS.md')}" in text
+        assert "### AGENTS.md" in text
+
+    def test_a_single_file_is_not_labelled(self, repo):
+        """只有一份时输出跟没这个功能时一模一样——不白多两行。"""
+        (repo / "AGENTS.md").write_text("就这一份\n", encoding="utf-8")
+
+        text = build_system_prompt(repo, "default")
+
+        assert "就这一份" in text
+        assert "### " not in text
+        assert "越靠后" not in text
+
+    def test_no_repo_means_no_walking_up(self, tmp_path):
+        """**这条最要紧**：找不到 `.git` 就**不许往上走**。
+
+        不设这条的话，cwd 之外、跟这个项目无关的 AGENTS.md 也会被卷进提示词——而它进的是
+        system prompt，等于谁能往上级目录写文件，谁就能给这个 agent 下指令。
+        """
+        outer = tmp_path / "outer"
+        inner = outer / "inner"
+        inner.mkdir(parents=True)
+        (outer / "AGENTS.md").write_text("上面那一层的\n", encoding="utf-8")
+        (inner / "AGENTS.md").write_text("我这一层的\n", encoding="utf-8")
+
+        text = build_system_prompt(inner, "default")
+
+        assert "我这一层的" in text
+        assert "上面那一层的" not in text
+
+    def test_it_stops_at_the_repo_root(self, tmp_path):
+        """仓库根**再往上**就不是这个仓库了——那一层的 AGENTS.md 不该进来。
+
+        （`.git` 是目录还是文件都算，worktree / submodule 里它是文件。这里造个目录就够。）
+        """
+        (tmp_path / "AGENTS.md").write_text("仓库外面的\n", encoding="utf-8")
+        root = tmp_path / "repo"
+        sub = root / "sub"
+        sub.mkdir(parents=True)
+        (root / ".git").mkdir()
+        (root / "AGENTS.md").write_text("根上的\n", encoding="utf-8")
+        (sub / "AGENTS.md").write_text("这层的\n", encoding="utf-8")
+
+        text = build_system_prompt(sub, "default")
+
+        assert "根上的" in text
+        assert "这层的" in text
+        assert "仓库外面的" not in text
+
+    def test_an_unreadable_one_says_which_file_it_was(self, repo):
+        """多份的时候不说是哪一份，等于没说。"""
+        (repo / "AGENTS.md").write_bytes(b"\xff\xfe\x80\x81 not utf-8")
+        sub = repo / "sub"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("这层的\n", encoding="utf-8")
+
+        text = build_system_prompt(sub, "default")
+
+        assert "读不出来" in text
+        assert f"（{os.path.join('..', 'AGENTS.md')} 在" in text
 
 
 def test_the_memory_section_tells_it_to_look_before_working(tmp_path):
