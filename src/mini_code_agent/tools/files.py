@@ -310,19 +310,39 @@ def project_tree(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     return text
 
 
+def _number_lines(text: str, start: int) -> str:
+    """给每行标上它在**文件里**的真实行号。
+
+    是文件里的行号，不是 1..N——只读一段时这两个数不一样，而 `replace_lines` 要的是前者。
+    宽度按最后一行对齐，不然第 9 行和第 10 行的正文会差一格。
+
+    分隔符固定是 ` | `。这段输出回头会被模型拿去当 `edit_file` 的 old_string（见那里的描述），
+    那时得照着这个分隔符把前缀削掉——所以它不能变来变去。
+    """
+    lines = text.split("\n")
+    width = len(str(start + len(lines) - 1))
+    return "\n".join(
+        f"{number:>{width}} | {line}" for number, line in enumerate(lines, start)
+    )
+
+
 def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """读一个文本文件，可以只读其中一段。
 
     start_line / end_line 从 1 数起、两头都含，得是 ≥1 的整数。分段读长文件就靠它：
     先读一段，看末尾注明的"共 N 行"决定下一段从哪开始。
 
+    **每行前面带着它在文件里的行号**（`12 | 正文`）。这是为了 `replace_lines`——它按位置改，
+    而模型自己数行很容易错（每改一次，后面的行号全变）。行号不是文件内容的一部分，拿着这段
+    正文去改文件时要去掉。
+
     检查顺序是有讲究的：先判路径（围栏、符号链接、敏感文件），再判类型和大小（便宜，
     而且能挡住大文件），然后开文件嗅一下是不是文本，最后才解码。任何一步不通过，
     内容都不会被读进来。
     """
 
-    def slice_lines(text: str, start_line: Any, end_line: Any) -> str:
-        """按行号切一段。行号从 1 数起，两头都含。"""
+    def slice_lines(text: str, start_line: Any, end_line: Any) -> tuple[list[str], int, int]:
+        """按行号切一段。返回（选中那几行, 起始行号, 文件总行数）。行号从 1 数起、两头都含。"""
         lines = text.splitlines()
         total = len(lines)
 
@@ -336,15 +356,7 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
             raise ValueError(f"end_line({asked_end}) 比 start_line({start}) 还小，这个范围不成立。")
 
         end = total if asked_end is None else min(asked_end, total)
-        selected = lines[start - 1 : end]
-        if not selected:
-            return f"{raw!r} 只有 {total} 行，从第 {start} 行开始没有内容了。"
-
-        body = "\n".join(selected)
-        # 只读了一段才注明范围。整篇读下来时不用多说，免得平白多一行噪音。
-        if start > 1 or end < total:
-            body += f"\n\n[这是第 {start}-{end} 行，文件共 {total} 行]"
-        return body
+        return lines[start - 1 : end], start, total
 
     root = ctx.cwd.resolve()
     raw = kwargs["path"]
@@ -371,7 +383,22 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
 
     text, mtime_ns, size = _read_text(target, raw)
 
-    body = truncate_text(slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line")))
+    selected, start, total = slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line"))
+
+    if not selected:
+        # 空文件，或者要从末尾之后开始读。这**不算失败**——只是没有内容可给；下面"读过"
+        # 那笔照样要记，不记的话模型连一个空文件都改不了（改之前必须先读过）。
+        body = f"{raw!r} 只有 {total} 行，从第 {start} 行开始没有内容了。"
+    else:
+        # **先编号、再截断**，顺序不能反：编号之后行号就是正文的一部分了，得跟着一起受
+        # MAX_TEXT_CHARS 管着——这样总数仍然守在限额以内，代价只是同样长的文件现在少给几行。
+        # 反过来（先截再编号）会超出限额，而且超多少取决于文件有多少行，那就没边了。
+        body = truncate_text(_number_lines("\n".join(selected), start))
+        # "共几行"这句接在**截断之后**：它是元信息，不是文件里的一行（所以不带行号），也不该
+        # 被截断吃掉（以前它就拼在正文里，长文件一截就把它一起吞了）。
+        # 只读了一段才说——整篇读下来时，行号本身已经说清了范围，多这句是噪音。
+        if start > 1 or start + len(selected) - 1 < total:
+            body += f"\n\n[文件共 {total} 行]"
 
     # 读成功了才记：路径 -> (读之前的 mtime, 整篇的字节数)。
     # 长度记的是**整篇**，不是返回给模型的那一段——后面改文件的工具要拿它跟磁盘上的现状

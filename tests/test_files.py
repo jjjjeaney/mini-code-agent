@@ -221,42 +221,54 @@ class TestReadFile:
     def test_reads_a_small_file_whole(self, project, ctx):
         (project / "a.txt").write_text("第一行\n第二行\n", encoding="utf-8")
 
-        assert read_file({"path": "a.txt"}, ctx) == "第一行\n第二行"
+        assert read_file({"path": "a.txt"}, ctx) == "1 | 第一行\n2 | 第二行"
 
     def test_no_range_note_when_the_whole_file_was_read(self, project, ctx):
+        """整篇读下来时，行号本身已经说清了范围——多那句"共 N 行"是噪音。"""
         (project / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
 
-        assert "[这是第" not in read_file({"path": "a.txt"}, ctx)
+        assert "[文件共" not in read_file({"path": "a.txt"}, ctx)
 
-    def test_a_line_range_slices_and_says_which_part(self, project, ctx):
+    def test_a_line_range_numbers_lines_by_their_place_in_the_file(self, project, ctx):
+        """行号是**文件里的位置**，不是 1..N——只读一段时这两个数不一样，而 replace_lines
+        要的是前者。"""
         body = "\n".join(f"line{i}" for i in range(1, 11))
         (project / "a.txt").write_text(body, encoding="utf-8")
 
         out = read_file({"path": "a.txt", "start_line": 3, "end_line": 5}, ctx)
 
-        assert out.splitlines()[:3] == ["line3", "line4", "line5"]
-        assert "[这是第 3-5 行，文件共 10 行]" in out
+        assert out.splitlines()[:3] == ["3 | line3", "4 | line4", "5 | line5"]
+        assert "[文件共 10 行]" in out
 
     def test_start_line_alone_reads_to_the_end(self, project, ctx):
         (project / "a.txt").write_text("\n".join(f"line{i}" for i in range(1, 6)), encoding="utf-8")
 
         out = read_file({"path": "a.txt", "start_line": 4}, ctx)
 
-        assert out.splitlines()[:2] == ["line4", "line5"]
-        assert "[这是第 4-5 行，文件共 5 行]" in out
+        assert out.splitlines()[:2] == ["4 | line4", "5 | line5"]
+        assert "[文件共 5 行]" in out
+
+    def test_the_width_is_set_by_the_last_line_number(self, project, ctx):
+        """读第 9-11 行时，三行的号数都是两位——不按最后一行的宽度对齐的话正文会差一格。"""
+        body = "\n".join(f"line{i}" for i in range(1, 12))
+        (project / "a.txt").write_text(body, encoding="utf-8")
+
+        out = read_file({"path": "a.txt", "start_line": 9, "end_line": 11}, ctx)
+
+        assert out.splitlines()[:3] == [" 9 | line9", "10 | line10", "11 | line11"]
 
     def test_line_numbers_start_at_one(self, project, ctx):
         (project / "a.txt").write_text("first\nsecond\n", encoding="utf-8")
 
         out = read_file({"path": "a.txt", "start_line": 1, "end_line": 1}, ctx)
 
-        assert out.startswith("first")
+        assert out.startswith("1 | first")
         assert "second" not in out
 
     def test_end_line_beyond_the_file_is_clamped(self, project, ctx):
         (project / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
 
-        assert read_file({"path": "a.txt", "end_line": 999}, ctx) == "one\ntwo"
+        assert read_file({"path": "a.txt", "end_line": 999}, ctx) == "1 | one\n2 | two"
 
     def test_starting_past_the_end_says_how_long_the_file_is(self, project, ctx):
         (project / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
@@ -272,7 +284,7 @@ class TestReadFile:
     def test_crlf_files_come_back_with_plain_newlines(self, project, ctx):
         (project / "a.txt").write_bytes(b"one\r\ntwo\r\n")
 
-        assert read_file({"path": "a.txt"}, ctx) == "one\ntwo"
+        assert read_file({"path": "a.txt"}, ctx) == "1 | one\n2 | two"
 
     def test_a_directory_is_rejected(self, project, ctx):
         with pytest.raises(IsADirectoryError):
@@ -315,6 +327,37 @@ class TestReadFile:
 
         assert "已截断" in read_file({"path": "long.txt"}, ctx)
 
+    def test_numbering_eats_into_the_budget_not_the_other_way_round(self, project, ctx):
+        """行号是正文的一部分，跟着一起受 MAX_TEXT_CHARS 管着——所以超长文件是**少给几行**，
+        而不是"正文给满限额、行号另外加"那样溢出。
+
+        （行数不能太多：write_text 会撑成 CRLF，文件太大就先被"超过 MAX_READ_BYTES"挡掉了。）
+        """
+        (project / "long.txt").write_text("x\n" * 5000, encoding="utf-8")
+
+        out = read_file({"path": "long.txt"}, ctx)
+
+        body, _, note = out.partition("\n\n[已截断")
+        assert len(body) == MAX_TEXT_CHARS  # 切点正好落在限额上，切的是含行号的那份
+        assert note
+
+    def test_the_truncation_note_is_not_numbered(self, project, ctx):
+        """那句说明不是文件里的一行，编上号会让它看起来像第 N 行。"""
+        (project / "long.txt").write_text("x\n" * 5000, encoding="utf-8")
+
+        out = read_file({"path": "long.txt"}, ctx)
+
+        assert out.splitlines()[-1].startswith("[已截断")
+
+    def test_the_line_count_note_survives_truncation(self, project, ctx):
+        """"共 N 行"是元信息，接在截断之后——以前它拼在正文里，长文件一截就把它一起吞了。"""
+        (project / "long.txt").write_text("x\n" * 5000, encoding="utf-8")
+
+        out = read_file({"path": "long.txt", "start_line": 2}, ctx)
+
+        assert "已截断" in out
+        assert "[文件共 5000 行]" in out
+
     def test_env_is_refused(self, project, ctx):
         """fixture 里那个 .env 装着 KEY=1——读了就等于把它发出去。"""
         with pytest.raises(SensitiveFileError):
@@ -354,7 +397,7 @@ class TestReadFile:
     def test_a_normal_file_is_still_readable(self, project, ctx):
         (project / "app.py").write_text("print(1)", encoding="utf-8")
 
-        assert read_file({"path": "app.py"}, ctx) == "print(1)"
+        assert read_file({"path": "app.py"}, ctx) == "1 | print(1)"
 
     def test_a_successful_read_is_recorded(self, project, ctx):
         # 用 write_bytes 而不是 write_text：文本模式在 Windows 上会把 \n 翻成 \r\n，
@@ -452,7 +495,7 @@ class TestReadFile:
         """模型偶尔会把数字包成字符串，这个不用为难它。"""
         (project / "a.txt").write_bytes(b"one\ntwo\nthree\n")
 
-        assert read_file({"path": "a.txt", "start_line": "3"}, ctx).startswith("three")
+        assert read_file({"path": "a.txt", "start_line": "3"}, ctx).startswith("3 | three")
 
     def test_a_file_changed_while_reading_is_reported(self, project, ctx, monkeypatch):
         """读到一半文件被改了：手上这份可能是撕裂的，必须报错，也不能记下"读过"。"""

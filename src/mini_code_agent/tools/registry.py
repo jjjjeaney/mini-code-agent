@@ -110,8 +110,7 @@ def default_tools() -> ToolRegistry:
             Tool(
                 name="list_files",
                 description=(
-                    "列出某个目录下面一层的文件和子目录，不往下钻。"
-                    "想知道某个目录里有什么时用它。"
+                    "列出某个目录下面一层的文件和子目录，不往下钻。想知道某个目录里有什么时用它。"
                 ),
                 fn=list_files,
                 params=LIST_FILES_SCHEMA,
@@ -130,6 +129,8 @@ def default_tools() -> ToolRegistry:
                 description=(
                     "读一个文本文件的内容。文件很长时可以只读一段："
                     "start_line / end_line 指定行号范围，从 1 数起。"
+                    "返回的每行前面带着它在文件里的行号（形如 `12 | 正文`），"
+                    "那是给你按位置引用用的，**不是文件内容的一部分**。"
                 ),
                 fn=read_file,
                 params=READ_FILE_SCHEMA,
@@ -169,6 +170,8 @@ def default_tools() -> ToolRegistry:
                 description=(
                     "把文件里的一段文本换成另一段，局部改动用它。"
                     "old_string 必须和原文一模一样，所以改之前得先读过这个文件。"
+                    "从 read_file 的输出里抄的话，**先把每行前面那段 `行号 | ` 削掉**——"
+                    "它不是原文，带着它一定匹配不上。"
                     "整篇重写用 write_file。"
                 ),
                 fn=edit_file,
@@ -178,6 +181,7 @@ def default_tools() -> ToolRegistry:
                 name="replace_lines",
                 description=(
                     "按行号替换一段：把第 start_line 到 end_line 行换成 new_text。"
+                    "行号就用 read_file 输出里印的那些，不用自己数。"
                     "改的内容在文件里不唯一、或者要按位置增删几行时用它；"
                     "按内容找位置用 edit_file。"
                 ),
@@ -220,6 +224,8 @@ def default_tools() -> ToolRegistry:
                     "联网搜索。遇到你不确定、可能已过时、或需要查证的事实时用它，"
                     "比如近期新闻、最新版本号、人物近况。返回若干条结果的标题、链接和摘要；"
                     "要读其中某一条的正文，把它的链接交给 web_fetch。"
+                    "适用于查询最新信息、官方文档、"
+                    "第三方库用法和不确定的事实。"
                 ),
                 fn=web_search,
                 params=WEB_SEARCH_SCHEMA,
