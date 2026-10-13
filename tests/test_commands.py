@@ -14,12 +14,13 @@ from mini_code_agent.commands import (
     CommandContext,
     Commands,
     default_commands,
+    render_session_list,
 )
 from mini_code_agent.commands.base import split_command
 from mini_code_agent.commands.builtin import make_help
 from mini_code_agent.console import console
 from mini_code_agent.permissions import Grants, PermissionRequest
-from mini_code_agent.sessions import Session
+from mini_code_agent.sessions import SESSIONS_DIR, Session, start
 from mini_code_agent.summarizing import MAX_HISTORY_CHARS
 
 
@@ -320,3 +321,58 @@ class TestRegistration:
         for command in commands.list():
             for alias in command.aliases:
                 assert commands.by_name[alias] is command
+
+
+def a_spoken_session(tmp_path, said: str = "给我看看那个文件"):
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append([{"role": "user", "content": said}])
+    return session
+
+
+class TestSessionList:
+    """会话列表的渲染。启动参数 --list 和以后的 /sessions 共用这一份。"""
+
+    def test_it_lists_what_is_there(self, capsys, tmp_path):
+        session = a_spoken_session(tmp_path)
+
+        render_session_list(console, tmp_path)
+
+        out = capsys.readouterr().out
+        assert session.id in out
+        assert "1 条" in out
+        assert "给我看看那个文件" in out
+        assert "--resume" in out  # 列出来就是为了让你知道该接哪个
+
+    def test_it_says_so_when_there_has_never_been_one(self, capsys, tmp_path):
+        render_session_list(console, tmp_path)
+
+        assert "还没有过会话" in capsys.readouterr().out
+
+    def test_the_ones_that_never_said_anything_are_counted_not_listed(self, capsys, tmp_path):
+        """空壳是每次启动的副产品，逐行列出来会把列表淹掉——报个数就够了。"""
+        spoken = a_spoken_session(tmp_path)
+        (tmp_path / SESSIONS_DIR / "29991231-235959.jsonl").write_text(
+            '{"type": "meta", "cwd": "."}', encoding="utf-8"
+        )
+
+        render_session_list(console, tmp_path)
+
+        out = capsys.readouterr().out
+        assert spoken.id in out
+        assert "29991231-235959" not in out
+        assert "另有 1 次没说过话的" in out
+
+    def test_a_compacted_session_is_marked(self, capsys, tmp_path):
+        session = a_spoken_session(tmp_path)
+        session.record_summary(1, "压过了")
+
+        render_session_list(console, tmp_path)
+
+        assert "压过" in capsys.readouterr().out
+
+    def test_a_session_that_was_never_compacted_is_not_marked(self, capsys, tmp_path):
+        a_spoken_session(tmp_path)
+
+        render_session_list(console, tmp_path)
+
+        assert "压过" not in capsys.readouterr().out

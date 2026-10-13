@@ -8,8 +8,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.console import Console
+
 from mini_code_agent.commands.base import Command, CommandContext, CommandOutcome
 from mini_code_agent.permissions import PERMISSION_MODES, parse_permission_mode
+from mini_code_agent.sessions import SESSIONS_DIR, list_sessions
 from mini_code_agent.summarizing import MAX_HISTORY_CHARS, total_chars
 
 # 只在类型标注里用得上，而且那边（registry）反过来要 import 这儿——真去 import 就成环了。
@@ -41,6 +44,40 @@ def _relative(path: Path, cwd: Path) -> str:
     except ValueError:
         # 不在 cwd 底下（接的是别的目录的会话之类）——那就照实印，别硬凑一个相对路径。
         return str(path)
+
+
+def render_session_list(console: Console, cwd: Path) -> None:
+    """把这个目录下有过哪些会话摆出来。
+
+    落在命令层而不是 cli.py：这是 CLI 的表现层，而且**启动参数 `--list` 和 `/sessions`
+    要共用同一份**——同一件事印两遍，迟早有一边先长歪。cli 那边只负责把它挂到 flag 上。
+
+    没说过话的那些不逐行列出来，只在末尾报个数：它们是每次启动的副产品，占一半篇幅会让
+    列表没法看。列表里也**不放档位**——`bypass permissions` 一个词就把行宽撑爆了，而档位
+    本来就不跟着历史走（接上会话时那句"这次按 X 走"就是为这个），列它意义不大。
+    """
+    infos = list_sessions(cwd)
+    spoken = [info for info in infos if info.messages]
+    silent = len(infos) - len(spoken)
+
+    if not spoken:
+        console.print("这个目录下还没有过会话。（说过话才会留下会话文件）", markup=False)
+        return
+
+    console.print(f"这个目录下有过 {len(spoken)} 次会话（都在 {SESSIONS_DIR} 里）：", markup=False)
+    console.print()
+    for info in spoken:
+        # 条数右对齐、"压过"占两格：这样这几栏能对齐（中文宽度不一，预览那栏就没法较真了）。
+        mark = "压过" if info.has_summary else "    "
+        row = f"  {info.id}  {info.messages:>3} 条  {mark}  「{info.preview}」"
+        console.print(row, markup=False)
+    if silent:
+        console.print(f"\n（另有 {silent} 次没说过话的，略过）", style="dim", markup=False)
+    console.print(
+        "\n接上某一次：mca --resume <id>；mca --continue 接最近一次有内容的",
+        style="dim",
+        markup=False,
+    )
 
 
 def make_help(commands: Commands) -> Command:

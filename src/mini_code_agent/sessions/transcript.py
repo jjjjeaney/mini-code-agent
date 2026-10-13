@@ -34,6 +34,9 @@ from typing import Any
 # SENSITIVE_DIRS）。
 SESSIONS_DIR = Path(".agent") / "sessions"
 
+# 列表里那句预览截多长。够认出"这是哪次"就行——它只是给你挑的，不是用来读的。
+PREVIEW_CHARS = 40
+
 # 摘要那条合成消息长这样。加载和压缩两边都用这个函数造，免得形状走样。
 SUMMARY_PREFIX = "[前面这段对话已压缩成摘要]\n\n"
 
@@ -158,6 +161,76 @@ def _has_messages(path: Path) -> bool:
         if item.get("type") not in ("meta", "summary"):
             return True
     return False
+
+
+@dataclass
+class SessionInfo:
+    """列表里一行要用的那几样。
+
+    **不是**用来接着聊的那份——那是 `load()` 的活儿，它要的是完整的 messages。这里只要能
+    认出"这是哪一次、聊了多少、最后停在哪儿"。
+    """
+
+    id: str
+    messages: int
+    has_summary: bool
+
+    # **最后**一次人说的话，不是第一句。第一句常常认不出这是哪次——实测盘上连着三次会话的
+    # 第一句都是「读取main.py的文件内容」；而"我上次停在哪儿"正好是翻这个列表要回答的问题。
+    # 代价是收尾那句如果只是个「继续」，单看它确实没什么信息量——那也没办法，列表只能给你
+    # 一个认得出的钩子，认不出就靠 id 和条数。
+    preview: str
+
+
+def list_sessions(cwd: Path) -> list[SessionInfo]:
+    """这个目录下有过哪些会话，最新的在前。
+
+    每个文件完整读一遍——计数和预览都得知道里面有什么，没有更省的算法（好处是顺便把
+    `_read_lines` 那套"跳过读不出来的行"也用上了，手工编辑坏了的文件不至于炸掉整个列表）。
+
+    坏在**打不开**的文件直接跳过：列个表不该因为一个读不出来的文件整个报错。（`load()` 的
+    契约正相反，它是"读不回来就报错"——那个是要接着聊，静默给个空会话比报错糟得多。）
+    """
+    directory = cwd / SESSIONS_DIR
+    infos = []
+    # 按 id 字符串排，不是按文件路径——同秒撞名那份带 `-1` 后缀，按路径比会排到前头去。
+    for name in sorted((path.stem for path in directory.glob("*.jsonl")), reverse=True):
+        try:
+            infos.append(_describe(directory / f"{name}.jsonl"))
+        except OSError:
+            continue
+    return infos
+
+
+def _describe(path: Path) -> SessionInfo:
+    """一个会话文件撮成一行。"""
+    messages = 0
+    has_summary = False
+    preview = ""
+    for item in _read_lines(path):
+        kind = item.get("type")
+        if kind == "meta":
+            continue
+        if kind == "summary":
+            has_summary = True
+            continue
+        messages += 1
+        if item.get("role") == "user":
+            # 用户那句话存的是字符串；工具结果那一批虽然也是 user，但 content 是块列表，
+            # 不是人说的话，不能拿来当预览。
+            content = item.get("content")
+            if isinstance(content, str):
+                # 一路覆盖，不留第一句：最后留下的就是这个人**最后**说的一句话。
+                preview = _one_line(content)
+    return SessionInfo(
+        id=path.stem, messages=messages, has_summary=has_summary, preview=preview
+    )
+
+
+def _one_line(text: str) -> str:
+    """折成一行再截短。**折行是必须的**：一句粘贴进来的多行 prompt 会把整个列表撕开。"""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= PREVIEW_CHARS else flat[:PREVIEW_CHARS] + "…"
 
 
 def load(cwd: Path, session_id: str | None = None) -> tuple[Session, dict[str, Any], list[dict]]:

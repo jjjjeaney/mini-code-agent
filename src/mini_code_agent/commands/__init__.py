@@ -8,6 +8,7 @@ builtin.py 里写一条，再登记进 `default_commands()`。
 """
 
 from mini_code_agent.commands.base import ChatState, Command, CommandContext, Outcome
+from mini_code_agent.commands.builtin import render_session_list
 from mini_code_agent.commands.registry import Commands, default_commands
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "Commands",
     "Outcome",
     "default_commands",
+    "render_session_list",
 ]

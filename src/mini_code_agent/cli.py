@@ -6,7 +6,12 @@ from pathlib import Path
 
 import typer
 
-from mini_code_agent.commands import ChatState, CommandContext, default_commands
+from mini_code_agent.commands import (
+    ChatState,
+    CommandContext,
+    default_commands,
+    render_session_list,
+)
 from mini_code_agent.console import console
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.memory import sync_index
@@ -166,9 +171,17 @@ def main_command(
     resume: str = typer.Option(
         "", "--resume", help="接上指定 id 的会话（id 就是 .agent/sessions/ 里的文件名）"
     ),
+    list_: bool = typer.Option(
+        False, "--list", help="列出这个目录下有过哪些会话（连同各自的 id），然后退出"
+    ),
 ) -> None:
     """把指令交给 agent，把最终回复打印到标准输出。"""
     prompt = prompt.strip()
+    if list_:
+        # 只看不做的活儿，排在所有检查和构造之前：它连 provider 都不需要，所以没有 API key
+        # 也跑得起来，一个打错的档位也不该把一次列目录拦下。
+        render_session_list(console, cwd or Path.cwd())
+        raise typer.Exit()
     try:
         permission_mode = parse_permission_mode(permission_mode)
     except ValueError as exc:

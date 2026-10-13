@@ -6,7 +6,8 @@ import json
 
 import pytest
 
-from mini_code_agent.sessions import SESSIONS_DIR, Session, latest, load, start
+from mini_code_agent.sessions import SESSIONS_DIR, Session, latest, list_sessions, load, start
+from mini_code_agent.sessions.transcript import PREVIEW_CHARS
 
 
 def a_session(tmp_path, **kwargs):
@@ -174,6 +175,97 @@ def test_a_blank_line_is_skipped(tmp_path):
     _, _, messages = load(tmp_path, session.id)
 
     assert len(messages) == 1
+
+
+class TestListing:
+    """列表：最新的在前，带上聊了多少、压过没有、开头说的是什么。"""
+
+    def test_newest_comes_first(self, tmp_path):
+        older = a_session(tmp_path)
+        older.append([{"role": "user", "content": "早的"}])
+        newer = a_session(tmp_path)
+        newer.append([{"role": "user", "content": "新的"}])
+
+        assert [info.id for info in list_sessions(tmp_path)] == [newer.id, older.id]
+
+    def test_it_counts_messages_and_flags_the_summary(self, tmp_path):
+        session = a_session(tmp_path)
+        session.append(
+            [
+                {"role": "user", "content": "第一句"},
+                {"role": "assistant", "content": [{"type": "text", "text": "好"}]},
+            ]
+        )
+        session.record_summary(2, "压过了")
+
+        (info,) = list_sessions(tmp_path)
+
+        assert info.messages == 2
+        assert info.has_summary is True
+
+    def test_the_preview_is_the_last_thing_the_user_said(self, tmp_path):
+        """第一句常常认不出这是哪次——停在哪儿才认得出来。"""
+        session = a_session(tmp_path)
+        session.append(
+            [
+                {"role": "user", "content": "给我看看那个文件"},
+                {"role": "assistant", "content": [{"type": "text", "text": "好"}]},
+                {"role": "user", "content": "再看看另一个"},
+            ]
+        )
+
+        assert list_sessions(tmp_path)[0].preview == "再看看另一个"
+
+    def test_a_tool_result_is_not_mistaken_for_something_the_user_said(self, tmp_path):
+        """工具结果那一批的 role 也是 user，但 content 是块列表——那不是人说的话。
+
+        这条比取第一句的时候**更要紧**：会话多半以一串工具结果收尾，滤不掉的话预览就变成
+        一大坨输出。
+        """
+        session = a_session(tmp_path)
+        session.append(
+            [
+                {"role": "user", "content": "这才是我说的"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "一大坨输出"}
+                    ],
+                },
+            ]
+        )
+
+        assert list_sessions(tmp_path)[0].preview == "这才是我说的"
+
+    def test_a_long_preview_is_flattened_and_cut(self, tmp_path):
+        """粘贴进来的多行 prompt 会把整个列表撕开，所以先折成一行再截。"""
+        session = a_session(tmp_path)
+        session.append([{"role": "user", "content": "第一行\n第二行\n" + "x" * 200}])
+
+        preview = list_sessions(tmp_path)[0].preview
+
+        assert "\n" not in preview
+        assert preview.endswith("…")
+        assert len(preview) == PREVIEW_CHARS + 1
+
+    def test_the_ones_that_never_said_anything_are_listed_too(self, tmp_path):
+        """筛掉它们是**显示**那一层的事——列表本身要能报出"另有 N 次没说过话的"。"""
+        quiet = a_session(tmp_path)
+        quiet.append([{"role": "user", "content": "聊过"}])
+        # 名字更晚、但只有 meta 的残骸
+        (tmp_path / SESSIONS_DIR / "29991231-235959.jsonl").write_text(
+            '{"type": "meta", "cwd": "."}', encoding="utf-8"
+        )
+
+        assert [info.messages for info in list_sessions(tmp_path)] == [0, 1]
+
+    def test_a_file_that_cannot_be_read_is_skipped(self, tmp_path):
+        """列个表不该因为一个读不出来的文件整个报错。（建个目录冒充会话文件就行。）"""
+        good = a_session(tmp_path)
+        good.append([{"role": "user", "content": "好的那份"}])
+        (tmp_path / SESSIONS_DIR / "20200101-000000.jsonl").mkdir()
+
+        assert [info.id for info in list_sessions(tmp_path)] == [good.id]
 
 
 class TestSummaries:

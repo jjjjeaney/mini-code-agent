@@ -6,10 +6,21 @@
 from mini_code_agent.sessions.transcript import (
     SESSIONS_DIR,
     Session,
+    SessionInfo,
     latest,
+    list_sessions,
     load,
     start,
     summary_message,
 )
 
-__all__ = ["SESSIONS_DIR", "Session", "latest", "load", "start", "summary_message"]
+__all__ = [
+    "SESSIONS_DIR",
+    "Session",
+    "SessionInfo",
+    "latest",
+    "list_sessions",
+    "load",
+    "start",
+    "summary_message",
+]

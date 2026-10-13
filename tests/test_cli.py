@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 
+import pytest
+import typer
+
 from mini_code_agent import cli
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants, PermissionRequest
@@ -284,3 +287,26 @@ def test_a_short_history_is_not_compacted(monkeypatch, tmp_path):
 
     # 只有一次请求（就这一轮），没有摘要那次
     assert len(provider.calls) == 1
+
+
+def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
+    """`mca --list` 只看不做：它排在所有构造之前，所以连 provider 都不用建——没有 API key
+    也跑得起来，也不会因为列个目录就在盘上留下一个会话。"""
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append([{"role": "user", "content": "给我看看那个文件"}])
+
+    with pytest.raises(typer.Exit):
+        cli.main_command(
+            prompt="",
+            cwd=tmp_path,
+            shell=False,
+            permission_mode="default",
+            continue_=False,
+            resume="",
+            list_=True,
+        )
+
+    out = capsys.readouterr().out
+    assert session.id in out
+    assert "给我看看那个文件" in out
+    assert "--resume" in out
