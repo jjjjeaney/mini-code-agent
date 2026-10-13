@@ -25,8 +25,8 @@ from pathlib import Path
 MAX_READ_BYTES = 256 * 1024
 
 # 单次读进上下文的字符数上限。超了就截断，并在正文里说明被截了。
-# 注意是字符不是字节——8000 个中文字符在 UTF-8 下要占 24000 字节。
-MAX_TEXT_CHARS = 12000
+# 注意是字符不是字节——20000 个中文字符在 UTF-8 下要占 24000 字节。
+MAX_TEXT_CHARS = 20000
 
 EXCLUDED_DIRS = {
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
