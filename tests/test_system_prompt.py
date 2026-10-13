@@ -10,6 +10,7 @@ import pytest
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import PERMISSION_MODES
 from mini_code_agent.system_prompt import build_system_prompt
+from mini_code_agent.tools.safety import MAX_TEXT_CHARS
 
 
 def session_line(text: str) -> str:
@@ -118,13 +119,14 @@ def test_a_rules_file_that_is_not_utf8_says_so(tmp_path):
 
 
 def test_a_huge_rules_file_is_truncated(tmp_path):
-    (tmp_path / "AGENTS.md").write_text("x" * 20000, encoding="utf-8")
+    size = MAX_TEXT_CHARS + 500  # 跟常量走，别写死——限额改了这条也得跟着对
+    (tmp_path / "AGENTS.md").write_text("x" * size, encoding="utf-8")
 
     text = build_system_prompt(tmp_path, "default")
 
     # **别图省事断言"已截断"三个字**：静态提示词里本来就有一句「结果里写着"已截断"时…」，
     # 那样写会永远成立——这条用例就变成假通过的。要断言就断言截断说明里独有的那半句。
-    assert "全文共 20000 个字符" in text
+    assert f"全文共 {size} 个字符" in text
 
 
 def test_an_empty_rules_file_is_skipped(tmp_path):

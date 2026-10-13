@@ -126,9 +126,12 @@ class TestListFiles:
         assert "没有可列出的内容" in list_files({"path": "empty"}, ctx)
 
     def test_huge_output_is_truncated(self, project, ctx):
+        # 条数按限额推出来，**不写死**：每行大约 70 个字符（名字 + 前缀），乘 2 留足余量。
+        # 写死一个数的话，限额一涨这条就变成"其实没超"——红得莫名其妙，而且红的原因跟它要测
+        # 的东西（超了会不会截断）没有关系。
         (project / "many").mkdir()
-        for index in range(200):
-            name = f"{index:04d}" + "x" * 55
+        for index in range(MAX_TEXT_CHARS // 70 * 2):
+            name = f"{index:05d}" + "x" * 55
             (project / "many" / f"{name}.txt").write_text("x", encoding="utf-8")
 
         assert "已截断" in list_files({"path": "many"}, ctx)
