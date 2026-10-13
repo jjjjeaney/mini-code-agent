@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import platform
+import subprocess
 from datetime import date
 
 import pytest
 
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import PERMISSION_MODES
-from mini_code_agent.system_prompt import build_system_prompt
+from mini_code_agent.system_prompt import _branch_of, build_system_prompt
 from mini_code_agent.tools.safety import MAX_TEXT_CHARS
 
 
@@ -71,6 +72,108 @@ def test_a_windows_shell_loses_its_extension(tmp_path, monkeypatch):
     monkeypatch.setenv("SHELL", "C:\\Program Files\\Git\\bin\\bash.exe")
 
     assert "终端 shell bash" in session_line(build_system_prompt(tmp_path, "default"))
+
+
+def git_line(text: str) -> str:
+    """把"这个仓库现在…"那一行挑出来，理由同 session_line。"""
+    return next(line for line in text.splitlines() if line.startswith("这个仓库现在"))
+
+
+def run_git(cwd, *args, check=True):
+    # 提交要带身份，不然 git 会拒绝——临时仓库里没有全局配置。
+    # `encoding="utf-8"` 也不能省：不给的话 Python 按本地编码（这台机器是 GBK）去解，而 git
+    # 吐的是 UTF-8——中文提交信息会解炸（生产代码那边 _run_git 同样是写死 utf-8 的）。
+    return subprocess.run(
+        ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", *args],
+        cwd=cwd,
+        check=check,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+@pytest.fixture
+def repo(tmp_path):
+    """一个真有提交的仓库：init、提交一笔。"""
+    run_git(tmp_path, "init")
+    (tmp_path / "a.txt").write_text("原来的\n", encoding="utf-8")
+    run_git(tmp_path, "add", "a.txt")
+    run_git(tmp_path, "commit", "-m", "第一笔提交")
+    return tmp_path
+
+
+class TestGitSection:
+    def test_it_says_which_branch(self, repo):
+        branch = run_git(repo, "branch", "--show-current").stdout.strip()
+
+        assert f"分支 {branch}" in git_line(build_system_prompt(repo, "default"))
+
+    def test_a_clean_tree_says_clean(self, repo):
+        assert "工作区干净" in git_line(build_system_prompt(repo, "default"))
+
+    def test_it_counts_changes_and_untracked_separately(self, repo):
+        """改动和未跟踪分开数——"我改过的"和"新加的"是两回事。"""
+        (repo / "a.txt").write_text("改了\n", encoding="utf-8")
+        (repo / "新加的.txt").write_text("新\n", encoding="utf-8")
+
+        assert "1 个改动、1 个未跟踪" in git_line(build_system_prompt(repo, "default"))
+
+    def test_it_lists_the_recent_commits(self, repo):
+        text = build_system_prompt(repo, "default")
+
+        assert "最近几条提交" in text
+        assert "第一笔提交" in text
+
+    def test_a_chinese_file_name_is_not_escaped(self, repo):
+        """不加 `-c core.quotepath=false` 的话，git 会把中文名转义成 `\\344\\275\\240` 那种。
+
+        而且这个开关**得放在子命令前面**——放后面 git 直接报 unknown switch c。
+        """
+        (repo / "新加的.txt").write_text("新\n", encoding="utf-8")
+
+        assert "新加的.txt" in build_system_prompt(repo, "default")
+
+    def test_an_empty_repo_reports_the_branch_but_no_commits(self, tmp_path):
+        """`git init` 之后还没提交：分支报得出来，"最近提交"那半没有。"""
+        run_git(tmp_path, "init")
+
+        text = build_system_prompt(tmp_path, "default")
+
+        assert "分支 " in git_line(text)
+        assert "最近几条提交" not in text
+
+    def test_a_directory_that_is_not_a_repo_says_nothing(self, tmp_path):
+        """不是仓库就**整段不写**——别在提示词里留个空壳，也别每发都印一句"git 用不了"。"""
+        assert "这个仓库现在" not in build_system_prompt(tmp_path, "default")
+
+    def test_a_hostile_config_cannot_hide_the_untracked_files(self, repo):
+        """`status.showUntrackedFiles=no` 会把未跟踪的文件整个藏掉，而输出看着一切正常（实测）。
+
+        `--porcelain` 保证的是**格式**稳定，不保证这些开关还是默认值——所以得显式钉住。
+        """
+        run_git(repo, "config", "status.showUntrackedFiles", "no")
+        (repo / "新加的.txt").write_text("新\n", encoding="utf-8")
+
+        assert "1 个未跟踪" in git_line(build_system_prompt(repo, "default"))
+
+
+class TestBranchParsing:
+    """从 `git status --branch` 的第一行里取分支名。三种写法都得认，这层不用起进程。"""
+
+    @pytest.mark.parametrize(
+        ("header", "expected"),
+        [
+            ("## main", "main"),
+            ("## main...origin/main", "main"),
+            ("## main...origin/main [ahead 1]", "main"),
+            ("## No commits yet on main", "main"),
+            ("## HEAD (no branch)", ""),  # 分离头指针：没有分支可报
+        ],
+    )
+    def test_it_picks_the_branch_out(self, header, expected):
+        assert _branch_of(header) == expected
 
 
 def test_every_mode_gets_its_own_line(tmp_path):
