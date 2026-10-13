@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import pytest
 
-from mini_code_agent.core.agent import runagent
+from mini_code_agent.core.agent import RETRY_PAUSE_SECONDS, runagent
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompting import make_ask_user
 from mini_code_agent.prompts import Answer
-from mini_code_agent.providers.base import ModelResponse, ToolCall
+from mini_code_agent.providers.base import (
+    ModelResponse,
+    ProviderError,
+    ToolCall,
+    TransientProviderError,
+)
 from mini_code_agent.tools import Tool, ToolContext, ToolRegistry, default_tools
 from mini_code_agent.tools.shell import SHELL_SCHEMA, bash
 
@@ -706,3 +711,115 @@ def test_no_usage_line_when_the_backend_reports_nothing(capsys):
     runagent("问一句", provider, ToolRegistry([]))
 
     assert "输入 token" not in capsys.readouterr().out
+
+
+class ProviderThatFails:
+    """一律报错——模拟请求根本发不出去。"""
+
+    def __init__(self, message: str = "连不上模型服务。") -> None:
+        self.message = message
+        self.calls = 0
+
+    def complete(self, messages, tools=None, system=None) -> ModelResponse:
+        self.calls += 1
+        raise ProviderError(self.message)
+
+
+class FlakyThenFine:
+    """前 `failures` 次抛**瞬时**故障，之后正常——模拟"网络抖了一下又好了"。"""
+
+    def __init__(self, failures: int, responses: list[ModelResponse]) -> None:
+        self.failures = failures
+        self.responses = list(responses)
+        self.calls = 0
+
+    def complete(self, messages, tools=None, system=None) -> ModelResponse:
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise TransientProviderError("连不上模型服务（网络断了，或者服务本身不可达）")
+        return self.responses.pop(0)
+
+
+class ScriptedThenFails:
+    """前几发按剧本答，之后一律报错——模拟"工具跑完了，然后网断了"。"""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        self.responses = list(responses)
+
+    def complete(self, messages, tools=None, system=None) -> ModelResponse:
+        if self.responses:
+            return self.responses.pop(0)
+        raise ProviderError("工具跑完之后网断了。")
+
+
+def test_a_provider_failure_ends_the_turn_without_raising():
+    """请求发不出去只该收掉**这一轮**：把话说清楚带回去，别把异常甩给调用方（那会要了会话）。"""
+    result = runagent("问一句", ProviderThatFails(), ToolRegistry([]))
+
+    assert result.error == "连不上模型服务。"
+    assert result.final is None
+
+
+def test_what_already_happened_survives_a_provider_failure():
+    """工具可能已经把文件改过了——那些消息必须带回来。
+
+    丢了的话下一轮模型会以为没发生过，把副作用再做一遍。所以这里**接住异常再返回**，而不是
+    往上抛——异常路径拿不到 locals 里攒着的 messages。
+    """
+    registry = ToolRegistry([Tool(name="add", description="", fn=add, params=ADD_SCHEMA)])
+    provider = ScriptedThenFails([tool_turn("t1", "add", {"a": 1, "b": 2})])
+
+    result = runagent("给我加一下", provider, registry)
+
+    assert result.error
+    # 用户那句、模型要调工具那句、工具结果那句——一句都不能少
+    assert [m["role"] for m in result.messages] == ["user", "assistant", "user"]
+    assert result.messages[2]["content"][0]["type"] == "tool_result"
+
+
+def test_a_transient_failure_is_retried_once(monkeypatch, capsys):
+    """SDK 那 2 次救不回来的，我们再补一次——补之前要停一下，而且得说一声。"""
+    monkeypatch.setattr("mini_code_agent.core.agent.time.sleep", lambda seconds: None)
+    provider = FlakyThenFine(failures=1, responses=[text_turn("补上了")])
+
+    result = runagent("问一句", provider, ToolRegistry([]))
+
+    assert provider.calls == 2
+    assert result.final == "补上了"
+    assert result.error is None
+    assert "再试一次" in capsys.readouterr().out
+
+
+def test_it_waits_before_retrying(monkeypatch):
+    """必须**真的**停一下：SDK 那两次的退避是 0.5 + 1 秒，不停就等于白补一次。"""
+    slept: list[float] = []
+    monkeypatch.setattr("mini_code_agent.core.agent.time.sleep", slept.append)
+    provider = FlakyThenFine(failures=1, responses=[text_turn("补上了")])
+
+    runagent("问一句", provider, ToolRegistry([]))
+
+    assert slept == [RETRY_PAUSE_SECONDS]
+
+
+def test_it_gives_up_after_one_retry(monkeypatch):
+    """只补一次——补多了就是拿钱和时间去赌一个大概率还是不行的结果。"""
+    monkeypatch.setattr("mini_code_agent.core.agent.time.sleep", lambda seconds: None)
+    provider = FlakyThenFine(failures=99, responses=[])
+
+    result = runagent("问一句", provider, ToolRegistry([]))
+
+    assert provider.calls == 2  # 第一发 + 补的一发，就这些
+    assert result.error
+
+
+def test_an_error_that_will_never_work_is_not_retried(monkeypatch):
+    """401 再试一百次还是 401——一个字都不该多等，那只会把"去查 .env"推迟几秒。"""
+    slept: list[float] = []
+    monkeypatch.setattr("mini_code_agent.core.agent.time.sleep", slept.append)
+    provider = ProviderThatFails("API key 不对或已经过期（401）。")
+
+    result = runagent("问一句", provider, ToolRegistry([]))
+
+    assert provider.calls == 1
+    assert slept == []
+    assert result.error

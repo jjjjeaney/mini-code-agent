@@ -8,7 +8,32 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import httpx2
+import pytest
+from anthropic import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    ConflictError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+    UnprocessableEntityError,
+)
+
 from mini_code_agent.providers.anthropic import MAX_OUTPUT_TOKENS_CEILING, AnthropicProvider
+from mini_code_agent.providers.base import ProviderError, TransientProviderError
+
+
+def a_request() -> httpx2.Request:
+    return httpx2.Request("POST", "https://example.invalid/v1/messages")
+
+
+def an_error(cls, status: int, message: str = "服务端说不行"):
+    """造一个**真的** SDK 异常对象（不是打桩）——SDK 用的是 httpx2，不是更常见的那个 httpx。"""
+    return cls(message, response=httpx2.Response(status, request=a_request()), body=None)
 
 
 def a_response(
@@ -36,7 +61,10 @@ class FakeMessages:
 
     def create(self, **kwargs):
         self.calls.append(dict(kwargs))
-        return self.responses.pop(0)
+        item = self.responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item  # 剧本里排的是异常就抛出去
+        return item
 
 
 class FakeClient:
@@ -135,3 +163,98 @@ class TestUsage:
 
         assert result.input_tokens == 0
         assert result.cache_read_input_tokens == 0
+
+
+class TestErrors:
+    """SDK 的异常翻成**人话**，再以项目自己的 ProviderError 抛上去。
+
+    上游（agent、CLI）不认识 anthropic 的类名，换后端时也不该改——所以翻译只在这一层做。
+    """
+
+    def test_a_bad_key_says_which_variable_to_check(self):
+        provider = a_provider(an_error(AuthenticationError, 401))
+
+        with pytest.raises(ProviderError, match="DEEPSEEK_API_KEY"):
+            provider.complete([{"role": "user", "content": "问"}])
+
+    def test_a_rate_limit_says_to_wait(self):
+        provider = a_provider(an_error(RateLimitError, 429))
+
+        with pytest.raises(ProviderError, match="429"):
+            provider.complete([{"role": "user", "content": "问"}])
+
+    def test_a_server_error_names_the_status(self):
+        provider = a_provider(an_error(InternalServerError, 503))
+
+        with pytest.raises(ProviderError, match="503"):
+            provider.complete([{"role": "user", "content": "问"}])
+
+    def test_a_bad_request_repeats_what_the_server_said(self):
+        """400 里服务端那句话往往就是唯一有用的线索（到底哪儿不合法），得照抄给用户。"""
+        provider = a_provider(an_error(BadRequestError, 400, "max_tokens 超出上限"))
+
+        with pytest.raises(ProviderError, match="max_tokens 超出上限"):
+            provider.complete([{"role": "user", "content": "问"}])
+
+    def test_a_timeout_is_not_mixed_up_with_a_connection_problem(self):
+        """超时是连接错的**子类**——顺序搞反的话两者会合成同一句话，而"对面太慢"和"网络不通"
+        是两件事。"""
+        provider = a_provider(APITimeoutError(request=a_request()))
+
+        with pytest.raises(TransientProviderError, match="超时"):
+            provider.complete([{"role": "user", "content": "问"}])
+
+    def test_a_connection_problem_names_the_network(self):
+        provider = a_provider(APIConnectionError(request=a_request()))
+
+        with pytest.raises(TransientProviderError, match="连不上"):
+            provider.complete([{"role": "user", "content": "问"}])
+
+    def test_the_ones_worth_retrying_are_marked_transient(self):
+        """该不该重试是**类型**，不是消息文本——认字会漂，类型不会。
+
+        这份名单就是 SDK 的 `_should_retry`（408 / 409 / 429 / ≥500、加上连接类）。**409 和
+        503 特意放进来**：它们没有专门的类，只靠状态码认——少认一个的后果是"本来能救的没救"。
+        """
+        retryable = (
+            an_error(RateLimitError, 429),
+            an_error(InternalServerError, 503),
+            an_error(ConflictError, 409),
+            APITimeoutError(request=a_request()),
+            APIConnectionError(request=a_request()),
+        )
+        for exc in retryable:
+            provider = a_provider(exc)
+            with pytest.raises(TransientProviderError):
+                provider.complete([{"role": "user", "content": "问"}])
+
+    def test_the_ones_that_will_never_work_are_not_transient(self):
+        """401 再试一百次还是 401——只该尽快把话给用户，一个字都别多等。"""
+        hopeless = (
+            an_error(AuthenticationError, 401),
+            an_error(PermissionDeniedError, 403),
+            an_error(NotFoundError, 404),
+            an_error(BadRequestError, 400),
+            an_error(UnprocessableEntityError, 422),
+        )
+        for exc in hopeless:
+            provider = a_provider(exc)
+            with pytest.raises(ProviderError) as caught:
+                provider.complete([{"role": "user", "content": "问"}])
+            assert not isinstance(caught.value, TransientProviderError)
+
+    def test_it_keeps_the_original_error_attached(self):
+        """翻成人话不等于把现场丢了——`from exc` 让 traceback 还指着根因。"""
+        provider = a_provider(an_error(NotFoundError, 404))
+
+        with pytest.raises(ProviderError) as caught:
+            provider.complete([{"role": "user", "content": "问"}])
+
+        assert isinstance(caught.value.__cause__, NotFoundError)
+
+    def test_our_own_bugs_are_not_swallowed(self):
+        """只翻译 SDK 的异常。自己代码里的 bug 该带着 traceback 崩掉，不该被这段吞成人话。"""
+        provider = a_provider(RuntimeError("我自己写错了"))
+
+        with pytest.raises(RuntimeError, match="我自己写错了"):
+            provider.complete([{"role": "user", "content": "问"}])

@@ -8,10 +8,25 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from anthropic import Anthropic
+from anthropic import (
+    Anthropic,
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 from dotenv import load_dotenv
 
-from mini_code_agent.providers.base import ModelResponse, ToolCall
+from mini_code_agent.providers.base import (
+    ModelResponse,
+    ProviderError,
+    ToolCall,
+    TransientProviderError,
+)
 
 load_dotenv()
 
@@ -22,6 +37,11 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 # 自己就拒绝发非流式请求了（"Streaming is required for operations that may take longer
 # than 10 minutes"）。所以再往上就不是换个数字的事，得改成流式——那是另一摊。
 MAX_OUTPUT_TOKENS_CEILING = 16384
+
+# SDK 会重试的状态码——照抄 `_should_retry` 里那几条（还有 ≥500，见下）。列在这儿是为了让
+# "我们的判断"和"它的判断"对得上：它那 2 次重试失败之后才轮到我们决定要不要补一次，两边的
+# 标准得是同一套，不然会漏掉本来能救的。
+SDK_RETRY_STATUSES = (408, 409, 429)
 
 def _content_block_to_dict(block: Any) -> dict[str, Any]:
     # DeepSeek 的 Anthropic-compatible endpoint 可能返回 thinking block。
@@ -35,6 +55,50 @@ def _content_block_to_dict(block: Any) -> dict[str, Any]:
         if hasattr(block, name):
             data[name] = getattr(block, name)
     return data
+
+def _translate(exc: APIError) -> ProviderError:
+    """把 SDK 的异常翻成项目自己的异常：**类**表示该不该重试，**消息**是给用户看的那句话。
+
+    分档只按"用户下一步该做什么"分，不按异常类型本身。"该不该重试"照抄 SDK 的 `_should_retry`
+    （408 / 409 / 429 / ≥500，加上连接类），**不自立一套**——两套标准迟早对不上，而抄漏一个的
+    后果是"本来能救的没救"。
+
+    先认具体的类、再退回状态码：类名更准（超时是连接错的**子类**，只看父类会把两者混成一句）。
+
+    **瞬时那几条的消息不写"该怎么办"**——因为我们马上就要替用户重试，这时候写"再发一次"自相
+    矛盾；真到补的那一次也用不上、要告诉他了，那句描述本身也够明白（网络断了、对面 5xx）。
+    反过来，**不重试的那几条一定要写清怎么办**（去查哪个变量、哪个地址），因为那才是他唯一
+    能做的事。
+    """
+    status = getattr(exc, "status_code", None)
+
+    # 先挑出"重试也没用"的——这几条得带着能照着做的建议。
+    if isinstance(exc, AuthenticationError):
+        return ProviderError("API key 不对或已经过期（401）。检查 .env 里的 DEEPSEEK_API_KEY。")
+    if isinstance(exc, PermissionDeniedError):
+        return ProviderError("这个 key 没有访问权限（403）。")
+    if isinstance(exc, NotFoundError):
+        return ProviderError(
+            "模型名或端点不对（404）。检查 .env 里的模型名和 DEEPSEEK_ANTHROPIC_BASE_URL。"
+        )
+    if isinstance(exc, BadRequestError):
+        # 400 里服务端那句话往往就是唯一有用的线索（到底哪儿不合法），照抄给用户。
+        return ProviderError(
+            f"模型服务拒绝了这次请求（400）：{getattr(exc, 'message', '') or exc}"
+        )
+
+    # 剩下的是"可以再试一次"的。
+    if isinstance(exc, APITimeoutError):
+        return TransientProviderError("模型响应太慢，超时了")
+    if isinstance(exc, APIConnectionError):
+        return TransientProviderError("连不上模型服务（网络断了，或者服务本身不可达）")
+    if isinstance(exc, RateLimitError):
+        return TransientProviderError("被限流了（429）——SDK 已经退避重试过两轮还是不行")
+    if status in SDK_RETRY_STATUSES or (status is not None and status >= 500):
+        return TransientProviderError(f"模型服务端出错（{status}），这是对面的事")
+
+    return ProviderError(f"模型调用失败（{type(exc).__name__}）：{exc}")
+
 
 class AnthropicProvider:
     def __init__(
@@ -95,7 +159,14 @@ class AnthropicProvider:
             kwargs["tools"] = tools
         if system:
             kwargs["system"] = system
-        response = self.create(kwargs)
+        try:
+            response = self.create(kwargs)
+        except APIError as exc:
+            # 翻译成项目自己的异常再往上抛：上游不认识 anthropic 的类名，换后端时也不该改。
+            # （`APIError` 是 SDK 所有异常的共同父类，所以"没预料到的"也会被接住、翻成人话——
+            # 不会漏一个出去把会话崩掉。反过来，我们自己代码里的 bug 不是 `APIError`，
+            # 该带着 traceback 崩掉，不该被这段吞掉。）
+            raise _translate(exc) from exc
         text_parts=[]
         tool_calls=[]
         assistant_content=[]

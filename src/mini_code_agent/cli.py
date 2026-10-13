@@ -142,6 +142,11 @@ def _chat(
             # 长度得在 messages 被换掉**之前**取。
             session.append(result.messages[len(state.messages) :])
             state.messages = result.messages
+            if result.error:
+                # 这一轮没能把请求发出去（网络、限流、配置……）。**会话不结束**——用户再发一次
+                # 就行；上面那句已经把这一轮**已经发生过的**工具调用落盘了，不会白丢。
+                typer.echo(f"这一轮没跑成：{result.error}", err=True)
+                continue
             if result.final is None:
                 typer.echo(
                     f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
@@ -251,6 +256,10 @@ def main_command(
         )
         # 长度得在 history 被换掉之前取——和 _chat 里同一处道理。
         session.append(result.messages[len(history) :])
+        if result.error:
+            # 一次性模式没有"下一轮"，所以报错就退出——但退出码要是 1，别让脚本以为跑成了。
+            typer.echo(f"这一轮没跑成：{result.error}", err=True)
+            raise typer.Exit(code=1)
         if result.final is None:
             typer.echo(
                 f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",

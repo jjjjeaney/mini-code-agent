@@ -11,7 +11,7 @@ from mini_code_agent import cli
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompts import NullPrompter
-from mini_code_agent.providers.base import ModelResponse, ToolCall
+from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCall
 from mini_code_agent.sessions import SESSIONS_DIR, Session, load, start
 from mini_code_agent.summarizing import MAX_HISTORY_CHARS
 from mini_code_agent.system_prompt import build_system_prompt
@@ -178,6 +178,37 @@ def test_a_session_that_never_says_anything_leaves_nothing_behind(monkeypatch, t
 
     assert provider.calls == []  # 命令是程序答的，没往模型那儿跑一趟
     assert list((tmp_path / SESSIONS_DIR).glob("*.jsonl")) == []
+
+
+class FlakyProvider:
+    """第一次报错，之后正常——模拟网络抖了一下。"""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        self.responses = list(responses)
+        self.calls = 0
+
+    def complete(self, messages, tools=None, system=None) -> ModelResponse:
+        self.calls += 1
+        if self.calls == 1:
+            raise ProviderError("连不上模型服务。")
+        return self.responses.pop(0)
+
+
+def test_a_failed_turn_does_not_kill_the_session(monkeypatch, tmp_path, capsys):
+    """请求失败只该收掉**这一轮**：说一句，然后下一句照常发得出去。
+
+    以前这儿没有接住的地方——SDK 重试完还是失败的话，异常会一路冒到顶，**整个交互会话跟着
+    死掉**，用户看见的是 Python 的 traceback。
+    """
+    provider = FlakyProvider([text_turn("第二句答上了")])
+
+    run_loop(monkeypatch, provider, ["第一句", "第二句", "/exit"], tmp_path)
+
+    out = capsys.readouterr()
+    assert "这一轮没跑成" in out.err
+    assert "连不上模型服务" in out.err
+    assert provider.calls == 2  # 第二句照常发出去了
+    assert "第二句答上了" in out.out
 
 
 def test_grants_reports_what_the_loop_has_approved(monkeypatch, tmp_path, capsys):

@@ -14,6 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from mini_code_agent.providers.anthropic import AnthropicProvider
+from mini_code_agent.providers.base import ProviderError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -117,13 +118,18 @@ class AnthropicProviderTest(unittest.TestCase):
         self.assertIn("42", text)
 
     def test_invalid_credentials_raise(self):
-        """错误凭证应该抛出 anthropic 的异常，而不是静默返回空响应。"""
+        """错误凭证要抛**项目自己的**异常，带着一句能照着做的话。
+
+        不是静默返回空响应，也不是把 anthropic 的类名甩给上层——翻译就在 provider 这一层做，
+        所以上面（agent、CLI）永远不用认识后端的异常类名。
+        """
         import anthropic
 
         bad = AnthropicProvider(max_tokens=32)
         bad.client = anthropic.Anthropic(api_key="sk-invalid-key", base_url=bad.client.base_url)
-        with self.assertRaises(anthropic.AnthropicError):
+        with self.assertRaises(ProviderError) as caught:
             bad.complete(messages=[{"role": "user", "content": "hi"}])
+        self.assertIn("DEEPSEEK_API_KEY", str(caught.exception))
 
 
 if __name__ == "__main__":

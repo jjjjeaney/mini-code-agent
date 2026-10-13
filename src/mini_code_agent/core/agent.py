@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,9 +11,21 @@ from typing import Any
 from mini_code_agent.console import console
 from mini_code_agent.permissions import EDIT_TOOLS, Grants, PermissionRequest, decide_permission
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
-from mini_code_agent.providers.base import ModelResponse, Provider, ToolCall
+from mini_code_agent.providers.base import (
+    ModelResponse,
+    Provider,
+    ProviderError,
+    ToolCall,
+    TransientProviderError,
+)
 from mini_code_agent.tools import ToolContext, ToolRegistry, ToolResult, default_tools
 from mini_code_agent.trimming import fold_old_tool_results
+
+# 瞬时故障（连不上、超时、限流、对面 5xx）**补一次**之前等多久。
+#
+# SDK 自己那 2 次重试的退避大概是 0.5 + 1 秒，所以这个数要比它明显长，否则补的那次等于白补；
+# 但也不能长到用户以为卡死了。只补一次——补几次写死在 ask() 里，要改就在那儿加一层。
+RETRY_PAUSE_SECONDS = 3.0
 
 
 @dataclass
@@ -20,6 +33,12 @@ class AgentResult:
     final: str | None
     trace: list[str]
     messages: list[dict[str, Any]]
+
+    # 这一轮没跑成的原因（人话，来自 ProviderError）。非空时 final 一定是 None。
+    #
+    # **它和"用满步数"不一样**：那个是模型自己没在给定步数内收尾，这个是根本没能把请求发出去。
+    # 调用方要分开说——前者提一句就行，后者要告诉用户"再发一次"还是"去查配置"。
+    error: str | None = None
 
 
 def _as_text(value: Any) -> str:
@@ -154,7 +173,7 @@ def runagent(
             reported_folding = True
         return trimmed.messages
 
-    def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
+    def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
         """发一发，顺手把这一发的用量打出来。
 
         为什么要看这个：打的后端是**自动**前缀缓存——请求的**开头**和上一次一样，那一部分就
@@ -175,49 +194,85 @@ def runagent(
             )
         return response
 
-    for _ in range(max_steps):
-        response = ask(sending(), tools=tools, system=system)
+    def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
+        """发一发；**瞬时故障再补一次**，然后才认输。
 
-        if not response.tool_calls:
+        为什么要补：SDK 自己已经重试过 2 次了（退避大约 0.5 + 1 秒），它救不回来的说明麻烦比
+        那更久。所以这一层唯一的增量就是"等得更久"——3 秒比它那一串长，又短到人还愿意等。
+
+        几条定下来的：
+
+        - **补在发请求这一层，不是整轮重跑**：工具可能已经跑过了（文件改过了、命令跑过了），
+          整轮重来会把副作用再做一遍；"再问一句"是幂等的。
+        - **只补一次**：补多了就是拿钱和时间去赌一个大概率还是不行的结果。
+        - **必须说出来**：不然提示符看着像卡死了；而且那是又一次全量计费，用户得有机会按
+          Ctrl+C 打断。
+        - **不重试的那几类一个字都不多等**：401 再试一百次还是 401，只会把"去查 .env"这句话
+          推迟几秒。
+        """
+        try:
+            return send(sent, **kwargs)
+        except TransientProviderError as exc:
+            console.print(
+                f"（{exc}，等 {RETRY_PAUSE_SECONDS:g} 秒自动再试一次…）",
+                style="dim",
+                markup=False,
+            )
+            time.sleep(RETRY_PAUSE_SECONDS)
+            # 补的这次再失败就往外放：外层接住，把这一轮收掉（会话不倒）。
+            return send(sent, **kwargs)
+
+    try:
+        for _ in range(max_steps):
+            response = ask(sending(), tools=tools, system=system)
+
+            if not response.tool_calls:
+                final = response.text
+                if final is not None:
+                    trace.append(final)
+                    # 这一条也要进 messages：不然 result.messages 结尾是用户那侧，拿它接着聊就
+                    # 丢了模型最后说的话。
+                    messages.append({"role": "assistant", "content": response.assistant_content})
+                break
+
+            # assistant 这轮的内容要原样回填：tool_use 块藏在里面，模型靠它认领结果。
+            messages.append({"role": "assistant", "content": response.assistant_content})
+
+            results: list[ToolResult] = []
+            for call in response.tool_calls:
+                # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
+                trace.append(_render_call(call))
+                console.print(_render_call(call), style="cyan", markup=False)
+
+                # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
+                result = _gate(call, prompter, allow_shell, permission_mode, grants)
+                if result is None:
+                    result = registry.dispatch(ctx, call)
+
+                trace.append(_render_result(result))
+                console.print(
+                    _render_result(result),
+                    style="red" if result.is_error else "green",
+                    markup=False,
+                )
+                results.append(result)
+
+            # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
+            messages.append({"role": "user", "content": [r.to_anthropic_block() for r in results]})
+        if final is None:
+            instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"
+            messages.append({"role": "user", "content": instruction})
+            response = ask(sending(), system=system)
             final = response.text
             if final is not None:
                 trace.append(final)
-                # 这一条也要进 messages：不然 result.messages 结尾是用户那侧，拿它接着聊就
-                # 丢了模型最后说的话。
                 messages.append({"role": "assistant", "content": response.assistant_content})
-            break
-
-        # assistant 这轮的内容要原样回填：tool_use 块藏在里面，模型靠它认领结果。
-        messages.append({"role": "assistant", "content": response.assistant_content})
-
-        results: list[ToolResult] = []
-        for call in response.tool_calls:
-            # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
-            trace.append(_render_call(call))
-            console.print(_render_call(call), style="cyan", markup=False)
-
-            # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
-            result = _gate(call, prompter, allow_shell, permission_mode, grants)
-            if result is None:
-                result = registry.dispatch(ctx, call)
-
-            trace.append(_render_result(result))
-            console.print(
-                _render_result(result),
-                style="red" if result.is_error else "green",
-                markup=False,
-            )
-            results.append(result)
-        
-        
-        # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
-        messages.append({"role": "user", "content": [r.to_anthropic_block() for r in results]})
-    if final is None:
-        instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"
-        messages.append({"role": "user", "content": instruction})
-        response = ask(sending(), system=system)
-        final = response.text
-        if final is not None:
-            trace.append(final)
-            messages.append({"role": "assistant", "content": response.assistant_content})
+    except ProviderError as exc:
+        # 请求根本发不出去（或者发出去被拒了），这一轮到此为止。
+        #
+        # **但已经发生过的事要带回去**：工具可能已经跑过了——文件改过了、命令跑过了——那些
+        # 消息必须跟着返回、跟着落盘。丢了的话下一轮模型会以为没发生过，把副作用再做一遍。
+        #
+        # 在这儿接住而不是往上抛，就是为了这个：异常路径拿不到 locals 里的 messages。
+        return AgentResult(final=None, trace=trace, messages=messages, error=str(exc))
     return AgentResult(final=final, trace=trace, messages=messages)
