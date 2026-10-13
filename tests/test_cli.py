@@ -310,3 +310,13 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
     assert session.id in out
     assert "给我看看那个文件" in out
     assert "--resume" in out
+
+
+def test_sessions_marks_the_one_you_are_in(monkeypatch, tmp_path, capsys):
+    """`/sessions` 跟 `--list` 是同一份渲染，多的那个星号指着这次会话——所以它得认得
+    循环里那个活着的 session，而不是别处的一份。"""
+    provider = ScriptedProvider([text_turn("嗯")])
+
+    session = run_loop(monkeypatch, provider, ["你好", "/sessions", "/exit"], tmp_path)
+
+    assert f"* {session.id}" in capsys.readouterr().out

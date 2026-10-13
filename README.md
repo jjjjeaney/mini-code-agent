@@ -28,7 +28,7 @@ cp .env.example .env
 uv run mca "用一句话解释什么是闭包"
 ```
 
-不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/compact`、`/grants`、`/permission_mode`、`/exit`）。
+不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/compact`、`/grants`、`/permission_mode`、`/exit`）。
 
 ```bash
 uv run mca

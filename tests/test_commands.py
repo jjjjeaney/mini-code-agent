@@ -93,7 +93,16 @@ class TestHelp:
         default_commands().dispatch("/help", make_ctx())
 
         out = capsys.readouterr().out
-        for name in ("/help", "/permission_mode", "/status", "/compact", "/grants", "/exit"):
+        wanted = (
+            "/help",
+            "/permission_mode",
+            "/status",
+            "/sessions",
+            "/compact",
+            "/grants",
+            "/exit",
+        )
+        for name in wanted:
             assert name in out
         assert "/quit" in out  # 别名也列出来，不然没人知道它存在
 
@@ -376,3 +385,30 @@ class TestSessionList:
         render_session_list(console, tmp_path)
 
         assert "压过" not in capsys.readouterr().out
+
+
+class TestSessionsCommand:
+    """/sessions：跟启动参数的 --list 是同一份渲染，多一个"我在这儿"的星号。"""
+
+    def test_it_marks_the_session_you_are_in(self, capsys, tmp_path):
+        mine = a_spoken_session(tmp_path, "我这次说的")
+        theirs = a_spoken_session(tmp_path, "另一次的")
+
+        default_commands().dispatch("/sessions", make_ctx(cwd=tmp_path, session=mine))
+
+        out = capsys.readouterr().out
+        assert f"* {mine.id}" in out
+        assert f"* {theirs.id}" not in out  # 星号只打在这一次上
+
+    def test_it_says_so_when_this_session_has_not_landed(self, capsys, tmp_path):
+        """还没说过话的这次盘上没有、列不出来——那就说明一句，别让人在单子上找自己。"""
+        not_yet = Session(id="s1", path=tmp_path / "s1.jsonl")  # opened 默认 False
+
+        default_commands().dispatch("/sessions", make_ctx(cwd=tmp_path, session=not_yet))
+
+        assert "还没落盘" in capsys.readouterr().out
+
+    def test_an_argument_is_refused(self, capsys, tmp_path):
+        default_commands().dispatch("/sessions 随便写点什么", make_ctx(cwd=tmp_path))
+
+        assert "不接受参数" in capsys.readouterr().out

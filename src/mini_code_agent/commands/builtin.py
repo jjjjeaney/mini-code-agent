@@ -46,11 +46,14 @@ def _relative(path: Path, cwd: Path) -> str:
         return str(path)
 
 
-def render_session_list(console: Console, cwd: Path) -> None:
+def render_session_list(console: Console, cwd: Path, *, current: str | None = None) -> None:
     """把这个目录下有过哪些会话摆出来。
 
     落在命令层而不是 cli.py：这是 CLI 的表现层，而且**启动参数 `--list` 和 `/sessions`
-    要共用同一份**——同一件事印两遍，迟早有一边先长歪。cli 那边只负责把它挂到 flag 上。
+    共用同一份**——同一件事印两遍，迟早有一边先长歪。
+
+    `current` 是"我现在这一次"的 id，会话里跑的时候（`/sessions`）才有——启动参数那次根本
+    还没有会话。给了就在对应的那一行前面打个 `*`。
 
     没说过话的那些不逐行列出来，只在末尾报个数：它们是每次启动的副产品，占一半篇幅会让
     列表没法看。列表里也**不放档位**——`bypass permissions` 一个词就把行宽撑爆了，而档位
@@ -64,12 +67,14 @@ def render_session_list(console: Console, cwd: Path) -> None:
         console.print("这个目录下还没有过会话。（说过话才会留下会话文件）", markup=False)
         return
 
-    console.print(f"这个目录下有过 {len(spoken)} 次会话（都在 {SESSIONS_DIR} 里）：", markup=False)
+    where = f"{SESSIONS_DIR} 里，* 是这次" if current else f"都在 {SESSIONS_DIR} 里"
+    console.print(f"这个目录下有过 {len(spoken)} 次会话（{where}）：", markup=False)
     console.print()
     for info in spoken:
         # 条数右对齐、"压过"占两格：这样这几栏能对齐（中文宽度不一，预览那栏就没法较真了）。
-        mark = "压过" if info.has_summary else "    "
-        row = f"  {info.id}  {info.messages:>3} 条  {mark}  「{info.preview}」"
+        star = "*" if info.id == current else " "
+        packed = "压过" if info.has_summary else "    "
+        row = f"{star} {info.id}  {info.messages:>3} 条  {packed}  「{info.preview}」"
         console.print(row, markup=False)
     if silent:
         console.print(f"\n（另有 {silent} 次没说过话的，略过）", style="dim", markup=False)
@@ -187,6 +192,31 @@ def make_status() -> Command:
         return "handled"
 
     return Command(name="status", run=run, summary="看在哪儿跑、什么档位、历史多长")
+
+
+def make_sessions() -> Command:
+    """列出这个目录下有过哪些会话，当前这次打个 `*`。
+
+    渲染和启动参数的 `--list` 是同一份（见 render_session_list）：同一件事印两遍，迟早有一边
+    先长歪。区别只在于会话里跑的时候**知道"我是哪一次"**，所以能标出来。
+
+    （列出来是为了让你知道该 `--resume` 哪个——会话里不能直接切过去，那是另一摊事。）
+    """
+
+    def run(ctx: CommandContext, arg: str) -> CommandOutcome:
+        if arg:
+            ctx.console.print(f"不接受参数（收到 {arg!r}）", style="red", markup=False)
+            return "handled"
+        # 还没落盘的会话盘上没有，列不出来、也就标不出来——那就说明一句，别让人在单子上找自己。
+        current = ctx.session.id if ctx.session.opened else None
+        render_session_list(ctx.console, ctx.cwd, current=current)
+        if current is None:
+            ctx.console.print(
+                "（这次会话还没落盘——说过话才建，所以上面没有它）", style="dim", markup=False
+            )
+        return "handled"
+
+    return Command(name="sessions", run=run, summary="列出这个目录下有过哪些会话")
 
 
 def make_compact() -> Command:
