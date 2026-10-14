@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import uuid
+from datetime import datetime
 
 import pytest
 
@@ -15,12 +17,25 @@ from mini_code_agent.sessions import (
     list_sessions,
     load,
     start,
+    transcript,
 )
 from mini_code_agent.sessions.transcript import PREVIEW_CHARS
 
 
 def a_session(tmp_path, **kwargs):
     return start(tmp_path, **{"permission_mode": "default", "allow_shell": False, **kwargs})
+
+
+class FrozenClock(datetime):
+    """把 `datetime.now()` 钉在一秒里——两个会话真的落在同一秒，才谈得上"同秒"。"""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 1, 1, 0, 0, 0)
+
+
+def freeze_the_clock(monkeypatch) -> None:
+    monkeypatch.setattr(transcript, "datetime", FrozenClock)
 
 
 def test_starting_a_session_writes_nothing(tmp_path):
@@ -77,6 +92,7 @@ def test_non_ascii_survives(tmp_path):
 
 
 def test_two_sessions_in_the_same_second_do_not_collide(tmp_path):
+    """同秒开两个：各有各的文件，谁也没盖掉谁，而且 `latest()` 认得后开的那个。"""
     first = a_session(tmp_path)
     second = a_session(tmp_path)
 
@@ -89,11 +105,58 @@ def test_two_sessions_in_the_same_second_do_not_collide(tmp_path):
     assert latest(tmp_path) == second.id
 
 
-def test_the_name_is_settled_at_the_first_write_not_at_start(tmp_path):
-    """两个同秒启动的会话，在启动那一刻都还看不见对方——名字得等真写的时候再定一次。
+def test_the_id_is_final_from_start(tmp_path, monkeypatch):
+    """id 在 `start()` 那一刻就定死，**不用等落盘**。
 
-    这里把两个 Session 都按同一个苗子 id 造出来，为的是不靠"两次 start() 落在同一秒"这种
-    时钟上的运气。
+    以前是等第一次写盘的时候才定（`_free_path` 往后排），那意味着第一轮跑到一半时 id 还
+    可能变。现在要它定死，是因为落了盘的工具结果要按它分目录——跑到一半改名会把一次会话
+    劈成两处。
+    """
+    freeze_the_clock(monkeypatch)
+
+    first = a_session(tmp_path)
+    second = a_session(tmp_path)
+
+    assert first.id != second.id
+    assert first.path != second.path
+    assert not (tmp_path / SESSIONS_DIR).exists()  # 名字定了，盘上还是什么都没建
+
+
+def test_sessions_in_the_same_second_keep_their_order(tmp_path, monkeypatch):
+    """同秒的两个，后开的必须排在后面——`latest()` 按 id **字符串**排，而 `--continue`
+    "接最近一次"靠的就是它。分先后的是 id 里那一截进程内计数器。"""
+    freeze_the_clock(monkeypatch)
+
+    first = a_session(tmp_path)
+    second = a_session(tmp_path)
+
+    assert first.id < second.id
+
+
+def test_the_counter_keeps_a_fixed_width(monkeypatch):
+    """计数器那一截**宽度是固定的**，所以整个范围里先开的都排得靠后。
+
+    宽度一旦不够，字符串序就反了：四位撑到 `ffff`，再往后写出来是五位的 `10000`，而按字符串
+    `"10000" < "ffff"`——下一次会话排到上一次前面去。所以这里跨过那个边界看看：条目数在变，
+    宽度不能跟着变，而且次序还得对。
+
+    （CLI 一次运行只开一个会话，实际够不着这个边界；"够不着"不是让它在代码里没名字的理由。）
+    """
+    monkeypatch.setattr(transcript, "_sequence", 0xFE)
+    monkeypatch.setattr(transcript.uuid, "uuid4", lambda: uuid.UUID(int=0))
+
+    ids = [transcript._fresh_id("20260101-000000") for _ in range(4)]
+
+    assert ids == sorted(ids)
+    widths = {len(s.rsplit("-", 1)[1]) for s in ids}  # 计数器 + 随机那一整截
+    assert len(widths) == 1, f"宽度变了，排序会坏：{ids}"
+
+
+def test_a_collision_still_falls_back_instead_of_clobbering(tmp_path):
+    """兜底那条路**留着**：id 的唯一性是概率上的（跨进程同秒、计数器一样、随机那 4 位还
+    撞了），真撞上的处置只能是"改一次名字"，绝不是"覆盖别人的文件"。
+
+    这里直接按同一个 id 造两个 Session，为的是不靠运气去撞。
     """
     stamp = "20260101-000000"
     meta = {"type": "meta", "cwd": str(tmp_path)}

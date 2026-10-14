@@ -6,9 +6,9 @@
   原样存——就是发给 API 的那个结构，不做任何加工。
 - **没说过话就不建文件**：`start()` 只算不写，第一轮真落了消息才建（见 `Session._open`）。
   以前是启动即建，于是"打开看了一眼就退出"也留下一个空文件——它们会攒起来，而 `--continue`
-  取的是最新的那个名字，很容易接到空壳上。**文件名在第一次写的时候才定下来**，不是启动那
-  一刻：推迟的只是"写"，"占名字"得等真写的时候做，不然两个同秒启动的会话会各自以为同一个
-  名字是自己的。
+  取的是最新的那个名字，很容易接到空壳上。**但名字（=id）在 `start()` 那一刻就定死了**
+  （`_fresh_id`：时间戳 + 进程内计数器 + 一截随机），不是等第一次写的时候再定——落了盘的
+  工具结果要按它分目录，跑到一半改名会把一次会话劈成两处。
 - **追加写**，不是每轮整篇重写：会话越长重写越贵，而且重写到一半崩了就全丢；追加最多丢最后
   一行。所以读的时候要**跳过解析不了的行**——一行 JSON 要么完整要么残，残的那行只可能是写
   到一半断了。
@@ -18,12 +18,14 @@
 - **压缩是有损的，所以得记一笔**：文件里那些消息**一条不删**（它还是完整流水，人也能翻），
   只追加一行 `{"type": "summary", "up_to": N, "text": ...}`——"写到第 N 条为止，都被这段摘要
   代表了"。加载时按**最后一条** summary 剪掉它前面的消息，把摘要顶在最前面。
-- id 用时间戳，和改前备份同一套。文件名自带顺序，"最近一次"不用另建索引。
+- id 是"时间戳 + 一截保证不撞的后缀"（见 `_fresh_id`），和改前备份同一套思路。文件名自带
+  顺序，"最近一次"不用另建索引。
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -33,6 +35,9 @@ from typing import Any
 # 和改前备份共用 .agent/：它已经在 .gitignore 里，也被挡在模型的视野之外（EXCLUDED_DIRS +
 # SENSITIVE_DIRS）。
 SESSIONS_DIR = Path(".agent") / "sessions"
+
+# 这个进程里开过几次会话。见 `_fresh_id`——它是 id 里那截计数器的来源。
+_sequence = 0
 
 # 列表里那句预览截多长。够认出"这是哪次"就行——它只是给你挑的，不是用来读的。
 PREVIEW_CHARS = 40
@@ -48,7 +53,7 @@ def summary_message(text: str) -> dict[str, Any]:
 
 @dataclass
 class Session:
-    """一次会话的落盘。id 是时间戳，path 是它那个文件。
+    """一次会话的落盘。id 是它的名字（也是文件名的主干），path 是那个文件。
 
     **文件是懒建的**：`start()` 不碰磁盘，第一轮真的攒下消息才写（见 `_open`）。所以"启动过
     但一句话没说"不会在盘上留下任何东西。
@@ -118,13 +123,41 @@ class Session:
             fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
+def _fresh_id(stamp: str) -> str:
+    """按时间戳生成一个**不再会撞**的会话 id。
+
+    为什么要多这一截：名字（= id）得在 `start()` 那一刻就定死，之后不能再改——落了盘的
+    工具结果要按它分目录，跑到一半改名会把一次会话劈成两处（见 known-issues 的 D6/G2）。
+    而时间戳只精确到秒，同一秒里开两次就会撞上；以前的处置是**等到真写盘的时候往后排**
+    （`_free_path` 加 `-1`），那正是"跑到一半改名字"。所以改成一开始就把"不撞"这件事做掉。
+
+    两截各管一件事：
+
+    - 前面那截是**进程内计数器**——保证同一个进程里后开的排得更靠后。`latest()` 是按 id
+      **字符串**排的（见那里的说明），同一秒里两个会话谁新谁旧只能靠它分。宽度定死在四位
+      十六进制：**宽度变了排序就乱**（`"ff"` 后面是 `"100"`，而按字符串 `"100" < "ff"`），
+      所以宁可写宽一点——四位数够 65535 次，一个进程（一次运行只开一个会话）够不着。
+    - 后面那截**随机**——两个进程在同一秒里各开一个也不撞。
+
+    它**不保证绝不撞**：跨进程、同一秒、计数器又一样、随机那 4 位还撞了，概率约 1/65536。
+    所以 `_free_path` 那条兜底留着——真撞上宁可改一次名字（那次会话的落盘目录会劈开，认了），
+    也绝不能覆盖别人的文件。
+    """
+    global _sequence
+    _sequence += 1
+    return f"{stamp}-{_sequence:04x}{uuid.uuid4().hex[:4]}"
+
+
 def start(cwd: Path, *, permission_mode: str, allow_shell: bool) -> Session:
     """开一次新会话。**不碰磁盘**——第一轮真攒下消息才建文件（见 Session._open）。
 
-    id 和 path 先按时间戳做成一个"苗子"，真落盘那一刻才定下来。在那之前，盘上什么都没有。
+    **名字在这一刻就定死了**（`_fresh_id`），文件还是等真写的时候才建：推迟的只是"写"。
+    两件事本来是一体的，拆开是因为名字有别的用处——落盘的工具结果要按它分目录——而"打开
+    看一眼就退出"不该在盘上留下任何东西。
     """
     started = datetime.now()
     stamp = started.strftime("%Y%m%d-%H%M%S")
+    session_id = _fresh_id(stamp)
     meta = {
         "type": "meta",
         "cwd": str(cwd),
@@ -132,7 +165,7 @@ def start(cwd: Path, *, permission_mode: str, allow_shell: bool) -> Session:
         "allow_shell": allow_shell,
         "started": started.isoformat(timespec="seconds"),
     }
-    return Session(id=stamp, path=cwd / SESSIONS_DIR / f"{stamp}.jsonl", meta=meta)
+    return Session(id=session_id, path=cwd / SESSIONS_DIR / f"{session_id}.jsonl", meta=meta)
 
 
 def latest(cwd: Path) -> str | None:
@@ -143,7 +176,8 @@ def latest(cwd: Path) -> str | None:
 
     比的是**id 字符串**、不是文件路径：同一个 id 撞了会加个 `-1` 后缀，而 `"…-1.jsonl"` 和
     `"….jsonl"` 按路径比是在 `-` 和 `.` 上分的（`-` < `.`），那样排出来 `-1` 反而更早。
-    id 是定宽时间戳，按字符串排就是时间序，撞了的那份跟在它前面那次的后面。
+    id 前面是定宽的时间戳、后面是定宽的一截（计数器 + 随机，见 `_fresh_id`），所以按字符串
+    排就是时间序——同一秒里的两次靠计数器分先后。
     """
     directory = cwd / SESSIONS_DIR
     for name in sorted((path.stem for path in directory.glob("*.jsonl")), reverse=True):
@@ -325,10 +359,13 @@ def _read_lines(path: Path) -> Iterable[dict[str, Any]]:
 
 
 def _free_path(directory: Path, session_id: str) -> Path:
-    """撞名就往后排，绝不覆盖——同一秒里连开两次会撞上，而先来的那份已经记着东西了。
+    """撞名就往后排，绝不覆盖——先来的那份已经记着东西了。
 
-    和改前备份那条路同一个办法：不指望"时间戳够细"来避重（Windows 上连取两次可能拿到
-    同一个值），靠计数器保证唯一。
+    **正常情况下走不到这儿**：id 在 `start()` 那一刻就是唯一的（见 `_fresh_id`）。留着是因为
+    那个"唯一"是概率上的——跨进程、同一秒、计数器又一样、随机那几位还撞了，才会到这儿。
+
+    真到这儿了就意味着**这次会话的名字变了**（多了个 `-1`）：按名字定位的东西（落盘的工具
+    结果目录）会跟着劈成两处。宁可那样，也不能覆盖别人的文件。
     """
     path = directory / f"{session_id}.jsonl"
     counter = 1
