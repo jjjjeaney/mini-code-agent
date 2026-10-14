@@ -101,6 +101,11 @@ class ToolContext:
     allow_shell: bool = False
 
 
+def _always_available(_: ToolContext) -> bool:
+    """默认：一直能用。绝大多数工具都是这样。"""
+    return True
+
+
 @dataclass
 class Tool:
     """一个可以被模型调用的工具。
@@ -114,6 +119,19 @@ class Tool:
     fn: Callable[[dict[str, Any], ToolContext], Any]
     description: str | None = None
     params: dict[str, Any] = field(default_factory=dict)
+
+    # 这个工具**此刻**能不能用。不给就是一直能用。
+    #
+    # 为什么要这么个东西：广告一个做不到的能力，代价不只是难看——模型会试一次、吃一条报错、
+    # 而且**花掉一步**（max_steps 数的是模型调用次数）。"没有"就别发。
+    #
+    # **它只管"发不发"，不管"放不放行"**。闸门（permissions.py）照旧管后者，而且必须照旧：
+    # 模型在这条对话里见过这个 schema（上一步的请求里就有），照样调得出来——所以"不发"只能
+    # 是加法，替代不了闸门。
+    #
+    # 判的也只有"存不存在"这一类（没开 shell、没配 key、一份技能/记忆都没有）。**权限不归
+    # 它管**：那是闸门的事，而且藏起来会连"为什么不行"那句话一起藏掉。
+    available: Callable[[ToolContext], bool] = _always_available
 
     def __post_init__(self) -> None:
         if not self.name:

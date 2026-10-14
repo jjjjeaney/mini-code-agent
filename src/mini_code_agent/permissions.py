@@ -118,6 +118,9 @@ def decide_permission(
 
     if request.tool_name == "bash":
         if not allow_shell:
+            # **这一支实际到不了**：没开 shell 时 bash 压根不发给模型（见 tools/base.py 的
+            # Tool.available）。留着是因为这个函数单独拿出来也得是对的——它有自己的测试，
+            # 而且"没开的工具直接放行"这个判断本身没毛病（先弹一句问、答完才发现跑不了，是白问）。
             return PermissionDecision("allow", "")
         return PermissionDecision("ask", "跑命令要用户确认")
 

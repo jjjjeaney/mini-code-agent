@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from mini_code_agent.memory import index_text as memory_index
 from mini_code_agent.providers.base import ToolCall
+from mini_code_agent.skills import index_text as skill_index
 from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
 from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
 from mini_code_agent.tools.files import (
@@ -39,7 +41,13 @@ from mini_code_agent.tools.skill import (
     read_skill,
     read_skill_file,
 )
-from mini_code_agent.tools.web import WEB_FETCH_SCHEMA, WEB_SEARCH_SCHEMA, web_fetch, web_search
+from mini_code_agent.tools.web import (
+    WEB_FETCH_SCHEMA,
+    WEB_SEARCH_SCHEMA,
+    is_configured,
+    web_fetch,
+    web_search,
+)
 
 
 class ToolRegistry:
@@ -77,9 +85,18 @@ class ToolRegistry:
 
         return tool.fn(args, ctx)
 
-    def schemas(self) -> list[dict[str, Any]]:
-        """传给 provider.complete(tools=...) 的列表。"""
-        return [tool.to_anthropic_schema() for tool in self.tools.values()]
+    def schemas(self, ctx: ToolContext) -> list[dict[str, Any]]:
+        """传给 provider.complete(tools=...) 的列表。
+
+        **此刻用不上的不发**（见 `Tool.available`）——广告一个做不到的能力，模型会试一次、
+        吃一条报错、还花掉一步。
+
+        筛的只有"存不存在"这一类：没开 `--shell`、没配 key、一份技能/记忆都没有。
+        **权限不在筛的范围里**：那是闸门的事，而且藏起来会连"为什么不行"那句话一起藏掉。
+        """
+        return [
+            tool.to_anthropic_schema() for tool in self.tools.values() if tool.available(ctx)
+        ]
 
     def dispatch(self, ctx: ToolContext, call: ToolCall) -> ToolResult:
         """执行一次模型发起的调用，返回可以直接回填进对话的 ToolResult。
@@ -149,6 +166,8 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_memory,
                 params=READ_MEMORY_SCHEMA,
+                # 一条记忆都没有就别发它——没清单的时候它只会让模型白试一次、花掉一步。
+                available=lambda ctx: bool(memory_index(ctx.cwd)),
             ),
             Tool(
                 name="remember",
@@ -170,6 +189,8 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_skill,
                 params=READ_SKILL_SCHEMA,
+                # 同上：一份技能都没有就别发"取技能"的两个工具。
+                available=lambda ctx: bool(skill_index(ctx.cwd)),
             ),
             Tool(
                 name="read_skill_file",
@@ -179,6 +200,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_skill_file,
                 params=READ_SKILL_FILE_SCHEMA,
+                available=lambda ctx: bool(skill_index(ctx.cwd)),
             ),
             Tool(
                 name="write_file",
@@ -223,6 +245,9 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=bash,
                 params=SHELL_SCHEMA,
+                # 没开 --shell 就别发：调了也只会拿到一句"没开命令执行"，而模型试这一下
+                # 是要花掉一步的（max_steps 里的一步）。
+                available=lambda ctx: ctx.allow_shell,
             ),
             Tool(
                 name="glob",
@@ -254,6 +279,8 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=web_search,
                 params=WEB_SEARCH_SCHEMA,
+                # 没配 key 就别发这两个——发出去是必错的。
+                available=lambda _: is_configured(),
             ),
             Tool(
                 name="web_fetch",
@@ -264,6 +291,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=web_fetch,
                 params=WEB_FETCH_SCHEMA,
+                available=lambda _: is_configured(),
             ),
         ]
     )

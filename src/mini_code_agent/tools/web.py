@@ -48,6 +48,15 @@ WEB_FETCH_SCHEMA: dict[str, Any] = {
 }
 
 
+def is_configured() -> bool:
+    """配了 TAVILY_API_KEY 吗。
+
+    装配工具表的时候拿这个判（见 tools/registry.py）：没配的话这两个工具发出去也是白搭，
+    而**广告一个必错的工具，代价是模型试一次、吃一条报错、花掉一步**。
+    """
+    return bool(os.getenv("TAVILY_API_KEY"))
+
+
 def _client() -> TavilyClient:
     """按需建客户端。缺 key 时抛一句能照着做的话，而不是让 KeyError 冒出去。"""
     api_key = os.getenv("TAVILY_API_KEY")

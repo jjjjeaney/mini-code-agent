@@ -133,13 +133,14 @@ def test_assistant_content_is_replayed_untouched(registry):
     assert result.messages[1]["content"] == response.assistant_content
 
 
-def test_every_request_carries_the_tool_schemas(registry):
+def test_every_request_carries_the_tool_schemas(registry, tmp_path):
     provider = ScriptedProvider([tool_turn("toolu_1", "add", {"a": 1, "b": 2}), text_turn("3")])
 
-    runagent("1+2", provider, registry)
+    runagent("1+2", provider, registry, cwd=tmp_path)
 
-    assert provider.calls[0]["tools"] == registry.schemas()
-    assert provider.calls[1]["tools"] == registry.schemas()
+    expected = registry.schemas(ToolContext(tmp_path))
+    assert provider.calls[0]["tools"] == expected
+    assert provider.calls[1]["tools"] == expected
 
 
 def test_system_prompt_is_forwarded_on_every_step(registry):
@@ -150,12 +151,12 @@ def test_system_prompt_is_forwarded_on_every_step(registry):
     assert [call["system"] for call in provider.calls] == ["你是一个计算器。"] * 2
 
 
-def test_without_a_registry_the_default_tools_are_used():
+def test_without_a_registry_the_default_tools_are_used(tmp_path):
     provider = ScriptedProvider([text_turn("你好")])
 
-    runagent("你好", provider)
+    runagent("你好", provider, cwd=tmp_path)
 
-    assert provider.calls[0]["tools"] == default_tools().schemas()
+    assert provider.calls[0]["tools"] == default_tools().schemas(ToolContext(tmp_path))
 
 
 def test_multiple_tool_rounds_interleave_calls_and_results(registry):

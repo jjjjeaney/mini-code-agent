@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from mini_code_agent.memory import Memory, write
 from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools import (
     Tool,
@@ -142,8 +143,8 @@ class TestToolRegistry:
         with pytest.raises(ValueError, match="缺少必填参数"):
             registry.run(ctx, "add", {"a": 1})
 
-    def test_schemas_lists_every_tool(self, registry):
-        assert [schema["name"] for schema in registry.schemas()] == ["add", "boom", "echo"]
+    def test_schemas_lists_every_tool(self, registry, ctx):
+        assert [schema["name"] for schema in registry.schemas(ctx)] == ["add", "boom", "echo"]
 
     def test_dispatch_wraps_the_return_value_in_a_tool_result(self, registry, ctx):
         call = ToolCall(id="toolu_1", name="add", arguments={"a": 1, "b": 2})
@@ -202,8 +203,8 @@ class TestDefaultTools:
             "web_fetch",
         ]
 
-    def test_echo_schema_requires_text(self):
-        schema = default_tools().schemas()[0]
+    def test_echo_schema_requires_text(self, ctx):
+        schema = default_tools().schemas(ctx)[0]
 
         assert schema["name"] == "echo"
         assert schema["input_schema"]["required"] == ["text"]
@@ -300,3 +301,77 @@ class TestWebSearch:
 
         assert result.is_error is True
         assert "rate limited" in result.result
+
+
+class TestToolFiltering:
+    """"此刻用不上的不发"——广告一个做不到的能力，代价是模型试一次、吃一条报错、花掉一步。"""
+
+    def names(self, ctx) -> list[str]:
+        return [schema["name"] for schema in default_tools().schemas(ctx)]
+
+    def test_bash_is_not_advertised_without_shell(self, tmp_path):
+        """没开 --shell 时它调了也只会拿到一句"没开命令执行"，而那一下是要花掉一步的。"""
+        assert "bash" not in self.names(ToolContext(tmp_path))
+        assert "bash" in self.names(ToolContext(tmp_path, allow_shell=True))
+
+    def test_web_tools_are_not_advertised_without_a_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+        names = self.names(ToolContext(tmp_path))
+
+        assert "web_search" not in names
+        assert "web_fetch" not in names
+
+    def test_web_tools_show_up_once_the_key_is_there(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TAVILY_API_KEY", "k")
+
+        assert "web_search" in self.names(ToolContext(tmp_path))
+
+    def test_skill_tools_are_not_advertised_without_any_skill(self, tmp_path):
+        names = self.names(ToolContext(tmp_path))
+
+        assert "read_skill" not in names
+        assert "read_skill_file" not in names
+
+    def test_skill_tools_show_up_once_there_is_one(self, tmp_path):
+        directory = tmp_path / ".agent" / "skill" / "release"
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(
+            "---\ndescription: 发版前走一遍\n---\n\n正文\n", encoding="utf-8"
+        )
+
+        names = self.names(ToolContext(tmp_path))
+
+        assert "read_skill" in names
+        assert "read_skill_file" in names
+
+    def test_the_memory_tool_is_not_advertised_without_any_memory(self, tmp_path):
+        assert "read_memory" not in self.names(ToolContext(tmp_path))
+
+    def test_the_memory_tool_shows_up_once_there_is_one(self, tmp_path):
+        write(tmp_path, Memory(name="a-note", description="一条", type="user", body="正文"))
+
+        assert "read_memory" in self.names(ToolContext(tmp_path))
+
+    def test_writing_a_memory_is_always_advertised(self, tmp_path):
+        """记一条永远可以——没有可读的，也能写第一条。"""
+        assert "remember" in self.names(ToolContext(tmp_path))
+
+    def test_the_always_available_ones_are_untouched(self, tmp_path):
+        names = self.names(ToolContext(tmp_path))
+
+        for name in ("read_file", "write_file", "edit_file", "grep", "glob"):
+            assert name in names
+
+    def test_a_tool_without_available_is_always_sent(self, ctx):
+        """默认是"一直能用"——绝大多数工具都走这一条。"""
+        registry = ToolRegistry([Tool(name="x", fn=lambda kwargs, ctx: "ok")])
+
+        assert [schema["name"] for schema in registry.schemas(ctx)] == ["x"]
+
+    def test_a_tool_can_hide_itself(self, ctx):
+        registry = ToolRegistry(
+            [Tool(name="x", fn=lambda kwargs, ctx: "ok", available=lambda _: False)]
+        )
+
+        assert registry.schemas(ctx) == []
