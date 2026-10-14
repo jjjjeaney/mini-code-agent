@@ -4,6 +4,8 @@
 
 - 每条记忆一个文件，`frontmatter + 正文`。frontmatter 是**手工可读的几行**，不引 YAML——
   值都是简单标量，split 一次冒号就够了（描述里带冒号也切得对，因为只切第一个）。
+  **拆 frontmatter 和校验名字的代码本身在 `frontmatter.py`**，和 skill 共用一份——两边各写
+  一份迟早会漂。
 - **索引不手工维护**：写完重扫一遍目录重排。增量改会漂，重扫不会，而且这点量很便宜。排序是
   固定的（按名字），所以只动到变了的那几行——这对 system prompt 的缓存前缀很重要。
 - **手工加/删记忆也会让它漂**（那条路不经过 `write()`），所以启动时还会对一次
@@ -19,10 +21,11 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+
+from mini_code_agent import frontmatter
 
 # 和会话落盘、改前备份共用 .agent/：它在 .gitignore 里，也读不到（EXCLUDED_DIRS +
 # SENSITIVE_DIRS）——记忆进模型是靠 system prompt 那一份，不是靠文件工具去读。
@@ -34,16 +37,6 @@ TYPES = ("user", "project", "reference")
 
 # 谁写的。这不是分类，是置信度——所以是个字段，不是第四类。
 SOURCES = ("user", "agent")
-
-# 名字要能当文件名，也要能一眼看出是什么。挡掉路径分隔符和 . 就是挡掉"顺着名字跑出目录"。
-_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-
-# 索引那个文件占掉的名字。名字一律小写（上面的正则），所以拿小写比就够——而 Windows 的文件名
-# 不分大小写，小写的 memory 和 MEMORY.md 是同一个文件。
-_INDEX_STEM = INDEX_NAME[: -len(".md")].lower()
-
-# 整个文件：以 --- 起、以 --- 收，后面是正文。
-_FRONTMATTER = re.compile(r"^---\s*\n(?P<fields>.*?)\n---\s*\n?(?P<body>.*)$", re.DOTALL)
 
 
 @dataclass
@@ -142,26 +135,13 @@ def render(memory: Memory) -> str:
 
 def parse(text: str, *, where: str) -> Memory:
     """读回来。`where` 只用在报错里——说清是哪个文件坏了。"""
-    match = _FRONTMATTER.match(text)
-    if match is None:
-        raise ValueError(f"{where} 少了 frontmatter：文件要以 --- 开头、用 --- 收尾。")
-
-    fields: dict[str, str] = {}
-    for line in match.group("fields").splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        fields[key.strip().lower()] = value.strip()
-
-    missing = [key for key in ("name", "description", "type") if not fields.get(key)]
-    if missing:
-        raise ValueError(f"{where} 的 frontmatter 缺了：{'、'.join(missing)}。")
+    fields, body = frontmatter.split(text, where=where, required=("name", "description", "type"))
 
     memory = Memory(
         name=fields["name"],
         description=fields["description"],
         type=fields["type"],
-        body=match.group("body").strip(),
+        body=body,
         source=fields.get("source") or "user",
         created=fields.get("created") or "",
     )
@@ -169,13 +149,10 @@ def parse(text: str, *, where: str) -> Memory:
     return memory
 
 
-def _checked_name(name: str) -> str:
-    if not isinstance(name, str) or not _NAME.match(name) or name == _INDEX_STEM:
-        raise ValueError(
-            f"{name!r} 不是有效的记忆名：只能用小写字母、数字、连字符和下划线，"
-            f"而且 {INDEX_NAME} 是索引的名字。"
-        )
-    return name
+def _checked_name(name: object) -> str:
+    # 拆 frontmatter、校验名字这两件事 skill 也要做，所以实现在 frontmatter.py 里。
+    # index_file 得传：记忆是**平铺的文件**，索引和它们挤在同一个目录，名字撞上就是同一个文件。
+    return frontmatter.check_name(name, problem="不是有效的记忆名", index_file=INDEX_NAME)
 
 
 def _validate(memory: Memory, *, where: str = "") -> None:

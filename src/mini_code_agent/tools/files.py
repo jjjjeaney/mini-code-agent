@@ -31,15 +31,14 @@ from mini_code_agent.tools.safety import (
     EXCLUDED_FILES,
     SENSITIVE_FILE_PATTERNS,
     NotTextFileError,
-    OutOfSandboxError,
     SensitiveFileError,
     UndecodableTextError,
     detect_encoding,
     ensure_text_file,
     ensure_within_size,
+    find_symlink,
     is_sensitive,
-    is_within,
-    resolve_within,
+    resolve_inside,
     should_skip,
     truncate_text,
 )
@@ -364,7 +363,7 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
 
     # 不顺着符号链接读。指向 cwd 外面的链接，围栏那一步已经拦下了；指向 cwd 里面的
     # 拦不住——顺着它读到的可能是另一个文件，模型以为读的是 A，实际读的是 B。
-    link = _find_symlink(raw, root)
+    link = find_symlink(raw, root)
     if link is not None:
         raise ValueError(
             f"{raw!r} 的路径上有符号链接（{link}）。read_file 不顺着链接读——"
@@ -819,44 +818,6 @@ def _compile_glob(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(out) + r"\Z")
 
 
-def _resolve_inside(root: Path, raw: str | Path) -> Path:
-    """解析路径并确认它落在 root 里面。存不存在、是不是目录由调用方各自判。
-
-    这是安全闸门，几个工具都要走。抄成多份的话，以后补一条校验只会补在其中一份上——
-    安全校验有多份，就等于只会被修好一份。写文件那个工具要允许"还不存在"，
-    所以围栏和"必须存在"是分开的两件事。
-    """
-    target = resolve_within(root, raw)
-    if not is_within(root, target):
-        raise OutOfSandboxError(
-            f"路径 {str(raw)!r} 指向 {target}，超出了允许的范围 {root}。"
-            f"只能访问 {root} 里面的东西。"
-        )
-    return target
-
-
-def _find_symlink(raw: str | Path, root: Path) -> Path | None:
-    """沿着**没解析过**的路径一段段看，返回第一段符号链接。
-
-    为什么不能拿解析后的 target 去判 `is_symlink()`：链接在 resolve_within 那一步就
-    被展开了，等拿到 target，"这是链接"这个信息已经没了。只能顺着原始路径重新走一遍。
-
-    和围栏一样，这是安全校验——将来 edit_file 也要走同一份。
-    """
-    unresolved = Path(raw)
-    if unresolved.is_absolute():
-        try:
-            unresolved = unresolved.relative_to(root)
-        except ValueError:
-            return None  # 压根不在 root 下面，围栏那一步会另行拒绝
-    current = root
-    for part in unresolved.parts:
-        current = current / part
-        if current.is_symlink():
-            return current
-    return None
-
-
 def _line_number(value: Any, name: str, minimum: int = 1) -> int:
     """把模型给的行号参数转成整数，低于 minimum 就报错。
 
@@ -924,9 +885,9 @@ def _checked_writable(root: Path, raw: str | Path) -> Path:
 
     不查存在性——write_file 要能新建还不存在的文件，那件事留给调用方各自判。
     """
-    target = _resolve_inside(root, raw)
+    target = resolve_inside(root, raw)
 
-    link = _find_symlink(raw, root)
+    link = find_symlink(raw, root)
     if link is not None:
         raise ValueError(
             f"{raw!r} 的路径上有符号链接（{link}）。不顺着链接写——"
@@ -1075,7 +1036,7 @@ def _commit_change(
 
 def _checked_path(root: Path, raw: str | Path) -> Path:
     """在 _resolve_inside 之上再要求它确实存在。读类工具都用这个。"""
-    target = _resolve_inside(root, raw)
+    target = resolve_inside(root, raw)
     if not target.exists():
         raise FileNotFoundError(f"{str(raw)!r} 不存在。路径要相对项目根目录写。")
     return target

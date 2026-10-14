@@ -120,6 +120,45 @@ def is_within(root: Path, candidate: Path) -> bool:
     return candidate.is_relative_to(root)
 
 
+def resolve_inside(root: Path, raw: str | Path) -> Path:
+    """解析路径并确认它落在 root 里面。存不存在、是不是目录由调用方各自判。
+
+    这是安全闸门，几个工具都要走——**所以只有这一份**。抄成多份的话，以后补一条校验只会补在
+    其中一份上，而安全校验有多份就等于只会被修好一份。
+
+    写文件的工具要允许"还不存在"，所以围栏和"必须存在"是分开的两件事。
+    """
+    target = resolve_within(root, raw)
+    if not is_within(root, target):
+        raise OutOfSandboxError(
+            f"路径 {str(raw)!r} 指向 {target}，超出了允许的范围 {root}。"
+            f"只能访问 {root} 里面的东西。"
+        )
+    return target
+
+
+def find_symlink(raw: str | Path, root: Path) -> Path | None:
+    """沿着**没解析过**的路径一段段看，返回第一段符号链接。
+
+    为什么不能拿解析后的 target 去判 `is_symlink()`：链接在 resolve_within 那一步就被展开了，
+    等拿到 target，"这是链接"这个信息已经没了。只能顺着原始路径重新走一遍。
+
+    和围栏一样，这是安全校验，**只有这一份**。
+    """
+    unresolved = Path(raw)
+    if unresolved.is_absolute():
+        try:
+            unresolved = unresolved.relative_to(root)
+        except ValueError:
+            return None  # 压根不在 root 下面，围栏那一步会另行拒绝
+    current = root
+    for part in unresolved.parts:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
 # 带 BOM 的几种文本。长 BOM 必须排在短的前面——`\xff\xfe` 是 `\xff\xfe\x00\x00`
 # 的前缀，顺序反了 UTF-32 会被认成 UTF-16。
 _BOMS: tuple[tuple[bytes, str], ...] = (
@@ -160,13 +199,19 @@ def ensure_text_file(sample: bytes) -> bool:
 
 
 def ensure_within_size(path: Path, max_bytes: int = MAX_READ_BYTES) -> None:
-    # 整文件读取的硬上限。Day 3 不做 offset/limit，超限直接拒绝，
-    # 课后挑战里再补按行读。
+    """**一次读进来**的硬上限：超过了就拒，让调用方换个做法。
+
+    这是"这一次读多少"的闸，不是"这个文件不能碰"：读文件那条路自己还有行号区间
+    （`read_file` 的 start_line / end_line），所以超限不是没救，是得换个读法。
+    grep 那边用它来**跳过**太大的文件（那边接住异常，不当错误往上抛）。
+
+    报错是给人看、也给模型看的，所以写中文——这个项目里对模型说的话没有英文。
+    """
     size = path.stat().st_size
     if size > max_bytes:
         raise ValueError(
-            f"file too large: {size} bytes > {max_bytes}; "
-            f"read a smaller file or use grep instead"
+            f"{path.name} 太大了：{size} 字节，一次最多读 {max_bytes} 字节。"
+            f"读文件的话可以用 start_line / end_line 只读一段，找内容用 grep。"
         )
 
 

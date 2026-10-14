@@ -315,7 +315,8 @@ class TestReadFile:
     def test_a_too_large_file_is_rejected_before_reading_it(self, project, ctx):
         (project / "big.txt").write_bytes(b"x" * (MAX_READ_BYTES + 1))
 
-        with pytest.raises(ValueError, match="too large"):
+        # 报错是给模型看的，所以是中文（以前是英文，那句话是从课程作业里带过来的）。
+        with pytest.raises(ValueError, match="太大了"):
             read_file({"path": "big.txt"}, ctx)
 
     def test_gbk_is_reported_as_an_encoding_problem_not_as_binary(self, project, ctx):
