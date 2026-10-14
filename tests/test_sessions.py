@@ -6,7 +6,16 @@ import json
 
 import pytest
 
-from mini_code_agent.sessions import SESSIONS_DIR, Session, latest, list_sessions, load, start
+from mini_code_agent.sessions import (
+    SESSIONS_DIR,
+    Session,
+    delete,
+    describe,
+    latest,
+    list_sessions,
+    load,
+    start,
+)
 from mini_code_agent.sessions.transcript import PREVIEW_CHARS
 
 
@@ -353,3 +362,60 @@ class TestSummaries:
 
         assert "第二次" in messages[0]["content"]
         assert not any("第一次" in str(message.get("content")) for message in messages)
+
+
+class TestDeleting:
+    """删一次会话。会话文件是那次对话唯一的记录，所以删之前要先看得见它。"""
+
+    def test_describe_says_what_that_session_is(self, tmp_path):
+        """id 是一串时间戳，光看它认不出是哪一回——得有句人话。"""
+        session = a_session(tmp_path)
+        session.append([{"role": "user", "content": "第一句"}])
+        session.append([{"role": "user", "content": "最后说的那句"}])
+
+        info = describe(tmp_path, session.id)
+
+        assert info.id == session.id
+        assert info.messages == 2
+        assert info.preview == "最后说的那句"
+
+    def test_describe_an_unknown_id_says_so(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="没有"):
+            describe(tmp_path, "20200101-000000")
+
+    def test_delete_removes_the_file(self, tmp_path):
+        session = a_session(tmp_path)
+        session.append([{"role": "user", "content": "说了句话"}])
+
+        delete(tmp_path, session.id)
+
+        assert not session.path.exists()
+        assert latest(tmp_path) is None
+
+    def test_delete_leaves_the_others_alone(self, tmp_path):
+        """删的是点名那一次——别的会话连碰都不碰。"""
+        doomed = a_session(tmp_path)
+        doomed.append([{"role": "user", "content": "这一次要被删掉"}])
+        keeper = a_session(tmp_path)
+        keeper.append([{"role": "user", "content": "这一次留着"}])
+
+        delete(tmp_path, doomed.id)
+
+        assert keeper.path.exists()
+        assert [info.id for info in list_sessions(tmp_path)] == [keeper.id]
+
+    def test_delete_an_unknown_id_says_so(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="没有"):
+            delete(tmp_path, "20200101-000000")
+
+    def test_a_session_that_never_spoke_can_be_deleted_too(self, tmp_path):
+        """没说过话的那种在 `--list` 里不逐行列出来，但盘上确实有——它是每次启动的残骸，
+        正是最想清掉的东西。"""
+        session = a_session(tmp_path)
+        session.append([{"role": "user", "content": "说了句话"}])
+        silent = a_session(tmp_path)
+        silent._open()  # 只建了 meta，没有消息
+
+        assert describe(tmp_path, silent.id).messages == 0
+        delete(tmp_path, silent.id)
+        assert not silent.path.exists()

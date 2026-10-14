@@ -339,6 +339,7 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
             continue_=False,
             resume="",
             list_=True,
+            delete_="",
         )
 
     out = capsys.readouterr().out
@@ -355,3 +356,80 @@ def test_sessions_marks_the_one_you_are_in(monkeypatch, tmp_path, capsys):
     session = run_loop(monkeypatch, provider, ["你好", "/sessions", "/exit"], tmp_path)
 
     assert f"* {session.id}" in capsys.readouterr().out
+
+
+def run_delete(tmp_path, session_id: str, *, yes: bool) -> None:
+    """跑一次 `mca --delete <id>`。两条路都以 typer.Exit 收场——删了，或者用户没同意。"""
+    with pytest.raises(typer.Exit):
+        cli.main_command(
+            prompt="",
+            cwd=tmp_path,
+            shell=False,
+            permission_mode="default",
+            continue_=False,
+            resume="",
+            list_=False,
+            delete_=session_id,
+            yes=yes,
+        )
+
+
+def test_delete_shows_what_it_would_remove_and_asks_first(tmp_path, capsys, monkeypatch):
+    """id 是一串时间戳，光看它认不出是哪一回——所以要把"最后说了什么"摆出来，再问一次。
+
+    删错了拿不回来：没有回收站，也不像改文件那样有 `.agent/.history` 兜着（会话是纯追加的，
+    从来不备份）。所以默认是要问的。
+    """
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append([{"role": "user", "content": "这一段对话我不要了"}])
+    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: False)
+
+    run_delete(tmp_path, session.id, yes=False)
+
+    out = capsys.readouterr().out
+    assert session.id in out
+    assert "1 条消息" in out
+    assert "这一段对话我不要了" in out
+    assert "没删" in out
+    assert session.path.exists()
+
+
+def test_answering_yes_removes_the_file(tmp_path, capsys, monkeypatch):
+    """顺带证明它**不需要 provider**：删除排在构造之前，没有 API key 也跑得起来。"""
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append([{"role": "user", "content": "删了我"}])
+    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: True)
+
+    run_delete(tmp_path, session.id, yes=False)
+
+    assert not session.path.exists()
+    assert "删掉了" in capsys.readouterr().out
+
+
+def test_the_yes_flag_skips_the_question(tmp_path, monkeypatch):
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append([{"role": "user", "content": "删了我"}])
+
+    def never_ask(*args, **kwargs):
+        raise AssertionError("给了 --yes 就不该再问")
+
+    monkeypatch.setattr(cli.typer, "confirm", never_ask)
+
+    run_delete(tmp_path, session.id, yes=True)
+
+    assert not session.path.exists()
+
+
+def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
+    with pytest.raises(typer.BadParameter, match="没有"):
+        cli.main_command(
+            prompt="",
+            cwd=tmp_path,
+            shell=False,
+            permission_mode="default",
+            continue_=False,
+            resume="",
+            list_=False,
+            delete_="20200101-000000",
+            yes=True,
+        )

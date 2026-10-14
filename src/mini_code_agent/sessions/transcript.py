@@ -233,6 +233,32 @@ def _one_line(text: str) -> str:
     return flat if len(flat) <= PREVIEW_CHARS else flat[:PREVIEW_CHARS] + "…"
 
 
+def describe(cwd: Path, session_id: str) -> SessionInfo:
+    """撮一次会话，只为看清它是什么——`--delete` 在动手之前用它。
+
+    找不着就报错，不返回 None：调用方要拿它做决定，一个"看起来正常但什么都没有"的空壳比
+    一句报错难查得多（和 `load()` 同一条理由）。
+    """
+    path = cwd / SESSIONS_DIR / f"{session_id}.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(f"没有 {session_id} 这个会话（找的是 {path}）。")
+    return _describe(path)
+
+
+def delete(cwd: Path, session_id: str) -> None:
+    """删掉一次会话——删的是那个 jsonl 文件本身。
+
+    **没有回收站、也没有备份，这一步不可逆**。所以调用方要**先给人看过再动手**（cli.py 里
+    就是这么用的：先 describe 打印一遍、问过用户，才调这里）。
+
+    落了盘的工具结果（`.agent/tool-results/`）**不跟着删**：那些文件名里没有会话 id，认不出
+    是谁的。等它们按会话分目录了才谈得上一起删（见 docs/known-issues.md 的 G2）。
+    """
+    # 先撮一遍再删：报错的措辞和 describe 一致，而"文件在不在"这件事也只判一次。
+    describe(cwd, session_id)
+    (cwd / SESSIONS_DIR / f"{session_id}.jsonl").unlink()
+
+
 def load(cwd: Path, session_id: str | None = None) -> tuple[Session, dict[str, Any], list[dict]]:
     """读回一次会话：Session、meta、messages。
 

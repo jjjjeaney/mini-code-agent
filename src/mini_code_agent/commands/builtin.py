@@ -79,7 +79,8 @@ def render_session_list(console: Console, cwd: Path, *, current: str | None = No
     if silent:
         console.print(f"\n（另有 {silent} 次没说过话的，略过）", style="dim", markup=False)
     console.print(
-        "\n接上某一次：mca --resume <id>；mca --continue 接最近一次有内容的",
+        "\n接上某一次：mca --resume <id>；mca --continue 接最近一次有内容的"
+        "\n删掉某一次：mca --delete <id>（删之前会把要删的那次摆给你看，问过才动手）",
         style="dim",
         markup=False,
     )

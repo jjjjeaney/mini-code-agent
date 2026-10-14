@@ -42,6 +42,12 @@ uv run mca
 uv run mca --list
 ```
 
+`--delete <id>` 删掉某一次。删之前会先把要删的那次摆出来（多少条消息、最后说了什么）问一遍——会话文件是那次对话唯一的记录，没有回收站也没有备份，所以默认要问；脚本里用 `--yes` 跳过。
+
+```bash
+uv run mca --delete 20261014-153000
+```
+
 ## 测试
 
 `tests/test_anthropic_provider.py` 是真实接口冒烟测试，会实际发起请求并产生费用；`.env` 里缺少任一变量时整组跳过。`tests/test_agent.py` 和 `tests/test_tools.py` 用假 provider 驱动，完全不联网。

@@ -20,7 +20,7 @@ from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.prompts import Prompter
 from mini_code_agent.providers.anthropic import AnthropicProvider
 from mini_code_agent.providers.base import Provider
-from mini_code_agent.sessions import Session, load, start, summary_message
+from mini_code_agent.sessions import Session, delete, describe, load, start, summary_message
 from mini_code_agent.skills import sync_index as sync_skill_index
 from mini_code_agent.summarizing import KEEP_RECENT_TURNS, cut_point, summarize
 from mini_code_agent.system_prompt import build_system_prompt
@@ -162,6 +162,32 @@ def _chat(
         typer.echo()
 
 
+def _delete_session(cwd: Path, session_id: str, *, assume_yes: bool) -> None:
+    """删掉一次会话：**先把要删的那次摆出来，问过才动手**。
+
+    顺序是有意的。会话文件是那次对话唯一的记录——没有回收站，也不像改文件那样有
+    `.agent/.history` 兜着（`Session.append` 是纯追加，从来不备份）。所以这一步要让人
+    **看清删的是哪一次**再答：id 是一串时间戳，光看 id 认不出那是哪一回，最后那句人话才是
+    认得出的那个钩子（和 `--list` 里那栏同一个用途）。
+
+    `--yes` 跳过那一次问答，给脚本用。
+    """
+    try:
+        target = describe(cwd, session_id)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--delete") from None
+
+    what = f"{target.messages} 条消息" if target.messages else "没说过话"
+    console.print(f"要删的是 {target.id}（{what}）", style="bold", markup=False)
+    if target.preview:
+        console.print(f"  最后一句：「{target.preview}」", markup=False)
+    if not assume_yes and not typer.confirm(f"删掉 {target.id}？删了拿不回来"):
+        console.print("没删。", markup=False)
+        return
+    delete(cwd, target.id)
+    console.print(f"删掉了 {target.id}。", markup=False)
+
+
 @app.command()
 def main_command(
     prompt: str = typer.Argument("", help="Prompt to send to the agent."),
@@ -181,6 +207,10 @@ def main_command(
     list_: bool = typer.Option(
         False, "--list", help="列出这个目录下有过哪些会话（连同各自的 id），然后退出"
     ),
+    delete_: str = typer.Option(
+        "", "--delete", help="删掉指定 id 的会话（删之前会摆出来问一次），然后退出"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="配合 --delete：不再问那一次"),
 ) -> None:
     """把指令交给 agent，把最终回复打印到标准输出。"""
     prompt = prompt.strip()
@@ -188,6 +218,11 @@ def main_command(
         # 只看不做的活儿，排在所有检查和构造之前：它连 provider 都不需要，所以没有 API key
         # 也跑得起来，一个打错的档位也不该把一次列目录拦下。
         render_session_list(console, cwd or Path.cwd())
+        raise typer.Exit()
+    if delete_:
+        # 删除同理，也排在构造之前：它不是 agent 的动作，是用户对自己的文件动手——不该需要
+        # provider，也不该因为顺带写错了个档位就被拦下。
+        _delete_session(cwd or Path.cwd(), delete_, assume_yes=yes)
         raise typer.Exit()
     try:
         permission_mode = parse_permission_mode(permission_mode)
