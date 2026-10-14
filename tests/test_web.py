@@ -133,17 +133,22 @@ class TestWebFetch:
 
         assert "没取回" in web.web_fetch({"url": "https://a.example/x"}, ctx)
 
-    def test_a_long_page_is_truncated_and_says_so(self, monkeypatch, ctx):
-        """静默截断最糟——模型会以为页面就这么长，然后照着这个认知做事。"""
+    def test_a_long_page_comes_back_whole(self, monkeypatch, ctx):
+        """这个工具**自己不截断**：太长的那份整篇落盘，上下文里只留预览（见 tools/spill.py）。
+
+        截在这儿的话，落下去的也只是截过的那一份——而这一页是花钱取回来的，再要就得重新
+        取一次，网页还可能已经变了。
+        """
         use(monkeypatch, FakeTavily(extract=a_page(raw_content="x" * 50_000)))
 
         out = web.web_fetch({"url": "https://a.example/x"}, ctx)
 
-        assert "已截断" in out
-        assert "50000" in out  # 原文多长也写出来
+        assert "已截断" not in out
+        # 拿末尾那截来比，不数全文的 x：抬头那行 URL 里就有一个 x。
+        assert out.endswith("x" * 50_000)  # 一个字都没少
 
     def test_a_long_page_keeps_its_title_and_link(self, monkeypatch, ctx):
-        """截的是正文，抬头那两行得留着——不然模型认不出这坨正文是哪一页的。"""
+        """抬头那两行得留着——不然模型认不出这坨正文是哪一页的（落盘那份也一样）。"""
         use(monkeypatch, FakeTavily(extract=a_page(raw_content="x" * 50_000)))
 
         out = web.web_fetch({"url": "https://a.example/x"}, ctx)

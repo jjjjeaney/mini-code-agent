@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from mini_code_agent.providers.base import ToolCall
+from mini_code_agent.tools import default_tools
 from mini_code_agent.tools.base import DangerousCommandError, ShellDisabledError, ToolContext
 from mini_code_agent.tools.shell import (
     DEFAULT_IMAGE,
@@ -260,8 +262,35 @@ class TestBashInDocker:
         ).stdout.strip()
         assert still_running == "", f"超时之后容器还在跑：{still_running}"
 
-    def test_long_output_is_capped(self, shell_ctx):
+    def test_a_long_output_comes_back_whole(self, shell_ctx):
+        """这个工具**自己不截断了**：留住的那份要整篇交给 registry 去落盘（见 tools/spill.py）。
+
+        以前是 8000 字节一刀切，尾巴直接丢——而测试失败的清单恰恰在尾巴上。现在那个尾巴会
+        跟着落盘文件一起留下来，上下文里换成的是一段预览。
+        """
         out = bash({"command": "python -c \"print('x' * 20000)\""}, shell_ctx)
 
-        assert "输出被截断" in out
-        assert len(out) < 20000
+        assert "被截断" not in out and "输出太多" not in out
+        assert out.count("x") == 20000
+
+    def test_the_spilled_copy_is_redacted_too(self, shell_ctx):
+        """落盘的那份必须是**涂黑之后**的。
+
+        涂黑发生在 _format 里、落盘发生在 registry 里，两者中间只隔着一次返回——所以这里
+        要连着走一遍 dispatch 才测得出来。不涂就落的话，磁盘上会留一份明文密钥，而模型
+        随时能用 read_tool_result 把它读回来，等于给涂黑开了个后门。
+        """
+        registry = default_tools()
+        command = (
+            "echo 'DEEPSEEK_API_KEY=sk-live-abcdef'; python -c \"print('x'*20000)\""
+        )
+        result = registry.dispatch(
+            shell_ctx,
+            ToolCall(id="t1", name="bash", arguments={"command": command}),
+        )
+
+        spilled = list((shell_ctx.cwd / ".agent" / "tool-results").glob("bash-*.txt"))
+        assert len(spilled) == 1, "这条输出够长，应该落盘了"
+        for text in (result.result, spilled[0].read_text(encoding="utf-8")):
+            assert "sk-live-abcdef" not in text
+            assert "已涂黑" in text

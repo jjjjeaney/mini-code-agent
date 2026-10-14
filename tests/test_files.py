@@ -19,23 +19,31 @@ from mini_code_agent.tools.base import (
 )
 from mini_code_agent.tools.files import (
     MAX_GREP_MATCHES,
+    MAX_TREE_NODES,
     edit_file,
     glob,
     grep,
     list_files,
     project_tree,
     read_file,
+    read_tool_result,
     replace_lines,
     write_file,
 )
 from mini_code_agent.tools.safety import (
     MAX_READ_BYTES,
-    MAX_TEXT_CHARS,
+    MAX_READ_FILE_CHARS,
+    MAX_TOOL_CHARS,
     NotTextFileError,
     OutOfSandboxError,
     SensitiveFileError,
     UndecodableTextError,
 )
+from mini_code_agent.tools.spill import TOOL_RESULTS_DIR
+
+# 一行编号后的正文大约 8~9 个字符（`   1 | x`），这个行数保证编号之后一定超过
+# MAX_READ_FILE_CHARS。**跟着常量走**：写死一个数的话，限额一涨这条就变成"其实没超"。
+LONG_LINES = MAX_READ_FILE_CHARS // 8 + 100
 
 
 @pytest.fixture
@@ -130,7 +138,7 @@ class TestListFiles:
         # 写死一个数的话，限额一涨这条就变成"其实没超"——红得莫名其妙，而且红的原因跟它要测
         # 的东西（超了会不会截断）没有关系。
         (project / "many").mkdir()
-        for index in range(MAX_TEXT_CHARS // 70 * 2):
+        for index in range(MAX_TOOL_CHARS // 70 * 2):
             name = f"{index:05d}" + "x" * 55
             (project / "many" / f"{name}.txt").write_text("x", encoding="utf-8")
 
@@ -183,9 +191,38 @@ class TestProjectTree:
         """
         out = project_tree({"max_nodes": 2}, ctx)
 
-        assert out.splitlines()[:2] == ["├── src/", "└── README.md"]
+        # 说明在最前面，空行之后才是树——理由见 project_tree 里那一段（它还要过一道字符
+        # 数闸，说明挂末尾会被那道截掉）。
+        assert out.splitlines()[:2] == ["[已截断：条目数到了上限 2，剩下的没列出来]", ""]
+        assert out.splitlines()[2:4] == ["├── src/", "└── README.md"]
+
+    def test_the_node_cap_cannot_be_raised_away(self, project, ctx):
+        """max_nodes 是**模型给的参数**，所以它必须有上限——别的工具的限额都写在代码里，
+        这是唯一一个能由模型调的，不能连顶都没有。
+
+        看的是**说明里印了哪个数**：要一百万条，说明上写的却是上限那个数，就说明夹过了。
+        （不数树里有多少行——字符那道闸比条目数先咬，树本来就看不了那么长。）
+        """
+        for index in range(MAX_TREE_NODES):
+            (project / f"f{index:05d}.txt").write_text("x", encoding="utf-8")
+
+        out = project_tree({"max_nodes": 10**6}, ctx)
+
+        assert f"上限 {MAX_TREE_NODES}" in out
+        assert "1000000" not in out
+
+    def test_a_huge_tree_is_also_capped_by_characters(self, project, ctx):
+        """条目数那道闸管不住长名字：一千条短名字和一千条长名字，字符数差着十倍。
+
+        说明在**树前面**：两条闸一起响的时候，末尾那句会被字符那道截掉，放前面才留得住。
+        """
+        for index in range(200):
+            (project / (f"{index:03d}" + "n" * 60 + ".txt")).write_text("x", encoding="utf-8")
+
+        out = project_tree({}, ctx)
+
         assert "已截断" in out
-        assert "上限 2" in out
+        assert len(out) < MAX_TOOL_CHARS + 200
 
     def test_skipped_entries_are_hidden(self, project, ctx):
         out = project_tree({}, ctx)
@@ -327,27 +364,27 @@ class TestReadFile:
             read_file({"path": "gbk.txt"}, ctx)
 
     def test_long_output_is_truncated(self, project, ctx):
-        (project / "long.txt").write_text("x" * (MAX_TEXT_CHARS + 500), encoding="utf-8")
+        (project / "long.txt").write_text("x" * (MAX_READ_FILE_CHARS + 500), encoding="utf-8")
 
         assert "已截断" in read_file({"path": "long.txt"}, ctx)
 
     def test_numbering_eats_into_the_budget_not_the_other_way_round(self, project, ctx):
-        """行号是正文的一部分，跟着一起受 MAX_TEXT_CHARS 管着——所以超长文件是**少给几行**，
+        """行号是正文的一部分，跟着一起受 MAX_READ_FILE_CHARS 管着——所以超长文件是**少给几行**，
         而不是"正文给满限额、行号另外加"那样溢出。
 
         （行数不能太多：write_text 会撑成 CRLF，文件太大就先被"超过 MAX_READ_BYTES"挡掉了。）
         """
-        (project / "long.txt").write_text("x\n" * 5000, encoding="utf-8")
+        (project / "long.txt").write_text("x\n" * LONG_LINES, encoding="utf-8")
 
         out = read_file({"path": "long.txt"}, ctx)
 
         body, _, note = out.partition("\n\n[已截断")
-        assert len(body) == MAX_TEXT_CHARS  # 切点正好落在限额上，切的是含行号的那份
+        assert len(body) == MAX_READ_FILE_CHARS  # 切点正好落在限额上，切的是含行号的那份
         assert note
 
     def test_the_truncation_note_is_not_numbered(self, project, ctx):
         """那句说明不是文件里的一行，编上号会让它看起来像第 N 行。"""
-        (project / "long.txt").write_text("x\n" * 5000, encoding="utf-8")
+        (project / "long.txt").write_text("x\n" * LONG_LINES, encoding="utf-8")
 
         out = read_file({"path": "long.txt"}, ctx)
 
@@ -355,12 +392,12 @@ class TestReadFile:
 
     def test_the_line_count_note_survives_truncation(self, project, ctx):
         """"共 N 行"是元信息，接在截断之后——以前它拼在正文里，长文件一截就把它一起吞了。"""
-        (project / "long.txt").write_text("x\n" * 5000, encoding="utf-8")
+        (project / "long.txt").write_text("x\n" * LONG_LINES, encoding="utf-8")
 
         out = read_file({"path": "long.txt", "start_line": 2}, ctx)
 
         assert "已截断" in out
-        assert "[文件共 5000 行]" in out
+        assert f"[文件共 {LONG_LINES} 行]" in out
 
     def test_env_is_refused(self, project, ctx):
         """fixture 里那个 .env 装着 KEY=1——读了就等于把它发出去。"""
@@ -579,6 +616,72 @@ class TestReadFile:
 
         with pytest.raises(ValueError, match="符号链接"):
             read_file({"path": "src/cli.py"}, ctx)
+
+
+class TestReadToolResult:
+    """取回一条落盘的工具结果（落盘那头在 registry 里，见 test_tools.py）。"""
+
+    def spill(self, project: Path, text: str, name: str = "bash-abcd1234") -> str:
+        directory = project / TOOL_RESULTS_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.txt").write_text(text, encoding="utf-8")
+        return name
+
+    def test_it_numbers_the_lines(self, project, ctx):
+        name = self.spill(project, "第一行\n第二行\n")
+
+        out = read_tool_result({"id": name}, ctx)
+
+        assert out.splitlines() == ["1 | 第一行", "2 | 第二行"]
+
+    def test_a_txt_suffix_is_accepted(self, project, ctx):
+        """引用消息里印的是带 .txt 的路径，模型可能整个抄过来。"""
+        name = self.spill(project, "正文\n")
+
+        assert "正文" in read_tool_result({"id": f"{name}.txt"}, ctx)
+
+    def test_a_range_works_like_read_file(self, project, ctx):
+        name = self.spill(project, "\n".join(f"line{i}" for i in range(1, 11)))
+
+        out = read_tool_result({"id": name, "start_line": 3, "end_line": 5}, ctx)
+
+        assert out.splitlines()[:3] == ["3 | line3", "4 | line4", "5 | line5"]
+        assert "[共 10 行]" in out
+
+    def test_reading_the_whole_thing_has_no_line_count_note(self, project, ctx):
+        """整篇取下来时行号已经说清了范围，多一句是噪音（和 read_file 同一条规矩）。"""
+        name = self.spill(project, "只有一行\n")
+
+        assert "[共" not in read_tool_result({"id": name}, ctx)
+
+    def test_an_empty_id_is_rejected(self, project, ctx):
+        with pytest.raises(ValueError, match="非空"):
+            read_tool_result({"id": "  "}, ctx)
+
+    def test_an_unknown_id_says_so(self, project, ctx):
+        with pytest.raises(FileNotFoundError, match="没有名为"):
+            read_tool_result({"id": "nope"}, ctx)
+
+    def test_it_cannot_escape_its_own_directory(self, project, ctx):
+        """这道门只认 `.agent/tool-results/` 里的名字——`..` 不能带它出去。"""
+        (project / "secret.txt").write_text("项目里的文件", encoding="utf-8")
+
+        with pytest.raises(OutOfSandboxError):
+            read_tool_result({"id": "../secret"}, ctx)
+
+    def test_a_symlink_inside_the_directory_is_still_refused(self, project, ctx):
+        """围栏拦得住指向**外面**的链接（那一步就解析出去了），拦不住指向**里面**的——
+        模型以为读的是 link，实际读的是另一个文件。所以还要有一道显式的检查。"""
+        directory = project / TOOL_RESULTS_DIR
+        directory.mkdir(parents=True)
+        (directory / "real.txt").write_text("真的内容", encoding="utf-8")
+        try:
+            (directory / "link.txt").symlink_to(directory / "real.txt")
+        except OSError:  # Windows 上没权限建链接是常事，那就没得测
+            pytest.skip("这个环境建不了符号链接")
+
+        with pytest.raises(ValueError, match="符号链接"):
+            read_tool_result({"id": "link"}, ctx)
 
 
 class TestWriteFile:

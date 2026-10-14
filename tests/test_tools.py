@@ -15,9 +15,12 @@ from mini_code_agent.tools import (
     ToolRegistry,
     ToolResult,
     default_tools,
+    spill,
     web,
 )
 from mini_code_agent.tools.builtin import echo as builtin_echo
+from mini_code_agent.tools.safety import MAX_TOOL_CHARS
+from mini_code_agent.tools.spill import TOOL_RESULTS_DIR
 
 ADD_SCHEMA = {
     "type": "object",
@@ -201,6 +204,9 @@ class TestDefaultTools:
             "grep",
             "web_search",
             "web_fetch",
+            # 取落盘结果的那个**排在最后**：工具表是请求前缀的一部分（自动前缀缓存按前缀
+            # 命中），往末尾追加不会让它前面那些的缓存作废，插在中间会。
+            "read_tool_result",
         ]
 
     def test_echo_schema_requires_text(self, ctx):
@@ -375,3 +381,98 @@ class TestToolFiltering:
         )
 
         assert registry.schemas(ctx) == []
+
+
+class TestSpilling:
+    """标了 spill 的工具：结果太长就整篇落盘，上下文里只留预览。
+
+    为什么只有标了的才落盘：截掉了就真没了的那几个工具（命令有副作用、网页会变、
+    取一次要花钱），落盘才有意义。read_file 那一类不落——它的内容本来就是盘上那个文件，
+    `start_line` / `end_line` 能读回来，而读副本还会把 read_state 那条线掐断。
+    """
+
+    LONG = MAX_TOOL_CHARS + 1
+
+    def registry(self, fn, *, spill: bool) -> ToolRegistry:
+        return ToolRegistry([Tool(name="chatty", fn=fn, spill=spill)])
+
+    def call(self, registry: ToolRegistry, ctx: ToolContext) -> ToolResult:
+        return registry.dispatch(ctx, ToolCall(id="t1", name="chatty", arguments={}))
+
+    def spill_files(self, ctx: ToolContext) -> list[Path]:
+        return sorted((ctx.cwd / TOOL_RESULTS_DIR).glob("chatty-*.txt"))
+
+    def test_a_long_result_lands_on_disk_whole(self, ctx):
+        text = "行\n" * self.LONG
+
+        result = self.call(self.registry(lambda kwargs, c: text, spill=True), ctx)
+
+        saved = self.spill_files(ctx)
+        assert len(saved) == 1
+        assert saved[0].read_text(encoding="utf-8") == text  # 一个字都没少
+        assert str(saved[0].stem) in result.result
+
+    def test_the_context_only_gets_a_preview(self, ctx):
+        result = self.call(
+            self.registry(lambda kwargs, c: "x" * self.LONG, spill=True), ctx
+        )
+
+        assert result.result.startswith("[输出太长")
+        assert "read_tool_result" in result.result
+        assert len(result.result) < MAX_TOOL_CHARS
+
+    def test_the_message_says_how_many_lines_there_are(self, ctx):
+        """真正要用的常在末尾，而模型只看得到开头——不告诉它多少行，它没法直接翻到最后。"""
+        text = "行\n" * self.LONG
+        lines = text.count("\n") + 1
+
+        result = self.call(self.registry(lambda kwargs, c: text, spill=True), ctx)
+
+        assert f"{lines:,} 行" in result.result
+
+    def test_a_short_result_is_not_spilled(self, ctx):
+        result = self.call(self.registry(lambda kwargs, c: "短", spill=True), ctx)
+
+        assert result.result == "短"
+        assert self.spill_files(ctx) == []
+
+    def test_a_tool_without_the_flag_is_left_alone(self, ctx):
+        """没标 spill 的照旧原样返回——截断是那些工具**自己**的事（各有各的说明）。"""
+        result = self.call(
+            self.registry(lambda kwargs, c: "x" * self.LONG, spill=False), ctx
+        )
+
+        assert len(result.result) == self.LONG
+        assert self.spill_files(ctx) == []
+
+    def test_a_non_string_result_is_left_alone(self, ctx):
+        """只有文本才谈得上落盘；结构化结果由 to_anthropic_block 那边自己序列化。"""
+        result = self.call(self.registry(lambda kwargs, c: {"a": 1}, spill=True), ctx)
+
+        assert result.result == {"a": 1}
+
+    def test_a_failed_spill_falls_back_to_truncating(self, ctx, monkeypatch):
+        """盘写不进去就退回普通限额——不能让一次落盘失败把几 MB 原样放进上下文。"""
+        monkeypatch.setattr(spill, "save", lambda *args, **kwargs: None)
+
+        result = self.call(
+            self.registry(lambda kwargs, c: "x" * self.LONG, spill=True), ctx
+        )
+
+        assert len(result.result) < MAX_TOOL_CHARS + 100
+        assert "已截断" in result.result
+
+    def test_what_was_spilled_can_be_read_back(self, ctx):
+        """落下去的和取回来的必须是同一份——不然这个机制就是在骗模型。"""
+        text = "".join(f"第 {index} 行\n" for index in range(1, self.LONG + 1))
+
+        spilled = self.call(self.registry(lambda kwargs, c: text, spill=True), ctx)
+        name = spilled.result.split('id 传 "')[1].split('"')[0]
+
+        back = default_tools().dispatch(
+            ctx, ToolCall(id="t2", name="read_tool_result", arguments={"id": name})
+        )
+
+        assert back.is_error is False
+        assert "1 | 第 1 行" in back.result
+        assert "100 | 第 100 行" in back.result

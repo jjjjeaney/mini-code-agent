@@ -17,6 +17,7 @@ from typing import Any
 from mini_code_agent.memory import Memory, read, write
 from mini_code_agent.memory.store import TYPES
 from mini_code_agent.tools.base import ToolContext
+from mini_code_agent.tools.safety import MAX_TOOL_CHARS, truncate_text
 
 READ_MEMORY_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -62,8 +63,12 @@ REMEMBER_SCHEMA: dict[str, Any] = {
 
 
 def read_memory(kwargs: dict[str, Any], ctx: ToolContext) -> str:
-    """按名字取一条记忆的正文。"""
-    return read(ctx.cwd, kwargs["name"]).body
+    """按名字取一条记忆的正文。
+
+    正文是模型自己写的，长度本来可控；这里卡一道只是不让它变成一条绕过所有限额的通道
+    （写的时候不限长，读的时候也不限的话，那条通道就一直开着）。
+    """
+    return truncate_text(read(ctx.cwd, kwargs["name"]).body, MAX_TOOL_CHARS)
 
 
 def remember(kwargs: dict[str, Any], ctx: ToolContext) -> str:

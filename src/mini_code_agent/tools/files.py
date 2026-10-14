@@ -3,8 +3,8 @@
 路径一律先过 safety 的围栏：解析、判越界、再决定要不要碰文件系统。
 
 每个工具各自成一体：它用到的小函数都定义在它自己里面，读一个函数就能读懂一个工具。
-唯一的例外是文件最底下那两个（`_checked_path` 和 `_children`），它们被多个工具共用，
-留在模块这一层，理由写在那儿。"""
+例外是几个被多个工具共用的（`_slice_lines`、`_number_lines`、`_checked_path`、
+`_children`），它们留在模块这一层，理由写在那儿。"""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ from mini_code_agent.tools.base import (
 from mini_code_agent.tools.safety import (
     EXCLUDED_DIRS,
     EXCLUDED_FILES,
+    MAX_READ_FILE_CHARS,
+    MAX_TOOL_CHARS,
     SENSITIVE_FILE_PATTERNS,
     NotTextFileError,
     SensitiveFileError,
@@ -42,9 +44,16 @@ from mini_code_agent.tools.safety import (
     should_skip,
     truncate_text,
 )
+from mini_code_agent.tools.spill import TOOL_RESULTS_DIR
 
 DEFAULT_MAX_DEPTH = 5
 DEFAULT_MAX_NODES = 200
+
+# project_tree 那两道闸的**上限**（上面两个是默认值）。没有上限的话，旋钮就攥在模型手里了
+# ——传个 max_nodes: 100000，它就能把整棵树摊进上下文。别的工具的限都在代码里，这里不能是
+# 例外。
+MAX_TREE_DEPTH = 20
+MAX_TREE_NODES = 1000
 
 # grep 最多返回多少条匹配。一条匹配就是一行，不设上限的话搜个 "e" 能把上下文塞满。
 MAX_GREP_MATCHES = 200
@@ -84,6 +93,28 @@ READ_FILE_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["path"],
+}
+
+READ_TOOL_RESULT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": "string",
+            "description": (
+                "落盘结果的名字。某个工具输出太长时，它的结果里会写明存在哪儿、id 是什么，"
+                "照抄那个 id；带不带 .txt 后缀都行"
+            ),
+        },
+        "start_line": {
+            "type": "integer",
+            "description": "从第几行开始读，从 1 数起，默认 1",
+        },
+        "end_line": {
+            "type": "integer",
+            "description": "读到第几行（含这一行），默认读到末尾",
+        },
+    },
+    "required": ["id"],
 }
 
 PROJECT_TREE_SCHEMA: dict[str, Any] = {
@@ -233,7 +264,7 @@ def list_files(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     entries = _children(target)
     if not entries:
         return f"{raw!r} 下面没有可列出的内容：要么是空目录，要么内容都被过滤掉了。"
-    return truncate_text("\n".join(render_level(entries)))
+    return truncate_text("\n".join(render_level(entries)), MAX_TOOL_CHARS)
 
 
 def project_tree(kwargs: dict[str, Any], ctx: ToolContext) -> str:
@@ -295,8 +326,10 @@ def project_tree(kwargs: dict[str, Any], ctx: ToolContext) -> str:
         return lines
 
     root = ctx.cwd.resolve()
-    max_depth = max(1, int(kwargs.get("max_depth") or DEFAULT_MAX_DEPTH))
-    max_nodes = max(1, int(kwargs.get("max_nodes") or DEFAULT_MAX_NODES))
+    # 两道闸都夹在默认值和上限之间：模型给得比默认小就听它的（少列一点是它的自由），
+    # 给得比上限大就按上限来（那是它拿不到的自由）。
+    max_depth = max(1, min(int(kwargs.get("max_depth") or DEFAULT_MAX_DEPTH), MAX_TREE_DEPTH))
+    max_nodes = max(1, min(int(kwargs.get("max_nodes") or DEFAULT_MAX_NODES), MAX_TREE_NODES))
 
     nodes = build(root, depth=1)
     if not nodes:
@@ -305,8 +338,13 @@ def project_tree(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     truncated = keep_breadth_first(nodes)
     text = "\n".join(render(nodes))
     if truncated:
-        text += f"\n\n[已截断：条目数到了上限 {max_nodes}，剩下的没列出来]"
-    return text
+        # 说明放**前面**，不放末尾：下面还要过一道字符数闸，而它的说明按 truncate_text 的
+        # 规矩挂在末尾——两条一起响的时候，末尾这句会被它连同树尾一起截掉。条目数这句更该
+        # 留住（它说的是"树本身就不全"，不是"显示不下"）。
+        text = f"[已截断：条目数到了上限 {max_nodes}，剩下的没列出来]\n\n{text}"
+    # 条目数那道上限和字符数这道是两回事，都得有：一千条短名字也可能把上下文撑满，
+    # 而两百个长名字未必。
+    return truncate_text(text, MAX_TOOL_CHARS)
 
 
 def _number_lines(text: str, start: int) -> str:
@@ -325,6 +363,28 @@ def _number_lines(text: str, start: int) -> str:
     )
 
 
+def _slice_lines(text: str, start_line: Any, end_line: Any) -> tuple[list[str], int, int]:
+    """按行号切一段。返回（选中那几行, 起始行号, 文件总行数）。行号从 1 数起、两头都含。
+
+    read_file 和 read_tool_result 共用——两边的行号语义必须是同一个，"按行号取一段"
+    这件事不该有两套规矩。
+    """
+    lines = text.splitlines()
+    total = len(lines)
+
+    asked_start = None if start_line is None else _line_number(start_line, "start_line")
+    asked_end = None if end_line is None else _line_number(end_line, "end_line")
+    start = 1 if asked_start is None else asked_start
+
+    # 只拿用户自己给的数比。没给 end_line 的时候不能拿"文件末尾"去跟 start 比——
+    # 那样"读一个 2 行文件的第 50 行"会报成范围不成立，而真正的原因是文件没那么长。
+    if asked_end is not None and asked_end < start:
+        raise ValueError(f"end_line({asked_end}) 比 start_line({start}) 还小，这个范围不成立。")
+
+    end = total if asked_end is None else min(asked_end, total)
+    return lines[start - 1 : end], start, total
+
+
 def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     """读一个文本文件，可以只读其中一段。
 
@@ -339,24 +399,6 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     而且能挡住大文件），然后开文件嗅一下是不是文本，最后才解码。任何一步不通过，
     内容都不会被读进来。
     """
-
-    def slice_lines(text: str, start_line: Any, end_line: Any) -> tuple[list[str], int, int]:
-        """按行号切一段。返回（选中那几行, 起始行号, 文件总行数）。行号从 1 数起、两头都含。"""
-        lines = text.splitlines()
-        total = len(lines)
-
-        asked_start = None if start_line is None else _line_number(start_line, "start_line")
-        asked_end = None if end_line is None else _line_number(end_line, "end_line")
-        start = 1 if asked_start is None else asked_start
-
-        # 只拿用户自己给的数比。没给 end_line 的时候不能拿"文件末尾"去跟 start 比——
-        # 那样"读一个 2 行文件的第 50 行"会报成范围不成立，而真正的原因是文件没那么长。
-        if asked_end is not None and asked_end < start:
-            raise ValueError(f"end_line({asked_end}) 比 start_line({start}) 还小，这个范围不成立。")
-
-        end = total if asked_end is None else min(asked_end, total)
-        return lines[start - 1 : end], start, total
-
     root = ctx.cwd.resolve()
     raw = kwargs["path"]
     target = _checked_path(root, raw)
@@ -382,7 +424,7 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
 
     text, mtime_ns, size = _read_text(target, raw)
 
-    selected, start, total = slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line"))
+    selected, start, total = _slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line"))
 
     if not selected:
         # 空文件，或者要从末尾之后开始读。这**不算失败**——只是没有内容可给；下面"读过"
@@ -390,9 +432,12 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
         body = f"{raw!r} 只有 {total} 行，从第 {start} 行开始没有内容了。"
     else:
         # **先编号、再截断**，顺序不能反：编号之后行号就是正文的一部分了，得跟着一起受
-        # MAX_TEXT_CHARS 管着——这样总数仍然守在限额以内，代价只是同样长的文件现在少给几行。
-        # 反过来（先截再编号）会超出限额，而且超多少取决于文件有多少行，那就没边了。
-        body = truncate_text(_number_lines("\n".join(selected), start))
+        # MAX_READ_FILE_CHARS 管着——这样总数仍然守在限额以内，代价只是同样长的文件现在
+        # 少给几行。反过来（先截再编号）会超出限额，而且超多少取决于文件有多少行，那就没边了。
+        #
+        # 这一档比别的工具宽（见 safety.py 里那三个常量的说明）。宽不代表鼓励读满：
+        # 它自带的 start_line / end_line 才是读长文件的正当姿势。
+        body = truncate_text(_number_lines("\n".join(selected), start), MAX_READ_FILE_CHARS)
         # "共几行"这句接在**截断之后**：它是元信息，不是文件里的一行（所以不带行号），也不该
         # 被截断吃掉（以前它就拼在正文里，长文件一截就把它一起吞了）。
         # 只读了一段才说——整篇读下来时，行号本身已经说清了范围，多这句是噪音。
@@ -406,6 +451,56 @@ def read_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     # 不该留下"读过"的痕迹。
     ctx.read_state.record(target, size, mtime_ns)
 
+    return body
+
+
+def read_tool_result(kwargs: dict[str, Any], ctx: ToolContext) -> str:
+    """取一条**落盘的工具结果**（谁落的盘见 tools/spill.py）。
+
+    为什么不能直接用 read_file：落盘在 `.agent/` 底下，那是敏感目录，read_file 连开都不开。
+    那道闸拦的是会话流水和改前备份，不能为了这个去撬它。所以这里是 harness 自己开的第二道
+    门——和 read_memory / read_skill 一个形状：只认自己那个目录里的名字，围栏和符号链接
+    照查。
+
+    读法和 read_file 一致（带行号、可以只取一段），因为落下来的可能就是几 MB 的日志，
+    不分段根本取不完。
+
+    **不记 read_state**：这个文件改不了（`.agent` 在沙箱里是只读挂载，`is_sensitive` 也
+    挡着写），没有"改之前要先读过"这回事。
+    """
+    directory = ctx.cwd.resolve() / TOOL_RESULTS_DIR
+    raw = kwargs["id"]
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("id 得是非空的字符串——引用消息里会给。")
+    name = raw.strip()
+    # 引用消息里印的路径带 .txt，模型可能整个抄过来。两种写法都收，省一次来回。
+    if name.endswith(".txt"):
+        name = name[: -len(".txt")]
+
+    file_name = f"{name}.txt"
+    target = resolve_inside(directory, file_name)
+    link = find_symlink(file_name, directory)
+    if link is not None:
+        raise ValueError(
+            f"{file_name!r} 的路径上有符号链接（{link}）。不顺着链接读——"
+            f"那样读到的可能是另一个文件。"
+        )
+    if not target.is_file():
+        raise FileNotFoundError(
+            f"没有名为 {name!r} 的落盘结果。id 要用引用消息里给的那个（在那个目录里 "
+            f"list_files 一下也行）。"
+        )
+
+    text = target.read_text(encoding="utf-8")
+    selected, start, total = _slice_lines(text, kwargs.get("start_line"), kwargs.get("end_line"))
+
+    if not selected:
+        return f"{name!r} 只有 {total} 行，从第 {start} 行开始没有内容了。"
+
+    body = truncate_text(_number_lines("\n".join(selected), start), MAX_READ_FILE_CHARS)
+    # 和 read_file 同一句，只是措辞按"一个文件"来——这里没有文件名可印，名字就是 id。
+    if start > 1 or start + len(selected) - 1 < total:
+        body += f"\n\n[共 {total} 行]"
     return body
 
 
@@ -596,7 +691,7 @@ def glob(kwargs: dict[str, Any], ctx: ToolContext) -> str:
 
     found.sort(key=lambda item: item[0].as_posix().lower())
     lines = [f"{path.as_posix()}{'/' if is_dir else ''}" for path, is_dir in found]
-    return truncate_text("\n".join(lines))
+    return truncate_text("\n".join(lines), MAX_TOOL_CHARS)
 
 
 def grep(kwargs: dict[str, Any], ctx: ToolContext) -> str:
@@ -775,7 +870,7 @@ def grep(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     body = "\n".join(f"{path}:{number}:{text}" for path, number, text in matches)
     if truncated:
         body += f"\n\n[已截断：匹配数到了上限 {MAX_GREP_MATCHES}，后面还有]"
-    return truncate_text(body)
+    return truncate_text(body, MAX_TOOL_CHARS)
 
 
 # ——— 下面是几个工具共用的，所以没嵌进任何一个工具里 ———

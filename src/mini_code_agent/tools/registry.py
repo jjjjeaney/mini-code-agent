@@ -8,6 +8,7 @@ from typing import Any
 from mini_code_agent.memory import index_text as memory_index
 from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.skills import index_text as skill_index
+from mini_code_agent.tools import spill
 from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
 from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
 from mini_code_agent.tools.files import (
@@ -17,6 +18,7 @@ from mini_code_agent.tools.files import (
     LIST_FILES_SCHEMA,
     PROJECT_TREE_SCHEMA,
     READ_FILE_SCHEMA,
+    READ_TOOL_RESULT_SCHEMA,
     REPLACE_LINES_SCHEMA,
     WRITE_FILE_SCHEMA,
     edit_file,
@@ -25,6 +27,7 @@ from mini_code_agent.tools.files import (
     list_files,
     project_tree,
     read_file,
+    read_tool_result,
     replace_lines,
     write_file,
 )
@@ -34,6 +37,7 @@ from mini_code_agent.tools.memory import (
     read_memory,
     remember,
 )
+from mini_code_agent.tools.safety import MAX_TOOL_CHARS, truncate_text
 from mini_code_agent.tools.shell import SHELL_SCHEMA, bash
 from mini_code_agent.tools.skill import (
     READ_SKILL_FILE_SCHEMA,
@@ -101,8 +105,8 @@ class ToolRegistry:
     def dispatch(self, ctx: ToolContext, call: ToolCall) -> ToolResult:
         """执行一次模型发起的调用，返回可以直接回填进对话的 ToolResult。
 
-        和 run 的区别是这里不往外抛异常：工具失败要作为结果交回模型让它自己改，
-        否则一次工具报错就会终结整轮对话。
+        和 run 的区别有两个：这里不往外抛异常（工具失败要作为结果交回模型让它自己改，
+        否则一次工具报错就会终结整轮对话），以及**超长的结果在这里落盘**。
         """
         try:
             result = self.run(ctx, call.name, call.arguments)
@@ -113,7 +117,28 @@ class ToolRegistry:
                 result=f"{type(exc).__name__}: {exc}",
                 is_error=True,
             )
+        tool = self.tools.get(call.name)
+        # 没注册的工具走不到这儿——上面 run 已经抛过 KeyError 了。
+        if tool is not None and tool.spill:
+            result = _spill_if_too_long(ctx, call.name, result)
         return ToolResult(id=call.id, name=call.name, result=result)
+
+
+def _spill_if_too_long(ctx: ToolContext, name: str, result: Any) -> Any:
+    """太长的结果整篇存到盘上，返回"预览 + 存哪儿"那一段话。
+
+    只有**标了 spill 的工具**会走到这儿（调用方判的）。为什么搁在这一层而不是工具里：
+    工具拿不到"多长算长"这把统一的尺，而落盘这种通用机制也不该在十几个工具里各写一遍。
+
+    落盘失败（盘满、权限不对）就**退回普通限额截断**——不能让一次盘写失败把几 MB 的文本
+    原样放进上下文，那正是这个机制要防的事。
+    """
+    if not isinstance(result, str) or len(result) <= MAX_TOOL_CHARS:
+        return result
+    saved = spill.save(ctx.cwd, name, result)
+    if saved is None:
+        return truncate_text(result, MAX_TOOL_CHARS)
+    return spill.preview_message(result, saved)
 
 
 def default_tools() -> ToolRegistry:
@@ -248,6 +273,8 @@ def default_tools() -> ToolRegistry:
                 # 没开 --shell 就别发：调了也只会拿到一句"没开命令执行"，而模型试这一下
                 # 是要花掉一步的（max_steps 里的一步）。
                 available=lambda ctx: ctx.allow_shell,
+                # 命令的输出取不回来——它有副作用，重跑一遍未必是同一件事。
+                spill=True,
             ),
             Tool(
                 name="glob",
@@ -292,6 +319,22 @@ def default_tools() -> ToolRegistry:
                 fn=web_fetch,
                 params=WEB_FETCH_SCHEMA,
                 available=lambda _: is_configured(),
+                # 正文是花钱取回来的，网页下一刻也可能变——截掉的部分再要就得重新取一次。
+                spill=True,
+            ),
+            Tool(
+                name="read_tool_result",
+                description=(
+                    "取一条**落盘的工具结果**的正文。某个工具的输出太长时，它的结果里会写明"
+                    "完整内容存在哪儿、id 是什么，用那个 id 来取；很长的那种可以配 "
+                    "start_line / end_line 分段读。"
+                ),
+                fn=read_tool_result,
+                params=READ_TOOL_RESULT_SCHEMA,
+                # **故意不加 available**：别的 `.agent` 工具是"有东西才发"（没记忆就没
+                # read_memory），这一个不行——落盘发生在**这一轮之内**，而工具表一轮只算
+                # 一次（在 runagent 开头），按"盘上有没有落盘文件"来判的话，模型在这一轮里
+                # 刚拿到路径、却调不出这个工具。代价是它一直占着一格 schema。
             ),
         ]
     )

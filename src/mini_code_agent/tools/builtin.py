@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from mini_code_agent.tools.base import ToolContext
+from mini_code_agent.tools.safety import MAX_TOOL_CHARS, truncate_text
 
 ECHO_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -18,7 +19,11 @@ ECHO_SCHEMA: dict[str, Any] = {
 
 
 def echo(kwargs: dict[str, Any], ctx: ToolContext) -> str:
-    """把文本打到终端，并回一句确认给模型。"""
+    """把文本打到终端，并回一句确认给模型。
+
+    回给模型的那句也过限额：真正的输出在终端上、用户看得见，回填进对话的这份只是确认，
+    没必要把同一段长文本在上下文里再放一遍（那本来就在模型自己上一条回复里）。
+    """
     text = kwargs["text"]
     print(text)
-    return f"已在终端打印：{text}"
+    return truncate_text(f"已在终端打印：{text}", MAX_TOOL_CHARS)

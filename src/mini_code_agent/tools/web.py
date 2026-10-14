@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from tavily import TavilyClient
 
 from mini_code_agent.tools.base import ToolContext
-from mini_code_agent.tools.safety import truncate_text
+from mini_code_agent.tools.safety import MAX_TOOL_CHARS, truncate_text
 
 load_dotenv()
 
@@ -92,7 +92,9 @@ def web_search(kwargs: dict[str, Any], ctx: ToolContext) -> str:
         if snippet := (item.get("content") or "").strip():
             lines.append(f"    {snippet}")
         blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
+    # 条数已经卡在 MAX_RESULTS_LIMIT 了，这里再卡一道字符数：十条长摘要也能上千字，
+    # 而且那是搜索给我方的、重新搜一次不算贵的量。
+    return truncate_text("\n\n".join(blocks), MAX_TOOL_CHARS)
 
 
 def web_fetch(kwargs: dict[str, Any], ctx: ToolContext) -> str:
@@ -102,8 +104,9 @@ def web_fetch(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     页面里的内容带偏、去取 localhost 或者内网地址——那一下请求发生在 Tavily 那边，够不着你的
     机器。所以这个工具不构成一条"从本机打内网"的路子。
 
-    正文可能很长，按 truncate_text 的限额截断，并在正文里注明截了、原文多长。静默截断最糟：
-    模型会以为页面就这么长，然后照着这个错的认知做事。
+    正文可能很长。**这里不截断**——这个工具在 registry 里标了 spill（见 tools/spill.py）：
+    太长的话由它整篇落盘、上下文里只留一段预览。为什么是落盘而不是截断：这一页是**花钱
+    取回来的**，截掉的部分再要就得重新取一次，而且网页下一刻可能就变了。
 
     一次一个链接。要读好几页就多调几次——同一条回复里可以并列好几个 tool_use，比一次塞一堆
     再让模型自己在正文里找边界强。
@@ -129,4 +132,4 @@ def web_fetch(kwargs: dict[str, Any], ctx: ToolContext) -> str:
             f"取回了 {url}（{title}），但正文是空的——可能是纯图片页、要登录，"
             "或者正文全靠脚本渲染。换个来源试试。"
         )
-    return f"# {title}\n{item.get('url') or url}\n\n{truncate_text(body)}"
+    return f"# {title}\n{item.get('url') or url}\n\n{body}"

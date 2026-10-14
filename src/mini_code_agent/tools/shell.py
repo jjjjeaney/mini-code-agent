@@ -32,8 +32,14 @@ DEFAULT_IMAGE = "mca_sandbox"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 300
 
-# 每条流最多留多少字节。超了继续读但不再留——不继续读的话子进程写满管道会卡死。
-MAX_OUTPUT_BYTES = 8_000
+# 每条流最多留多少字节。**这不是给模型的限额**，是"我们能留住多少原文"——超了继续读但
+# 不再留（不继续读的话子进程写满管道会卡死）。
+#
+# 留得比过去多得多（以前只有 8000）：留下来的这份会被 registry 整篇落盘，上下文里只放
+# 一段预览（见 tools/spill.py）。2 MiB 这个数是有意的——常见的命令输出（测试日志、构建
+# 日志）都在几百 KB 以内，留得住就是整条留得住；再往上是几 MB 的机器输出，多半该用管道
+# 收窄而不是整篇读，而且这份文本还要过一遍涂黑，留太多只是白花时间。
+MAX_CAPTURED_BYTES = 2 * 1024 * 1024
 
 SHELL_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -63,7 +69,11 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     时间到了或者命令卡住了，**杀掉 docker 客户端是不够的**——容器会继续跑。所以超时
     路径会拿 --cidfile 里的 id 去 docker rm -f。（实测过：杀掉客户端之后容器还在。）
 
-    输出会先涂黑（含密钥关键词的整行换掉），再按上限截断。
+    输出会先涂黑（含密钥关键词的整行换掉）。涂黑是**在落盘之前**做的——落下去的那份和
+    给模型看的那份必须是同一份，不然落盘就成了绕开涂黑的一条路。
+
+    太长的话由 registry 整篇落盘、上下文里只留预览（这个工具在那边标了 spill）。所以
+    这里只留得住 MAX_CAPTURED_BYTES 以内——连这个都超的，才真的丢东西。
 
     命令先过一道危险命令黑名单（`safety.py` 的 `DENY_PATTERNS`）：命中就直接拒，不执行。
     那是**启发式、不是边界**——边界是下面这个容器。
@@ -106,7 +116,7 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
                 "没找到 docker 命令。命令执行能力依赖 docker，先装好并让它跑起来。"
             ) from exc
 
-        stdout, stderr, timed_out = _run(process, timeout, cidfile)
+        stdout, stderr, totals, timed_out = _run(process, timeout, cidfile)
 
     if not timed_out and process.returncode == 125:
         # docker run 自己的退出码 125 表示"容器都没起来"，不是命令的失败——
@@ -122,7 +132,7 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
             )
         raise ContainerStartFailedError(f"容器没起来，命令没有执行过。docker 说：{said}{hint}")
 
-    return _format(process.returncode, stdout, stderr, timed_out, timeout)
+    return _format(process.returncode, stdout, stderr, totals, timed_out, timeout)
 
 
 def _timeout(value: Any) -> int:
@@ -211,8 +221,12 @@ def _docker_argv(workspace: Path, command: str, cidfile: Path) -> list[str]:
 
 def _run(
     process: subprocess.Popen[bytes], timeout: int, cidfile: Path
-) -> tuple[bytes, bytes, bool]:
-    """读输出、等它结束；超时就把客户端和容器一起收掉。"""
+) -> tuple[bytes, bytes, tuple[int, int], bool]:
+    """读输出、等它结束；超时就把客户端和容器一起收掉。
+
+    第三个返回值是两条流**各自吐了多少字节**（不是留住多少）。留住的那份超长时会被落盘，
+    一般用不上它；只有连落盘那份都装不下的时候，_format 才需要拿它说清丢了多少。
+    """
     sinks = [{"kept": b"", "total": 0}, {"kept": b"", "total": 0}]
     readers = [
         threading.Thread(target=_drain, args=(process.stdout, sinks[0])),
@@ -235,11 +249,11 @@ def _run(
     for reader in readers:
         reader.join(timeout=10)
 
-    return sinks[0]["kept"], sinks[1]["kept"], timed_out
+    return sinks[0]["kept"], sinks[1]["kept"], (sinks[0]["total"], sinks[1]["total"]), timed_out
 
 
 def _drain(stream: Any, sink: dict[str, Any]) -> None:
-    """把一条管道读到 EOF，但只留前 MAX_OUTPUT_BYTES 字节。
+    """把一条管道读到 EOF，但只留前 MAX_CAPTURED_BYTES 字节。
 
     超了之后**还得继续读**（读到了直接扔），不能停——停了子进程会卡在写那一头。
     """
@@ -250,8 +264,8 @@ def _drain(stream: Any, sink: dict[str, Any]) -> None:
         if not chunk:
             break
         total += len(chunk)
-        if len(kept) < MAX_OUTPUT_BYTES:
-            kept.extend(chunk[: MAX_OUTPUT_BYTES - len(kept)])
+        if len(kept) < MAX_CAPTURED_BYTES:
+            kept.extend(chunk[: MAX_CAPTURED_BYTES - len(kept)])
     stream.close()
     sink["kept"] = bytes(kept)
     sink["total"] = total
@@ -275,9 +289,18 @@ def _force_remove(cidfile: Path) -> None:
 
 
 def _format(
-    exit_code: int, stdout: bytes, stderr: bytes, timed_out: bool, timeout: int
+    exit_code: int,
+    stdout: bytes,
+    stderr: bytes,
+    totals: tuple[int, int],
+    timed_out: bool,
+    timeout: int,
 ) -> str:
-    """把结果拼成给模型看的文本。"""
+    """把结果拼成给模型看的文本。
+
+    totals 是两条流各吐了多少字节。只在超过"留得住的量"时才用得上——那是**真的丢了**：
+    落盘救不回来，因为落下去的也只有留住的那部分。
+    """
     out_text, out_hidden = redact_sensitive(stdout.decode("utf-8", "replace"))
     err_text, err_hidden = redact_sensitive(stderr.decode("utf-8", "replace"))
 
@@ -296,10 +319,11 @@ def _format(
 
     if out_hidden + err_hidden:
         sections.append(f"[已涂黑 {out_hidden + err_hidden} 行：里面出现了疑似密钥的关键词]")
-    if len(stdout) >= MAX_OUTPUT_BYTES or len(stderr) >= MAX_OUTPUT_BYTES:
+    if max(totals) > MAX_CAPTURED_BYTES:
         sections.append(
-            f"[输出被截断：每条流只保留前 {MAX_OUTPUT_BYTES} 字节。"
-            f"想看全就用管道收窄范围，比如 | tail -50]"
+            f"[输出太多：一共 {sum(totals):,} 字节，每条流只留住了前 "
+            f"{MAX_CAPTURED_BYTES:,} 字节，剩下的没留住。"
+            f"要看的部分在后面的话，用管道收窄范围，比如 | tail -50]"
         )
 
     return "\n\n".join(sections)

@@ -17,6 +17,7 @@ from typing import Any
 from mini_code_agent.skills import attachments, read
 from mini_code_agent.tools.base import ToolContext
 from mini_code_agent.tools.safety import (
+    MAX_READ_FILE_CHARS,
     ensure_within_size,
     find_symlink,
     resolve_inside,
@@ -49,9 +50,12 @@ def read_skill(kwargs: dict[str, Any], ctx: ToolContext) -> str:
 
     附件那段**接在截断之后**：它是元信息，被截掉的话模型就不知道有附件了（跟 read_file
     里"共 N 行"那半句同一个道理）。
+
+    限额按**读文件**那一档走，不按普通工具结果那档：正文是"照着做"的步骤，按工具那档
+    截成一段预览，等于让它照着半个步骤做事。
     """
     skill = read(ctx.cwd, kwargs["name"])
-    parts = [truncate_text(skill.body)]
+    parts = [truncate_text(skill.body, MAX_READ_FILE_CHARS)]
 
     files, hidden = attachments(skill)
     if files:
@@ -96,7 +100,8 @@ def read_skill_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     ensure_within_size(target)
 
     try:
-        return truncate_text(target.read_text(encoding="utf-8"))
+        # 同样按读文件那一档：附件是脚本、模板、参考文档，和 read_file 读的东西是一类。
+        return truncate_text(target.read_text(encoding="utf-8"), MAX_READ_FILE_CHARS)
     except UnicodeDecodeError:
         raise ValueError(
             f"{raw!r} 不是 UTF-8 文本（可能是图片、压缩包之类）。这个工具只读文本附件。"

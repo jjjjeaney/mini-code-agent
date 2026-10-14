@@ -133,6 +133,15 @@ class Tool:
     # 它管**：那是闸门的事，而且藏起来会连"为什么不行"那句话一起藏掉。
     available: Callable[[ToolContext], bool] = _always_available
 
+    # 结果太长时**落盘**，上下文里只留一段预览（见 tools/spill.py）。不给就是不落盘，
+    # 超了照旧截断。
+    #
+    # 给谁开、为什么：只给那些**输出取不回来**的工具开。命令有副作用、网页下一刻会变，
+    # 截掉了就是真没了，重跑一遍未必等价。反过来，read_file 就算读满 50000 字符也不该
+    # 落盘——原文件本来就在盘上，start_line / end_line 能读回来，而且**读了会记
+    # read_state**（改成读落盘的副本就断了这条，模型改原件时会被"你还没读过它"拦住）。
+    spill: bool = False
+
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("工具名不能为空")
