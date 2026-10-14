@@ -190,6 +190,8 @@ class TestDefaultTools:
             "read_file",
             "read_memory",
             "remember",
+            "read_skill",
+            "read_skill_file",
             "write_file",
             "edit_file",
             "replace_lines",

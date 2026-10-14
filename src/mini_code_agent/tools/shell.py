@@ -155,6 +155,16 @@ def _docker_argv(workspace: Path, command: str, cidfile: Path) -> list[str]:
         # 项目没有 .git 时不能挂：docker 会因为"源路径不存在"直接失败，容器都起不来。
         mounts += ["--mount", f"type=bind,src={git_dir.as_posix()},dst=/workspace/.git,ro"]
 
+    agent_dir = workspace / ".agent"
+    if agent_dir.exists():
+        # `.agent/` 同理——但理由比 `.git` 还硬：里面装的**全都是"会在宿主机上生效"的东西**
+        # ——会话流水、改前备份、长期记忆、skill。其中 skill 最要紧：它进 system prompt，
+        # 是模型**会照着做的步骤**，所以一条命令往 `.agent/skill/` 里写一个，就等于给下一轮
+        # （同一会话的下一轮，索引每轮重扫）塞一段指令进去。
+        # 挂成只读之后容器里照样看得见（备份和流水都还能读），只是写不进去。
+        # 目录不存在时不挂：docker 会因为"源路径不存在"直接失败，容器都起不来。
+        mounts += ["--mount", f"type=bind,src={agent_dir.as_posix()},dst=/workspace/.agent,ro"]
+
     return [
         "docker",
         "run",

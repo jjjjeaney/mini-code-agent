@@ -33,6 +33,12 @@ from mini_code_agent.tools.memory import (
     remember,
 )
 from mini_code_agent.tools.shell import SHELL_SCHEMA, bash
+from mini_code_agent.tools.skill import (
+    READ_SKILL_FILE_SCHEMA,
+    READ_SKILL_SCHEMA,
+    read_skill,
+    read_skill_file,
+)
 from mini_code_agent.tools.web import WEB_FETCH_SCHEMA, WEB_SEARCH_SCHEMA, web_fetch, web_search
 
 
@@ -154,6 +160,25 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=remember,
                 params=REMEMBER_SCHEMA,
+            ),
+            Tool(
+                name="read_skill",
+                description=(
+                    "取一份 skill 的正文——也就是那份**照着做**的步骤。清单在系统提示里，"
+                    "每份只有名字和一句描述；**动手之前先扫一遍**，对得上就把它读出来按它做。"
+                    "正文末尾会列出这份 skill 还带了哪些附件。"
+                ),
+                fn=read_skill,
+                params=READ_SKILL_SCHEMA,
+            ),
+            Tool(
+                name="read_skill_file",
+                description=(
+                    "取一份 skill 目录里的附件（脚本、模板、参考文档）。"
+                    "有哪些附件 read_skill 会告诉你。只能读那一个 skill 自己目录里的东西。"
+                ),
+                fn=read_skill_file,
+                params=READ_SKILL_FILE_SCHEMA,
             ),
             Tool(
                 name="write_file",

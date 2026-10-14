@@ -21,6 +21,7 @@ from mini_code_agent.prompts import Prompter
 from mini_code_agent.providers.anthropic import AnthropicProvider
 from mini_code_agent.providers.base import Provider
 from mini_code_agent.sessions import Session, load, start, summary_message
+from mini_code_agent.skills import sync_index as sync_skill_index
 from mini_code_agent.summarizing import KEEP_RECENT_TURNS, cut_point, summarize
 from mini_code_agent.system_prompt import build_system_prompt
 from mini_code_agent.tools import ToolRegistry, default_tools
@@ -214,9 +215,10 @@ def main_command(
     registry = default_tools()
     registry.register(make_ask_user(prompter))
     workdir = cwd or Path.cwd()
-    # 让磁盘上那份记忆索引跟目录对齐：手工加/删过记忆的话它会漂（不影响模型——模型看的是
-    # 现算的那份）。只在真不一样时才写，目录不存在就直接返回。
+    # 让磁盘上那两份索引（记忆、技能）跟目录对齐：手工加/删过的话它们会漂（不影响模型——
+    # 模型看的是现算的那份）。只在真不一样时才写，目录不存在就直接返回。
     sync_index(workdir)
+    sync_skill_index(workdir)
     # 会话：接着上一次，或者开一个新的。两个分支共用同一份落盘。**放在 provider 前面**——
     # 接不上的时候该报的是"没有这个会话"，而不是别的什么。
     history: list[dict] = []

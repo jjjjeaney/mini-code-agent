@@ -346,3 +346,46 @@ def test_the_memory_section_tells_it_to_look_before_working(tmp_path):
 
 def test_no_memories_means_no_memory_section(tmp_path):
     assert "长期记忆" not in build_system_prompt(tmp_path, "default")
+
+
+def a_skill(tmp_path, name="release", description="发版前按这个走一遍"):
+    directory = tmp_path / ".agent" / "skill" / name
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(
+        f"---\ndescription: {description}\n---\n\n第一步：跑测试\n", encoding="utf-8"
+    )
+
+
+class TestTheSkillsSection:
+    def test_the_index_lands_in_the_prompt(self, tmp_path):
+        a_skill(tmp_path)
+
+        text = build_system_prompt(tmp_path, "default")
+
+        assert "release" in text
+        assert "发版前按这个走一遍" in text
+        assert "第一步：跑测试" not in text  # 正文不在，那要按需取
+
+    def test_it_says_how_to_load_one_and_its_attachments(self, tmp_path):
+        """**别断言"先扫一遍"那种话**——记忆那节也有同一句，撞上了就是假通过。"""
+        a_skill(tmp_path)
+
+        text = build_system_prompt(tmp_path, "default")
+
+        assert "read_skill" in text
+        assert "read_skill_file" in text  # 附件怎么取也得说，不然模型不知道
+
+    def test_no_skills_means_no_section(self, tmp_path):
+        assert "技能" not in build_system_prompt(tmp_path, "default")
+
+    def test_it_comes_before_the_memory_section(self, tmp_path):
+        """按"变得多勤"排：skill 只在人加删时变，记忆随 remember 长——所以 skill 在前。"""
+        a_skill(tmp_path)
+        write(
+            tmp_path,
+            Memory(name="some-note", description="一条记忆", type="user", body="正文"),
+        )
+
+        text = build_system_prompt(tmp_path, "default")
+
+        assert text.index("技能") < text.index("长期记忆")

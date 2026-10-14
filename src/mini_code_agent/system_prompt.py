@@ -8,8 +8,8 @@
   按原价）。所以这半写得细一点是划算的，但它**每一发都要发**，不是草稿纸——加一条就问一次
   "模型照着这条会做错什么事，不加会做错什么事"。
 - **动态的**：这次运行的实情（日期/平台/模型）、当前档位、从 cwd 到仓库根那几份 `AGENTS.md`
-  的原文、长期记忆的清单、git 状态。按"变得越勤越靠后"排，这样改一处不会把它后面的缓存全
-  冲掉（git 状态最勤——模型每改一个文件它就变，所以垫底）。
+  的原文、技能清单、长期记忆的清单、git 状态。按"变得越勤越靠后"排，这样改一处不会把它后面
+  的缓存全冲掉（git 状态最勤——模型每改一个文件它就变，所以垫底）。
 
 单独一个模块，是因为它要读盘、要认识档位，而 `core/agent.py` 只该拿到一个现成的字符串。
 它只读**环境**——读盘、读几个环境变量、跑几条只读的 git 命令——不碰 provider、不碰会话状态；
@@ -26,6 +26,7 @@ from pathlib import Path
 
 from mini_code_agent.memory import index_text as memory_index
 from mini_code_agent.permissions import RULES_FILE, parse_permission_mode
+from mini_code_agent.skills import index_text as skill_index
 from mini_code_agent.tools.safety import truncate_text
 
 # 跑 git 那几条只读命令最多等多久。仓库太大时 `git status` 可能要好几秒——等不到就当没这回事
@@ -220,8 +221,9 @@ def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = Non
 
     顺序是**按"变得多勤"排的**（勤的靠后）：静态那半永远不变；这次运行的实情一天一变（平台、
     模型一次运行里不动）；档位会在会话里换（`/permission_mode`），但一次运行里通常不动；
-    `AGENTS.md` 跟着仓库走；记忆清单会随 `remember` 长一截；**git 状态最勤**——模型每改一个
-    文件它就变，所以垫底。这样任何一处变了，它**后面**的才掉缓存，前面的照旧命中。
+    `AGENTS.md` 跟着仓库走；技能清单只在人加/删 skill 时变；记忆清单会随 `remember` 长一截；
+    **git 状态最勤**——模型每改一个文件它就变，所以垫底。这样任何一处变了，它**后面**的才掉
+    缓存，前面的照旧命中。
 
     `model` 不给就不写那半句——**不猜**。调用方手上有真 provider 就传 `provider.model`；
     `Provider` 协议故意只声明了 complete（见 providers/base.py），所以这里也不假设它有。
@@ -235,6 +237,18 @@ def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = Non
     rules = _read_rules(cwd)
     if rules:
         parts.append(f"项目自己的规矩（来自 {RULES_FILE}，要遵守）：\n\n{rules}")
+    skills = skill_index(cwd)
+    if skills:
+        # 跟记忆那节同一个道理，而且更严重：光把清单摆出来，模型不会主动去取（实测过）。
+        # skill 还多一层——**它不会觉得自己需要一个自己不知道存在的东西**，所以那句"先扫一遍"
+        # 必须写，而且描述得是"什么时候用得上"，不是"这是什么"。
+        parts.append(
+            "你有一份**技能**清单（每份只有名字和一句话，正文要按需取）。**动手之前先扫一遍**："
+            "哪份对得上手头这件事，就先用 read_skill 把正文读出来，**按它写的步骤做**——"
+            "别照着那一句话猜，那只是个目录条目。skill 里可能还带附件（脚本、模板、参考文档），"
+            "read_skill 会列出来，要哪个用 read_skill_file 取。\n\n"
+            f"{skills}"
+        )
     index = memory_index(cwd)
     if index:
         # 只有清单，正文靠 read_memory 按需取——这段每轮都要发，也要稳（缓存前缀）。

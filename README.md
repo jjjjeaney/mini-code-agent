@@ -57,6 +57,7 @@ src/mini_code_agent/
 ├── providers/      # LLM 后端适配层，base.py 定义 Protocol
 ├── tools/          # 工具协议与实现
 ├── memory/         # 跨会话长期记忆
+├── skills/         # 技能：一份一份"照着做"的步骤
 ├── sessions/       # 单次会话的 transcript 持久化
 └── commands/       # 斜杠命令（CLI 表现层）
 ```

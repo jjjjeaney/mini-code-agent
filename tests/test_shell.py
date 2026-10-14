@@ -105,6 +105,32 @@ class TestBashArguments:
             f"type=bind,src={(tmp_path / '.git').as_posix()},dst=/workspace/.git,ro",
         ]
 
+    def test_the_agent_directory_is_mounted_on_top_read_only(self, tmp_path):
+        """`.agent/` 同理，而理由比 `.git` 还硬：里面装的**全都是"会在宿主机上生效"的东西**
+        ——会话流水、改前备份、长期记忆、skill。其中 skill 是要照做的**步骤**，一条命令往里
+        写一个，就等于给下一轮塞一段指令。"""
+        (tmp_path / ".agent").mkdir()
+
+        argv = _docker_argv(tmp_path, "echo hi", tmp_path / "c.cid")
+
+        assert _mounts(argv) == [
+            f"type=bind,src={tmp_path.as_posix()},dst=/workspace",
+            f"type=bind,src={(tmp_path / '.agent').as_posix()},dst=/workspace/.agent,ro",
+        ]
+
+    def test_the_two_read_only_layers_stack(self, tmp_path):
+        """两个都在的时候就两处（项目目录 → .git → .agent），后面的盖住前面的。"""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".agent").mkdir()
+
+        argv = _docker_argv(tmp_path, "true", tmp_path / "c.cid")
+
+        assert _mounts(argv) == [
+            f"type=bind,src={tmp_path.as_posix()},dst=/workspace",
+            f"type=bind,src={(tmp_path / '.git').as_posix()},dst=/workspace/.git,ro",
+            f"type=bind,src={(tmp_path / '.agent').as_posix()},dst=/workspace/.agent,ro",
+        ]
+
     def test_the_user_command_is_one_single_argument(self, tmp_path):
         """整条命令作为一个 argv 元素交给容器里的 /bin/sh -c：宿主机这层没有 shell
         参与，所以没有注入可言；容器里再解释一遍是刻意的。"""
@@ -191,6 +217,25 @@ class TestBashInDocker:
         assert "wrote" in out
         assert "blocked" in out
         assert (tmp_path / "new.txt").exists()
+
+    def test_it_can_read_the_agent_directory_but_not_write_it(self, shell_ctx, tmp_path):
+        """`.agent/` 挂的是只读：容器里照样看得见（备份、流水都还能读），但写不进去。
+
+        这条要 docker 才跑得起来——所以拼参数那份断言（TestBashArguments）是主力，
+        这条是"真跑一下也确实是这么回事"。
+        """
+        (tmp_path / ".agent").mkdir()
+        (tmp_path / ".agent" / "note.md").write_text("看得见吗", encoding="utf-8")
+
+        command = (
+            "cat /workspace/.agent/note.md && "
+            "touch /workspace/.agent/x || echo blocked"
+        )
+        out = bash({"command": command}, shell_ctx)
+
+        assert "看得见吗" in out  # 读得到
+        assert "blocked" in out  # 写不了
+        assert not (tmp_path / ".agent" / "x").exists()
 
     def test_output_is_redacted(self, shell_ctx):
         out = bash({"command": "echo 'DEEPSEEK_API_KEY=sk-live-abcdef'"}, shell_ctx)
