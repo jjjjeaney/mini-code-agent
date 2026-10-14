@@ -646,49 +646,28 @@ class TestMultiTurn:
         assert [m["role"] for m in provider.calls[0]["messages"]] == ["user"]
 
 
-def folded_blocks(messages: list[dict]) -> list[dict]:
-    """这份 messages 里被折掉的工具结果。"""
-    return [
-        block
-        for message in messages
-        if isinstance(message.get("content"), list)
-        for block in message["content"]
-        if block.get("type") == "tool_result" and "折叠" in str(block.get("content"))
-    ]
+def test_each_request_only_appends_to_the_previous_one():
+    """后一发请求必须是"前一发 + 尾巴"——**前面一个字节都不改**。
 
+    这不是风格问题，是省钱的前提：这个端点的缓存以**整个请求**为单位匹配，只追加就几乎全
+    命中，中间改一处就几乎全不中（实测 18,560 → 384 命中，每步贵 6 倍，见 known-issues 的
+    D5）。以前这里有一层"折叠"（把旧的工具结果换成占位符），删掉之后这条才成立——得有东西
+    守着它，不然谁再往中间加一层变换，账单上看不出来。
+    """
+    def dump(kwargs: dict, ctx: ToolContext) -> str:
+        return "x" * 3000
 
-class TestTrimming:
-    """旧的、长的工具结果发出去之前折掉——但留下的那份还是完整的。"""
+    registry = ToolRegistry([Tool(name="dump", description="", fn=dump, params={})])
+    provider = ScriptedProvider(
+        [*(tool_turn(f"t{i}", "dump", {}) for i in range(9)), text_turn("好了")]
+    )
 
-    def a_dump_registry(self) -> ToolRegistry:
-        def dump(kwargs: dict, ctx: ToolContext) -> str:
-            return "x" * 3000
+    # 九条结果——超过"最近八条"那个窗口，以前的折叠正是在这一步开始动的
+    runagent("读九次", provider, registry, max_steps=9)
 
-        return ToolRegistry([Tool(name="dump", description="", fn=dump, params={})])
-
-    def nine_dumps(self) -> ScriptedProvider:
-        return ScriptedProvider(
-            [*(tool_turn(f"t{i}", "dump", {}) for i in range(9)), text_turn("好了")]
-        )
-
-    def test_what_is_sent_is_folded_but_what_is_kept_is_whole(self):
-        provider = self.nine_dumps()
-
-        result = runagent("读九次", provider, self.a_dump_registry(), max_steps=9)
-
-        # 发出去的最后那次里，最旧的那条折了（一共九条，最近八条留着）
-        assert len(folded_blocks(provider.calls[-1]["messages"])) == 1
-        # 而 returned 的这份（也就是落盘的那份）一条都没折
-        assert folded_blocks(result.messages) == []
-        assert result.messages[2]["content"][0]["content"] == "x" * 3000
-
-    def test_nothing_is_folded_while_the_history_is_short(self):
-        provider = self.nine_dumps()
-
-        runagent("读九次", provider, self.a_dump_registry(), max_steps=9)
-
-        # 第八次请求时手上只有八条结果，正好是"最近八条"，一条都不该折
-        assert folded_blocks(provider.calls[7]["messages"]) == []
+    sent = [call["messages"] for call in provider.calls]
+    for earlier, later in zip(sent, sent[1:], strict=False):
+        assert later[: len(earlier)] == earlier, "后面那一发改动了前面"
 
 
 def test_a_dangerous_command_is_refused_even_after_the_user_says_yes():
@@ -715,9 +694,8 @@ def test_a_dangerous_command_is_refused_even_after_the_user_says_yes():
 def test_the_usage_line_is_printed_for_every_request(capsys):
     """打这一行是为了看缓存有没有省到钱：后端是自动前缀缓存，命中多少只看 cache_read。
 
-    一轮里**每一发**都打，因为要看的是它们之间的变化——正常情况下后一发比前一发的开头长，
-    命中该只增不减；中间要是被什么改动了开头（折叠旧工具结果改的正好是消息列表前排），命中
-    会从那个位置往后掉成 0。
+    一轮里**每一发**都打，因为要看的是它们之间的变化——正常情况下后一发就是前一发再往后接
+    一截，命中该只增不减；哪一步要是掉下来了，就说明有人动了前面。
     """
     provider = ScriptedProvider(
         [

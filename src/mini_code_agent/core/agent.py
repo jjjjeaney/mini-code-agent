@@ -19,7 +19,6 @@ from mini_code_agent.providers.base import (
     TransientProviderError,
 )
 from mini_code_agent.tools import ToolContext, ToolRegistry, ToolResult, default_tools
-from mini_code_agent.trimming import fold_old_tool_results
 
 # 瞬时故障（连不上、超时、限流、对面 5xx）**补一次**之前等多久。
 #
@@ -187,24 +186,6 @@ def runagent(
     # prompter 不放进 ctx：问用户不是工具的能力，确认是这一层在调工具之前发的。
     prompter = prompter if prompter is not None else NullPrompter()
     grants = grants if grants is not None else Grants()
-    reported_folding = False
-
-    def sending() -> list[dict[str, Any]]:
-        """该发出去的那一份：旧的、长的工具结果折掉，顺手报一次账。
-
-        `messages` 本身留着完整的——会话文件和 result.messages 都得是全的；折的只是这一次
-        请求发出去的那份。报账只报一次（每步都报会吵），但每步都得重算：历史在长。
-        """
-        nonlocal reported_folding
-        trimmed = fold_old_tool_results(messages)
-        if trimmed.count and not reported_folding:
-            console.print(
-                f"（折叠了 {trimmed.count} 条旧的工具结果，约 {trimmed.chars} 字符）",
-                style="dim",
-                markup=False,
-            )
-            reported_folding = True
-        return trimmed.messages
 
     def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
         """发一发，顺手把这一发的用量打出来。
@@ -212,11 +193,15 @@ def runagent(
         为什么要看这个：打的后端是**自动**前缀缓存——请求的**开头**和上一次一样，那一部分就
         按便宜价算，请求里不用传任何东西。所以这一行是"缓存到底省到钱没有"的唯一观测手段。
 
-        而且要看的是**同一轮里多次请求之间**的变化：正常情况下后一发比前一发的开头长，命中
-        应该只增不减；要是中间被什么东西改动了开头（比如折叠旧工具结果，它改的正好是消息列表
-        前排），命中就会从那个位置往后全部掉成 0。这一行就是为看这件事打的。
-        """
+        而且要看的是**同一轮里多次请求之间**的变化：正常情况下后一发就是前一发再往后接一截，
+        命中应该只增不减；哪一步要是掉下来了，就说明有人动了前面——那是要查的（这一行就是为
+        看这件事打的）。
 
+        **发出去的就是 `messages` 本身**，中间没有任何裁剪。这不是随手写的：这个端点的缓存
+        以**整个请求**为单位匹配，只追加就几乎全命中，中间改一处就几乎全不中（实测 18,560 →
+        384，见 known-issues 的 D5）。所以"只追加"是省钱的**前提**，而这一行代码正是那个前提
+        的落点——别在这儿加变换。
+        """
         response = provider.complete(sent, **kwargs)
         used = (response.input_tokens, response.output_tokens, response.cache_read_input_tokens)
         # 全是 0 就不吭声——那是假 provider（测试里那些），不是"这一发真的没花钱"。
@@ -255,7 +240,7 @@ def runagent(
 
     try:
         for _ in range(max_steps):
-            response = ask(sending(), tools=tools, system=system)
+            response = ask(messages, tools=tools, system=system)
 
             if not response.tool_calls:
                 final = response.text
@@ -293,7 +278,7 @@ def runagent(
         if final is None:
             instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"
             messages.append({"role": "user", "content": instruction})
-            response = ask(sending(), system=system)
+            response = ask(messages, system=system)
             final = response.text
             if final is not None:
                 trace.append(final)
