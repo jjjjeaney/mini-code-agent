@@ -100,6 +100,14 @@ class ToolContext:
     read_state: ReadFileState=field(default_factory=ReadFileState)
     allow_shell: bool = False
 
+    # 落盘的工具结果往哪儿放（见 tools/spill.py）。CLI 传的是**这次会话的目录**
+    # （`.agent/tool-results/<会话 id>/`），这样删会话时能一起端掉。
+    #
+    # 缺省（None）落在项目下那个共用的目录里——测试、以及不经 CLI 直接调 runagent 的
+    # 走的都是这条。传的是**一个目录**而不是会话 id：工具层不需要认识"会话"这个概念，
+    # 它只需要知道往哪儿放。
+    spill_dir: Path | None = None
+
 
 def _always_available(_: ToolContext) -> bool:
     """默认：一直能用。绝大多数工具都是这样。"""

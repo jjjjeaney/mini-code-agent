@@ -135,10 +135,14 @@ def _spill_if_too_long(ctx: ToolContext, name: str, result: Any) -> Any:
     """
     if not isinstance(result, str) or len(result) <= MAX_TOOL_CHARS:
         return result
-    saved = spill.save(ctx.cwd, name, result)
+    saved = spill.save(ctx, name, result)
     if saved is None:
         return truncate_text(result, MAX_TOOL_CHARS)
-    return spill.preview_message(result, saved)
+    # 给模型看的路径尽量相对项目根（它自己就在那儿活动）；万一不在（spill_dir 被指到别处），
+    # 退回绝对路径，总比印一条错的强。
+    inside = saved.is_relative_to(ctx.cwd)
+    where = saved.relative_to(ctx.cwd).as_posix() if inside else saved.as_posix()
+    return spill.preview_message(result, name=saved.stem, where=where)
 
 
 def default_tools() -> ToolRegistry:

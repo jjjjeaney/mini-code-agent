@@ -44,7 +44,7 @@ from mini_code_agent.tools.safety import (
     should_skip,
     truncate_text,
 )
-from mini_code_agent.tools.spill import TOOL_RESULTS_DIR
+from mini_code_agent.tools.spill import TOOL_RESULTS_DIR, find_spilled
 
 DEFAULT_MAX_DEPTH = 5
 DEFAULT_MAX_NODES = 200
@@ -465,6 +465,10 @@ def read_tool_result(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     读法和 read_file 一致（带行号、可以只取一段），因为落下来的可能就是几 MB 的日志，
     不分段根本取不完。
 
+    找的是**名字**、不是路径：文件按会话分在子目录里（`<会话 id>/<名字>.txt`），而模型手上
+    只有引用消息里给的那个名字——它不知道也不该知道那是哪次会话的文件。围栏开在整个
+    `tool-results/` 上（能搜到任何一次会话的），理由见 spill.py 的模块说明。
+
     **不记 read_state**：这个文件改不了（`.agent` 在沙箱里是只读挂载，`is_sensitive` 也
     挡着写），没有"改之前要先读过"这回事。
     """
@@ -476,19 +480,25 @@ def read_tool_result(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     # 引用消息里印的路径带 .txt，模型可能整个抄过来。两种写法都收，省一次来回。
     if name.endswith(".txt"):
         name = name[: -len(".txt")]
+    # **只认名字本身，不认路径**——id 就是 `bash-0123abcd` 这种。带路径的一律拒，理由不是
+    # 安全（下面还有围栏兜着），而是"你这个 id 格式不对"比"越界了"更能指出该改什么。
+    if name != Path(name).name:
+        raise ValueError(f"id 只能是名字本身，不带路径（收到的是 {raw!r}）。")
 
-    file_name = f"{name}.txt"
-    target = resolve_inside(directory, file_name)
-    link = find_symlink(file_name, directory)
+    relative = find_spilled(ctx.cwd, name)
+    if relative is None:
+        raise FileNotFoundError(
+            f"没有名为 {name!r} 的落盘结果。id 要用引用消息里给的那个。"
+        )
+    # 围栏。上面那两道（拒路径、只按名字搜）已经堵住了，这一句是**兜底**：它守的是"读什么
+    # 都在 tool-results/ 里面"这条线，以后 find_spilled 要是放宽了（比如允许带会话名前缀），
+    # 它还在。
+    target = resolve_inside(directory, relative)
+    link = find_symlink(relative, directory)
     if link is not None:
         raise ValueError(
-            f"{file_name!r} 的路径上有符号链接（{link}）。不顺着链接读——"
+            f"{relative!r} 的路径上有符号链接（{link}）。不顺着链接读——"
             f"那样读到的可能是另一个文件。"
-        )
-    if not target.is_file():
-        raise FileNotFoundError(
-            f"没有名为 {name!r} 的落盘结果。id 要用引用消息里给的那个（在那个目录里 "
-            f"list_files 一下也行）。"
         )
 
     text = target.read_text(encoding="utf-8")

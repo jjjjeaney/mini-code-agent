@@ -15,7 +15,8 @@ from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCal
 from mini_code_agent.sessions import SESSIONS_DIR, Session, load, start
 from mini_code_agent.summarizing import MAX_HISTORY_CHARS
 from mini_code_agent.system_prompt import build_system_prompt
-from mini_code_agent.tools import Tool, ToolRegistry
+from mini_code_agent.tools import Tool, ToolRegistry, spill
+from mini_code_agent.tools.safety import MAX_TOOL_CHARS
 
 
 class ScriptedProvider:
@@ -433,3 +434,45 @@ def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
             delete_="20200101-000000",
             yes=True,
         )
+
+
+def test_spilled_output_lands_in_this_sessions_directory(monkeypatch, tmp_path):
+    """走一遍完整的：CLI 把**这次会话的目录**交给工具层，太长的输出就落在那里。
+
+    落在会话目录里，`--delete` 才谈得上"连同落盘文件一起删"。不传的话会落到共用的
+    `.agent/tool-results/` 里，那些文件谁也认不出来。
+    """
+    chatty = Tool(
+        name="chatty",
+        fn=lambda kwargs, ctx: "x" * (MAX_TOOL_CHARS + 1),
+        spill=True,
+    )
+    provider = ScriptedProvider([tool_turn("t1", "chatty", {}), text_turn("看完了")])
+
+    session = run_loop(
+        monkeypatch, provider, ["跑一下", "/exit"], tmp_path, registry=ToolRegistry([chatty])
+    )
+
+    saved = list(spill.session_dir(tmp_path, session.id).glob("chatty-*.txt"))
+    assert len(saved) == 1
+    assert saved[0].read_text(encoding="utf-8") == "x" * (MAX_TOOL_CHARS + 1)
+
+
+def test_delete_takes_the_spilled_files_with_it(tmp_path, capsys, monkeypatch):
+    """落盘的工具结果属于那次会话——删会话要一起端掉，而且**动手之前要说清有几个**。"""
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append([{"role": "user", "content": "跑了一条很长的命令"}])
+    directory = spill.session_dir(tmp_path, session.id)
+    directory.mkdir(parents=True)
+    (directory / "bash-abc123.txt").write_text("很长的输出", encoding="utf-8")
+
+    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: False)
+    run_delete(tmp_path, session.id, yes=False)
+    capsys.readouterr()
+    assert directory.exists()  # 答了"不删"，那批文件一个都不动
+
+    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: True)
+    run_delete(tmp_path, session.id, yes=False)
+
+    assert "1 个落盘文件" in capsys.readouterr().out
+    assert not directory.exists()

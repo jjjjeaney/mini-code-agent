@@ -24,7 +24,7 @@ from mini_code_agent.sessions import Session, delete, describe, load, start, sum
 from mini_code_agent.skills import sync_index as sync_skill_index
 from mini_code_agent.summarizing import KEEP_RECENT_TURNS, cut_point, summarize
 from mini_code_agent.system_prompt import build_system_prompt
-from mini_code_agent.tools import ToolRegistry, default_tools
+from mini_code_agent.tools import ToolRegistry, default_tools, spill
 
 app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
 
@@ -139,6 +139,10 @@ def _chat(
                 prompter=prompter,
                 grants=grants,
                 messages=state.messages,
+                # 落盘的工具结果按**这次会话**分目录（`.agent/tool-results/<id>/`），
+                # 这样 `--delete` 能连同这些文件一起删。session.id 在 start() 那一刻就定死
+                # 了，跑到一半不会变。
+                spill_dir=spill.session_dir(cwd, session.id),
             )
             # 落盘、接下历史——两边要的是同一批东西：这一轮新增的那几条。
             # 长度得在 messages 被换掉**之前**取。
@@ -178,6 +182,11 @@ def _delete_session(cwd: Path, session_id: str, *, assume_yes: bool) -> None:
         raise typer.BadParameter(str(exc), param_hint="--delete") from None
 
     what = f"{target.messages} 条消息" if target.messages else "没说过话"
+    spilled = spill.count_session(cwd, target.id)
+    if spilled:
+        # **要一起删的也得说出来**。只报"删掉某次会话"的话，用户不知道还端掉了一批落盘文件
+        # ——那里面可能正是他想留着的东西（某条命令的完整输出）。
+        what += f"，连同 {spilled} 个落盘文件"
     console.print(f"要删的是 {target.id}（{what}）", style="bold", markup=False)
     if target.preview:
         console.print(f"  最后一句：「{target.preview}」", markup=False)
@@ -185,6 +194,8 @@ def _delete_session(cwd: Path, session_id: str, *, assume_yes: bool) -> None:
         console.print("没删。", markup=False)
         return
     delete(cwd, target.id)
+    # 落盘的工具结果属于这次会话，跟着一起端掉（见 tools/spill.py）。
+    spill.remove_session(cwd, target.id)
     console.print(f"删掉了 {target.id}。", markup=False)
 
 
@@ -291,6 +302,7 @@ def main_command(
             prompter=prompter,
             grants=grants,
             messages=history,
+            spill_dir=spill.session_dir(workdir, session.id),
         )
         # 长度得在 history 被换掉之前取——和 _chat 里同一处道理。
         session.append(result.messages[len(history) :])

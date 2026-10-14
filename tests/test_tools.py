@@ -476,3 +476,15 @@ class TestSpilling:
         assert back.is_error is False
         assert "1 | 第 1 行" in back.result
         assert "100 | 第 100 行" in back.result
+    def test_it_spills_into_the_session_directory_when_one_is_given(self, tmp_path):
+        """CLI 传的是**这次会话的目录**——删会话时能跟着一起端掉（见 tools/spill.py）。"""
+        session_dir = tmp_path / ".agent" / "tool-results" / "20260101-000000-0001abcd"
+        ctx = ToolContext(cwd=tmp_path, spill_dir=session_dir)
+
+        result = self.call(self.registry(lambda kwargs, c: "x" * self.LONG, spill=True), ctx)
+
+        saved = list(session_dir.glob("chatty-*.txt"))
+        assert len(saved) == 1
+        assert saved[0].read_text(encoding="utf-8") == "x" * self.LONG
+        # 给模型看的那条路径要指到会话目录里去，不能只说个文件名
+        assert ".agent/tool-results/20260101-000000-0001abcd/chatty-" in result.result

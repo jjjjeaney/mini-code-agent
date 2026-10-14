@@ -159,6 +159,39 @@ def test_without_a_registry_the_default_tools_are_used(tmp_path):
     assert provider.calls[0]["tools"] == default_tools().schemas(ToolContext(tmp_path))
 
 
+def test_spill_dir_reaches_the_tools(tmp_path):
+    """落盘目录要一路走到工具层——CLI 靠它把落盘文件按会话分目录（删会话时跟着删）。"""
+    seen = {}
+
+    def peek(kwargs: dict, ctx: ToolContext) -> str:
+        seen["spill_dir"] = ctx.spill_dir
+        return "看到了"
+
+    registry = ToolRegistry([Tool(name="peek", fn=peek)])
+    provider = ScriptedProvider([tool_turn("toolu_1", "peek", {}), text_turn("好")])
+    where = tmp_path / ".agent" / "tool-results" / "20260101-000000-0001abcd"
+
+    runagent("看一眼", provider, registry, cwd=tmp_path, spill_dir=where)
+
+    assert seen["spill_dir"] == where
+
+
+def test_spill_dir_defaults_to_nothing(tmp_path):
+    """不传（测试、以及不经 CLI 直接调 runagent 的）就是 None——工具层自己去落共用的目录。"""
+    seen = {}
+
+    def peek(kwargs: dict, ctx: ToolContext) -> str:
+        seen["spill_dir"] = ctx.spill_dir
+        return "看到了"
+
+    registry = ToolRegistry([Tool(name="peek", fn=peek)])
+    provider = ScriptedProvider([tool_turn("toolu_1", "peek", {}), text_turn("好")])
+
+    runagent("看一眼", provider, registry, cwd=tmp_path)
+
+    assert seen["spill_dir"] is None
+
+
 def test_multiple_tool_rounds_interleave_calls_and_results(registry):
     provider = ScriptedProvider(
         [

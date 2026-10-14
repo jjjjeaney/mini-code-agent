@@ -663,10 +663,14 @@ class TestReadToolResult:
             read_tool_result({"id": "nope"}, ctx)
 
     def test_it_cannot_escape_its_own_directory(self, project, ctx):
-        """这道门只认 `.agent/tool-results/` 里的名字——`..` 不能带它出去。"""
+        """这道门只认 `.agent/tool-results/` 里的**名字**——带路径的一律拒。
+
+        拒的理由不是安全（围栏还在后头兜着），而是措辞：说"你这个 id 格式不对"比说"越界了"
+        更能让模型知道该改什么。
+        """
         (project / "secret.txt").write_text("项目里的文件", encoding="utf-8")
 
-        with pytest.raises(OutOfSandboxError):
+        with pytest.raises(ValueError, match="只能是名字本身"):
             read_tool_result({"id": "../secret"}, ctx)
 
     def test_a_symlink_inside_the_directory_is_still_refused(self, project, ctx):
@@ -1492,3 +1496,19 @@ class TestGrepWithRipgrep:
         (project / "a.txt").write_text("needle\n", encoding="utf-8")
 
         assert grep({"pattern": "needle"}, ctx) == "a.txt:1:needle"
+
+    def test_it_finds_a_file_inside_a_session_directory(self, project, ctx):
+        """文件按会话分在子目录里，而模型手上只有那个名字——所以是**搜**出来的。"""
+        directory = project / TOOL_RESULTS_DIR / "20260101-000000-0001abcd"
+        directory.mkdir(parents=True)
+        (directory / "bash-abcd1234.txt").write_text("正文\n", encoding="utf-8")
+
+        assert "正文" in read_tool_result({"id": "bash-abcd1234"}, ctx)
+
+    def test_an_old_flat_file_is_still_found(self, project, ctx):
+        """根下平铺的那些是这次改动之前留下的，引用它们的 transcript 还在——照样得找得到。"""
+        directory = project / TOOL_RESULTS_DIR
+        directory.mkdir(parents=True)
+        (directory / "bash-old1234.txt").write_text("老文件\n", encoding="utf-8")
+
+        assert "老文件" in read_tool_result({"id": "bash-old1234"}, ctx)

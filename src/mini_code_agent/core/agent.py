@@ -157,6 +157,7 @@ def runagent(
     prompter: Prompter | None = None,
     grants: Grants | None = None,
     messages: list[dict[str, Any]] | None = None,
+    spill_dir: Path | None = None,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -171,11 +172,13 @@ def runagent(
     不在这儿新建）——不传就是空的，等于每轮都重新问。
     messages 是之前几轮的消息：把上一次的 result.messages 传回来就接着聊，不传就是新会话。
     传进来那份**不会**被就地改——返回的是新的一份。
+    spill_dir 是"太长而落盘的工具结果往哪儿放"，CLI 那边给的是这一次会话的目录
+    （`.agent/tool-results/<会话 id>/`），这样删会话时能一起端掉；不传就落在共用的目录里。
     """
     registry = registry if registry is not None else default_tools()
     # ctx 得在挑工具**之前**建：哪些工具此刻能用，是照着它判的（没开 shell 就没有 bash）。
     # 一轮之内这张表是固定的——每步重算的话，缓存前缀会被反复冲掉（工具那半占前缀一多半）。
-    ctx = ToolContext(cwd or Path.cwd(), allow_shell=allow_shell)
+    ctx = ToolContext(cwd or Path.cwd(), allow_shell=allow_shell, spill_dir=spill_dir)
     tools = registry.schemas(ctx)
     # 新拼一份，别就地改调用方手里那份。
     messages = [*(messages or []), {"role": "user", "content": prompt}]
