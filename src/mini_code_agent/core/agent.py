@@ -28,6 +28,21 @@ RETRY_PAUSE_SECONDS = 3.0
 
 
 @dataclass
+class ContextAnchor:
+    """「这一发请求有多大」的一个快照。压缩阈值靠它（见 summarizing.context_size）。
+
+    `tokens` 是那一发的输入总量——三个输入字段相加（它们不重叠，见 `_usage_note`）。
+    `covered` 是**那一发请求里实际装了多少条 messages**。
+
+    **两个必须来自同一发**，而 `covered` 尤其不能拿 `AgentResult.messages` 的长度去顶：那份
+    比发出去的长——响应是先拿到的，assistant 那条是之后才 append 进去的。
+    """
+
+    tokens: int
+    covered: int
+
+
+@dataclass
 class AgentResult:
     final: str | None
     trace: list[str]
@@ -38,6 +53,14 @@ class AgentResult:
     # **它和"用满步数"不一样**：那个是模型自己没在给定步数内收尾，这个是根本没能把请求发出去。
     # 调用方要分开说——前者提一句就行，后者要告诉用户"再发一次"还是"去查配置"。
     error: str | None = None
+
+    # 这一轮里**带工具的那最后一发**有多大。一发都没发出去过（假 provider 不报用量）就是 None
+    # ——那时调用方只能按字符粗估，别把它当成"很小"。
+    #
+    # **为什么是"带工具的最后一发"而不是"最后发"**：用满步数时最后那一发是不带 tools 的收尾
+    # 请求（见下面循环尾巴），它少了整段工具 schema，而那一大段占了前缀的一多半。拿它当锚点会
+    # 系统性小看半个前缀。
+    anchor: ContextAnchor | None = None
 
 
 def _usage_note(response: ModelResponse) -> str:
@@ -186,6 +209,8 @@ def runagent(
     # prompter 不放进 ctx：问用户不是工具的能力，确认是这一层在调工具之前发的。
     prompter = prompter if prompter is not None else NullPrompter()
     grants = grants if grants is not None else Grants()
+    # 这一轮里"带工具的那最后一发"有多大——见 ContextAnchor 的说明。
+    anchor: ContextAnchor | None = None
 
     def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
         """发一发，顺手把这一发的用量打出来。
@@ -202,11 +227,23 @@ def runagent(
         384，见 known-issues 的 D5）。所以"只追加"是省钱的**前提**，而这一行代码正是那个前提
         的落点——别在这儿加变换。
         """
+        nonlocal anchor
+
         response = provider.complete(sent, **kwargs)
         used = (response.input_tokens, response.output_tokens, response.cache_read_input_tokens)
         # 全是 0 就不吭声——那是假 provider（测试里那些），不是"这一发真的没花钱"。
         if not any(used):
             return response
+        if kwargs.get("tools"):
+            # 只认**带工具**的那几发（理由见 ContextAnchor）：用满步数收尾那一发不带 tools。
+            anchor = ContextAnchor(
+                tokens=(
+                    response.input_tokens
+                    + response.cache_read_input_tokens
+                    + response.cache_creation_input_tokens
+                ),
+                covered=len(sent),
+            )
         console.print(f"（这一发 token：{_usage_note(response)}）", style="dim", markup=False)
         return response
 
@@ -290,5 +327,7 @@ def runagent(
         # 消息必须跟着返回、跟着落盘。丢了的话下一轮模型会以为没发生过，把副作用再做一遍。
         #
         # 在这儿接住而不是往上抛，就是为了这个：异常路径拿不到 locals 里的 messages。
-        return AgentResult(final=None, trace=trace, messages=messages, error=str(exc))
-    return AgentResult(final=final, trace=trace, messages=messages)
+        return AgentResult(
+            final=None, trace=trace, messages=messages, error=str(exc), anchor=anchor
+        )
+    return AgentResult(final=final, trace=trace, messages=messages, anchor=anchor)

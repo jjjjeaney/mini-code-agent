@@ -11,8 +11,10 @@
 
 几条定下来的：
 
-- **只看字符数**，不引 tokenizer。这是个便宜的代理量，阈值留得比窗口保守——因为压缩本身还
-  要再把这段历史发一次给模型（那次请求一样占地方）。
+- **按"占了窗口多少"判**，不按字符数。`size` 是上一发真请求报的输入总量，`window` 是模型的
+  上下文窗口，够到 `COMPACT_AT` 就压。字符数那条老路量错了东西——窗口吃的是 token，而且
+  算上工具表和系统提示词，字符数两样都漏；而且那个阈值是拍的（注释写着 12 万、常量是 20 万，
+  调过一次没改理由）。
 - **只能切在真正的用户轮上**。切在 `tool_use` 和它的 `tool_result` 之间，后半段就从孤儿
   `tool_result` 开头，请求直接不合法。
 - **压出来的那段当成一条合成的 user 消息**，顶在历史最前面（见 sessions/transcript.py 的
@@ -28,9 +30,15 @@ from typing import Any
 
 from mini_code_agent.providers.base import Provider
 
-# 历史的字符数超过这个就压。粗算：中文约 1 字符 1 token，英文代码约 4 字符 1 token，混着算
-# 大概 2~3 字符 1 token——12 万字符大约 4~5 万 token，离窗口还远，留出压缩那次请求的余量。
-MAX_HISTORY_CHARS = 200_000
+# 占到窗口这个比例就压。
+#
+# 留出来的那部分（20%）不是白留的：`_compact` 是在**新敲的那一行加进来之前**跑的，所以那一
+# 行没算进 size；用户要是粘了一大坨进来，靠的就是这点余量。
+COMPACT_AT = 0.8
+
+# 没有锚点时按字符粗估 token 的系数。**取 2 是保守的**（中文约 1 字符 1 token，英文代码约
+# 4 字符 1 token，混着算 2~3）。估大了触发得早、估小了触发得晚，而早压比晚压安全。
+CHARS_PER_TOKEN = 2
 
 # 最近这么多轮（真正的用户轮）原样留着，只压更早的。
 KEEP_RECENT_TURNS = 6
@@ -50,31 +58,58 @@ SUMMARY_PROMPT = """\
 写成一小段，不要复述工具输出的原文，不要编造没发生过的事。"""
 
 
-def total_chars(messages: list[dict[str, Any]]) -> int:
-    """整段历史有多大（字符数）。算上了块的外壳——那部分也是要发的。"""
-    return sum(len(json.dumps(message, ensure_ascii=False)) for message in messages)
+def rough_tokens(messages: list[dict[str, Any]]) -> int:
+    """按字符粗估这段历史有多少 token。**只在没有锚点的时候用**（见 context_size）。
+
+    算上了块的外壳（`json.dumps` 那一圈）——那部分也是要发的。
+    """
+    chars = sum(len(json.dumps(message, ensure_ascii=False)) for message in messages)
+    return chars // CHARS_PER_TOKEN
+
+
+def context_size(messages: list[dict[str, Any]], *, tokens: int | None, covered: int = 0) -> int:
+    """这段历史现在有多大（token）。够不够阈值就看它。
+
+    **有锚点就用锚点**：`tokens` 是上一发真请求报的输入总量（三个输入字段相加），`covered`
+    是**那一发请求里装了多少条 messages**。两个必须来自**同一发**，而且 `covered` 不能拿
+    `AgentResult.messages` 的长度去顶——那份比发出去的长（响应拿到之后才 append 进去的）。
+
+    锚点自带工具表和系统提示词，那两块字符估算够不着，所以有锚点时不用再补，只补锚点之后
+    新加的那几条。
+
+    **没有锚点**（`tokens` 是 None：会话第一轮、`--resume` 上来还没发过请求、或者刚压完）
+    就整段粗估。
+    """
+    if tokens is None:
+        return rough_tokens(messages)
+    return tokens + rough_tokens(messages[covered:])
 
 
 def cut_point(
     messages: list[dict[str, Any]],
     *,
-    limit: int = MAX_HISTORY_CHARS,
+    size: int,
+    window: int,
     keep_turns: int = KEEP_RECENT_TURNS,
     force: bool = False,
 ) -> int | None:
     """该压就返回切点（`messages[:cut]` 压掉，`messages[cut:]` 留着），否则 None。
 
-    `force=True` 跳过大小那一关，`/compact` 用它——手动那一下的意思就是"不管现在多长，压
-    一次"。**最近 keep_turns 轮仍然原样留着**：那条规矩跟大小无关，它管的是"切在哪儿才合法"
-    （只有真正的用户轮上才下得了刀，见 _safe_cut）。
+    `size` 是这段历史现在有多大（token，见 context_size），`window` 是模型的上下文窗口；
+    够到 `window * COMPACT_AT` 才压。
 
-    不把"强制"写成 `limit=0` 是有意的：那是把阈值拧成一根魔杖，万一哪次手滑把 0 传进了
-    **自动**那条路，每一轮都会把历史压一遍、对话直接毁了。具名参数手滑不出来。
+    **`size` 和 `window` 都没有默认值，是有意的**：默认值不管取哪一侧都会静默走错——取 0 是
+    "永远不压"，取个大数是"每轮都压"，两样都不报错。必填的话忘了传直接 TypeError，那比静默
+    走错强。（`window <= 0` 也判不压：`window_for` 永远给正数，到不了这儿，留着是把"阈值这
+    一侧偏保守"写死。）
 
-    返回 None 有两种情况：还没大到该压（force 时不看这条），或者轮数不够、没有安全的切点。
-    调用方不用区分。
+    `force=True` 跳过大小那一关（`/compact` 用它）：用户点名要压，就不看多大了。两个大小参数
+    照旧要传（调用方手边本来就有），只是这会儿用不上。
+
+    返回 None 有两种情况：还没大到该压（force 时不看这条），或者轮数不够、没有安全的切点
+    （只有真正的用户轮上才下得了刀，见 _safe_cut）。调用方不用区分。
     """
-    if not force and total_chars(messages) <= limit:
+    if not force and (window <= 0 or size <= window * COMPACT_AT):
         return None
     return _safe_cut(messages, keep_turns)
 

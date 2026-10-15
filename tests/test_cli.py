@@ -13,7 +13,6 @@ from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompts import NullPrompter
 from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCall
 from mini_code_agent.sessions import SESSIONS_DIR, Session, load, start
-from mini_code_agent.summarizing import MAX_HISTORY_CHARS
 from mini_code_agent.system_prompt import build_system_prompt
 from mini_code_agent.tools import Tool, ToolRegistry, spill
 from mini_code_agent.tools.safety import MAX_TOOL_CHARS
@@ -33,9 +32,12 @@ class ScriptedProvider:
         return self.responses.pop(0)
 
 
-def text_turn(text: str) -> ModelResponse:
+def text_turn(text: str, *, input_tokens: int = 0) -> ModelResponse:
     return ModelResponse(
-        text=text, assistant_content=[{"type": "text", "text": text}], stop_reason="end_turn"
+        text=text,
+        assistant_content=[{"type": "text", "text": text}],
+        stop_reason="end_turn",
+        input_tokens=input_tokens,
     )
 
 
@@ -277,43 +279,73 @@ def test_the_transcript_lands_on_disk(monkeypatch, tmp_path):
     assert messages[0]["content"] == "第一句"
 
 
-def test_a_long_history_is_compacted_before_the_turn(monkeypatch, tmp_path):
-    """历史太长就先压一次再发：压出来那段顶在最前面，而且留下的那些恢复时还在。"""
-    # 每条按阈值算，不写死数字：阈值从 12 万调到 20 万之后，原来写死的 15_000 就刚好不够了
-    # （10 × 15010 ≈ 151k < 200k），这条测试会静默地退化成"什么都没压"，而断言还是那几条。
-    filler = MAX_HISTORY_CHARS // 8
-    long_history = [
+def an_eight_turn_history() -> list[dict]:
+    """盘上那种"聊了八轮"的历史——够 8 轮，压缩才有安全的切点（最近 6 轮要留着）。"""
+    return [
         message
-        for i in range(10)
+        for i in range(8)
         for message in (
-            {"role": "user", "content": f"第 {i} 句" + "x" * filler},
+            {"role": "user", "content": f"第 {i} 句"},
             {"role": "assistant", "content": [{"type": "text", "text": "好"}]},
         )
     ]
-    # 和真实流程一样：先写进会话，再当成"接着上一次"的那份历史用
-    session = start(tmp_path, permission_mode="default", allow_shell=False)
-    session.append(long_history)
-    provider = ScriptedProvider([text_turn("前面聊过十件事"), text_turn("接着说")])
+
+
+def a_registry_with_one_tool() -> ToolRegistry:
+    """**得有一个工具**：没有的话 `tools` 是空列表，那一发请求就不带工具 schema，
+    `runagent` 也不会拿它当锚点（锚点的判据就是"这一发带了工具"，见 ContextAnchor）。"""
+    return ToolRegistry([Tool(name="noop", fn=lambda kwargs, ctx: "ok")])
+
+
+def test_a_big_context_gets_compacted_before_the_next_turn(monkeypatch, tmp_path):
+    """上一发请求报回来的用量占了窗口八成以上，下一轮就先压一次再发。
+
+    **触发靠的是接口报的真数，不是数出来的字符。** 这段历史本身很小（八轮短句子，几千字符），
+    按老那套字符阈值永远不会压——压它是因为假响应说自己那一发有一百万 token。
+    """
+    provider = ScriptedProvider(
+        [
+            text_turn("第一轮", input_tokens=1_000_000),  # 把锚点顶到窗口以上
+            text_turn("前面聊过八件事"),  # 摘要那一次
+            text_turn("接着说"),  # 压完之后的这一轮
+        ]
+    )
 
     run_loop(
         monkeypatch,
         provider,
-        ["再来一句", "/exit"],
+        ["第一句", "第二句", "/exit"],
         tmp_path,
-        session=session,
-        messages=long_history,
+        messages=an_eight_turn_history(),
+        registry=a_registry_with_one_tool(),
     )
 
-    # 第一次请求是摘要那次：历史后面跟着那条摘要指令
-    assert "摘要" in provider.calls[0][-1]["content"]
-    # 第二次才是真正这一轮，历史已经压过：第一条就是那段摘要
-    assert "前面聊过十件事" in provider.calls[1][0]["content"]
-    # 恢复出来的那份和压过的一致：摘要在最前，压掉的没有，留着的都在
-    _, _, stored = load(tmp_path, session.id)
-    texts = [str(message.get("content")) for message in stored]
-    assert "前面聊过十件事" in texts[0]
-    assert not any("第 0 句" in text for text in texts)  # 被压掉的那几轮
-    assert any("第 4 句" in text for text in texts)  # 留着的
+    # 第一次请求就是第一轮那句本身，前面没有摘要请求
+    assert provider.calls[0][-1]["content"] == "第一句"
+    # 第二次是摘要那次：历史后面跟着那条摘要指令
+    assert "摘要" in provider.calls[1][-1]["content"]
+    # 第三次才是第二轮，历史已经压过：第一条就是那段摘要
+    assert "前面聊过八件事" in provider.calls[2][0]["content"]
+
+
+def test_compaction_does_not_happen_while_the_context_is_small(monkeypatch, tmp_path):
+    """报回来的用量没到阈值就不压——哪怕历史里有很多轮。"""
+    provider = ScriptedProvider(
+        [text_turn("第一轮", input_tokens=1_000), text_turn("第二轮")]
+    )
+
+    run_loop(
+        monkeypatch,
+        provider,
+        ["第一句", "第二句", "/exit"],
+        tmp_path,
+        messages=an_eight_turn_history(),
+        registry=a_registry_with_one_tool(),
+    )
+
+    # 两次请求就是两轮，中间没有摘要那次
+    assert len(provider.calls) == 2
+    assert all("摘要" not in call[-1]["content"] for call in provider.calls)
 
 
 def test_a_short_history_is_not_compacted(monkeypatch, tmp_path):

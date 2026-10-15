@@ -39,6 +39,32 @@ class ChatState:
     # 这一轮要发出去的那份历史（**内存里这份**，不是文件里那份：压过之后前缀换成了摘要）。
     messages: list[dict]
 
+    # 上一次**真请求**报的输入总量，以及那一发当时装了多少条 messages。压缩阈值拿这两个算
+    # （见 summarizing.context_size）。
+    #
+    # **两个必须成对，而且必须来自同一发**——所以要改就一起改（下面那两个方法就是干这个的），
+    # 别在外面单独赋值。`covered` 尤其不能拿 `AgentResult.messages` 的长度去顶：那份比发出去
+    # 的长，响应是先拿到的、assistant 那条是之后才 append 的。
+    #
+    # `context_tokens` 是 None 表示"还没有过真请求"（会话第一轮、`--resume` 上来还没发过、
+    # 或者刚压完），那时只能按字符粗估。
+    context_tokens: int | None = None
+    context_covered: int = 0
+
+    def remember_context(self, tokens: int, covered: int) -> None:
+        """记下锚点：上一次真请求报了多少 token、那一发装了多少条 messages。"""
+        self.context_tokens = tokens
+        self.context_covered = covered
+
+    def forget_context(self) -> None:
+        """锚点作废——消息被压缩换掉了，旧的数还指着压缩前的历史。
+
+        不作废的话下一轮会以为上下文还是那么大：够阈值、又刚好攒够 7 轮，就会再压一次，
+        阈值被架空成"每 7 轮压一次"。清掉之后下一轮退回粗估，再下一轮就有新的真数。
+        """
+        self.context_tokens = None
+        self.context_covered = 0
+
 
 @dataclass
 class CommandContext:
@@ -54,6 +80,11 @@ class CommandContext:
 
     console: Console
     state: ChatState
+    # 这个模型的上下文窗口（token），压缩阈值和 `/status` 都要用它。一次运行里定死，所以放
+    # 在这边（"这次运行的环境，只读"），不放 ChatState。
+    #
+    # 走这条路是为了不碰 provider：同一个约定见下面的注释。
+    window: int
     # 这次运行的环境，只读
     cwd: Path
     allow_shell: bool

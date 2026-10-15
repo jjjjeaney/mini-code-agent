@@ -13,7 +13,7 @@ from rich.console import Console
 from mini_code_agent.commands.base import Command, CommandContext, CommandOutcome
 from mini_code_agent.permissions import PERMISSION_MODES, parse_permission_mode
 from mini_code_agent.sessions import SESSIONS_DIR, list_sessions
-from mini_code_agent.summarizing import MAX_HISTORY_CHARS, total_chars
+from mini_code_agent.summarizing import COMPACT_AT, context_size
 
 # 只在类型标注里用得上，而且那边（registry）反过来要 import 这儿——真去 import 就成环了。
 # 标注本身是懒的（`from __future__ import annotations`），不 import 也跑得起来。
@@ -171,7 +171,14 @@ def make_status() -> Command:
         session = ctx.session
         mode = ctx.state.permission_mode
         shell = "开（跑在一次性容器里，跑完就删）" if ctx.allow_shell else "关（--shell 才打开）"
-        used = total_chars(ctx.state.messages)
+        used = context_size(
+            ctx.state.messages,
+            tokens=ctx.state.context_tokens,
+            covered=ctx.state.context_covered,
+        )
+        # 有锚点就是**真数**（上一发请求报的输入总量），没有就是按字符**估**的。这两个差着
+        # 几十个百分点，不标出来，这个数就没法信。
+        how = "真数" if ctx.state.context_tokens is not None else "估算"
         # 压过没有，用户看不出来——但它决定了模型还记不记得住开头的那些事。
         compacted = "；前面那段已经压成摘要了" if session.has_summary else ""
 
@@ -186,8 +193,8 @@ def make_status() -> Command:
             where = "（还没落盘——说过话才建）"
         ctx.console.print(f"会话文件：{where}", markup=False)
         ctx.console.print(
-            f"历史大小：{len(ctx.state.messages)} 条 / {used:,} 字符"
-            f"（到 {MAX_HISTORY_CHARS:,} 才压）{compacted}",
+            f"历史大小：{len(ctx.state.messages)} 条 / 约 {used:,} token（{how}）"
+            f"（窗口 {ctx.window:,}，到 {int(ctx.window * COMPACT_AT):,} 才压）{compacted}",
             markup=False,
         )
         return "handled"
@@ -223,8 +230,9 @@ def make_sessions() -> Command:
 def make_compact() -> Command:
     """现在就把前面的对话压成一段摘要，不管它多长。
 
-    自动那条路只看大小（`>12 万字符` 才动手，见 summarizing.py）。这一条是"我说了算"：接下来
-    要问一件跟前面全无关的事，先让模型把前面那段收成一段摘要，不必背着整段历史走。
+    自动那条路看的是"占了这个模型的窗口多少"（到 80% 才动手，见 summarizing.py）。这一条是
+    "我说了算"：接下来要问一件跟前面全无关的事，先让模型把前面那段收成一段摘要，不必背着
+    整段历史走。
 
     压的是内存里那份历史，`record_summary` 会在同一步里往会话文件记一笔（`_compact` 内部
     做的），所以 `--resume` 接上来照样认——不是只活在这一次进程里。

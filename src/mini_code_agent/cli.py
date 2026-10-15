@@ -13,6 +13,7 @@ from mini_code_agent.commands import (
     render_session_list,
 )
 from mini_code_agent.console import console
+from mini_code_agent.context_window import window_for
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.memory import sync_index
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
@@ -22,7 +23,7 @@ from mini_code_agent.providers.anthropic import AnthropicProvider
 from mini_code_agent.providers.base import Provider
 from mini_code_agent.sessions import Session, delete, describe, load, start, summary_message
 from mini_code_agent.skills import sync_index as sync_skill_index
-from mini_code_agent.summarizing import KEEP_RECENT_TURNS, cut_point, summarize
+from mini_code_agent.summarizing import KEEP_RECENT_TURNS, context_size, cut_point, summarize
 from mini_code_agent.system_prompt import build_system_prompt
 from mini_code_agent.tools import ToolRegistry, default_tools, spill
 
@@ -30,20 +31,30 @@ app = typer.Typer(add_completion=False, help="最小可用的 coding agent。")
 
 
 def _compact(
-    messages: list[dict], provider: Provider, session: Session, *, force: bool = False
+    messages: list[dict],
+    provider: Provider,
+    session: Session,
+    *,
+    size: int,
+    window: int,
+    force: bool = False,
 ) -> list[dict]:
     """压一次：把旧的那段换成一段摘要，并记进会话。
 
-    `force=False`（默认，"轮与轮之间"那条路）是**太长才压**；`force=True` 是 `/compact`
-    ——用户点名要压，就不看长度了。两条走同一个函数，免得落盘、记账那些事各自漂出去。
+    `size` 是这段历史现在有多大（token），`window` 是模型的上下文窗口——够到 `COMPACT_AT`
+    才压（见 summarizing.cut_point）。`force=True` 是 `/compact`：用户点名要压，就不看大小了，
+    两个参数照旧收着（调用方手边本来就有），由 cut_point 决定用不用。
 
     放在**轮与轮之间**做，不放 runagent 里：那边有个前提——"返回的 messages = 传进去的 +
     追加的那几条"（下面就是靠 result.messages[len(messages):] 落盘的）。压缩会改掉前缀，
     正好把这个前提破坏掉。
 
     摘要调不动就当没压，照常跑这一轮——绝不能因为压缩把会话卡死。
+
+    **返回值是不是同一个 list 就是"压没压"的信号**：没压时原样返回传进来那个（`is` 相等），
+    压了返回一个新的。调用方靠它决定要不要把锚点作废（见 ChatState.forget_context）。
     """
-    cut = cut_point(messages, force=force)
+    cut = cut_point(messages, size=size, window=window, force=force)
     if cut is None:
         return messages
     # 这底下是一次网络往返，慢起来好几秒。自动那条路上它是背景行为，手动那条路上它是用户
@@ -90,22 +101,43 @@ def _chat(
     一个 provider 进来，测试就能拿剧本化的假 provider 跑两轮，看第二轮有没有带上第一轮。
     """
     state = ChatState(permission_mode=permission_mode, messages=messages)
+    # 模型的窗口一次运行里定死，所以不进 ChatState 那个"会变的东西"的盒子（见它的类注释）。
+    window = window_for(model)
+
+    def size_now() -> int:
+        """这段历史现在有多大（token）——有锚点就用锚点，没有就按字符粗估。"""
+        return context_size(
+            state.messages, tokens=state.context_tokens, covered=state.context_covered
+        )
+
+    def compact_once(*, force: bool = False) -> bool:
+        """压一次（够不够大由 force 决定），返回"真压了没有"。"""
+        before = state.messages
+        state.messages = _compact(
+            state.messages, provider, session, size=size_now(), window=window, force=force
+        )
+        if state.messages is before:
+            return False
+        # 消息被换掉了，锚点作废——不作废的话下一轮会以为还是压缩前那么大。见 ChatState。
+        state.forget_context()
+        return True
 
     def compact_now() -> str | None:
         """就地压一次，不管现在多长（`/compact` 用）。返回该跟用户补的一句话。
 
         判"有没有可压的"用的是同一个 cut_point，所以这儿的规矩和自动那条路一模一样：切点
-        必须落在真正的用户轮上，最近几轮一律留着——区别只在于不看长度。
+        必须落在真正的用户轮上，最近几轮一律留着——区别只在于不看大小。
         """
-        if cut_point(state.messages, force=True) is None:
+        if cut_point(state.messages, size=size_now(), window=window, force=True) is None:
             return f"没什么可压的——最近 {KEEP_RECENT_TURNS} 轮一律原样留着，要压得先多聊几轮。"
-        # 切在第几条、成没成，_compact 自己会说；只有它没说到的那些才由这里补。
-        state.messages = _compact(state.messages, provider, session, force=True)
+        # 压在第几条、成没成，_compact 自己会说；只有它没说到的那些才由这里补。
+        compact_once(force=True)
         return None
 
     ctx = CommandContext(
         console=console,
         state=state,
+        window=window,
         cwd=cwd,
         allow_shell=allow_shell,
         session=session,
@@ -125,8 +157,8 @@ def _chat(
                 break
             if outcome == "handled":
                 continue
-            # 太长就压一次再发。放在轮与轮之间，不放进 runagent——理由见 _compact。
-            state.messages = _compact(state.messages, provider, session)
+            # 太大就压一次再发。放在轮与轮之间，不放进 runagent——理由见 _compact。
+            compact_once()
             system = build_system_prompt(cwd, state.permission_mode, model)
             result = runagent(
                 line,
@@ -148,6 +180,9 @@ def _chat(
             # 长度得在 messages 被换掉**之前**取。
             session.append(result.messages[len(state.messages) :])
             state.messages = result.messages
+            if result.anchor is not None:
+                # 这一轮带工具的最后一发有多大——下一轮判断要不要压就看它。
+                state.remember_context(result.anchor.tokens, result.anchor.covered)
             if result.error:
                 # 这一轮没能把请求发出去（网络、限流、配置……）。**会话不结束**——用户再发一次
                 # 就行；上面那句已经把这一轮**已经发生过的**工具调用落盘了，不会白丢。
@@ -289,8 +324,15 @@ def main_command(
     if prompt:
         # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
         console.print(f"> {prompt}", style="bold", markup=False)
-        # 接上来的历史可能已经很长了，先压一次再发。
-        history = _compact(history, provider, session)
+        # 接上来的历史可能已经很长了，先压一次再发。**这一轮之前没有真请求**，所以没有锚点，
+        # 只能整段按字符粗估——`--resume` 接上一个长历史时走的就是这条。
+        history = _compact(
+            history,
+            provider,
+            session,
+            size=context_size(history, tokens=None),
+            window=window_for(provider.model),
+        )
         result = runagent(
             prompt,
             provider,

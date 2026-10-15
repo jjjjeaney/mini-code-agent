@@ -19,9 +19,10 @@ from mini_code_agent.commands import (
 from mini_code_agent.commands.base import split_command
 from mini_code_agent.commands.builtin import make_help
 from mini_code_agent.console import console
+from mini_code_agent.context_window import window_for
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.sessions import SESSIONS_DIR, Session, start
-from mini_code_agent.summarizing import MAX_HISTORY_CHARS
+from mini_code_agent.summarizing import COMPACT_AT
 
 
 def make_ctx(
@@ -33,14 +34,23 @@ def make_ctx(
     grants: Grants | None = None,
     messages: list[dict] | None = None,
     compact: Callable[[], str | None] | None = None,
+    window: int | None = None,
+    context_tokens: int | None = None,
+    context_covered: int = 0,
 ) -> CommandContext:
     """一份手边的东西。全给上默认值，测哪一块就只改哪一块。
 
     `compact` 默认是个"什么都不做、什么都不说"的桩——真那个要连 provider，在 cli 里。
+    `window` 默认按"未知模型"那一档（见 context_window），所以是 40 万而不是 0——印出
+    "窗口 0" 那种数谁看都不对。
     """
+    state = ChatState(permission_mode=mode, messages=list(messages or []))
+    if context_tokens is not None:
+        state.remember_context(context_tokens, context_covered)
     return CommandContext(
         console=console,
-        state=ChatState(permission_mode=mode, messages=list(messages or [])),
+        state=state,
+        window=window_for(None) if window is None else window,
         cwd=cwd or Path("proj"),
         allow_shell=allow_shell,
         # opened=True：这就是"盘上已经有一次会话"的样子。没落盘的那种由 /status 那条单独的
@@ -190,7 +200,22 @@ class TestStatus:
         assert "abcd.jsonl" in out
         assert "落盘 7 条消息" in out
         assert "历史大小：1 条" in out
-        assert f"{MAX_HISTORY_CHARS:,} 才压" in out
+        # 没有真用过接口（没锚点），所以只能说"估算"，再报出窗口和阈值
+        assert "token（估算）" in out
+        assert f"窗口 {window_for(None):,}" in out
+        assert f"到 {int(window_for(None) * COMPACT_AT):,} 才压" in out
+
+    def test_it_says_when_the_number_is_real_not_estimated(self, capsys):
+        """锚点是上一发真请求报的——那就不是估的，这个字得改，不然这个数没法信。"""
+        ctx = make_ctx(
+            messages=[{"role": "user", "content": "x"}],
+            context_tokens=120_000,
+            context_covered=1,
+        )
+
+        default_commands().dispatch("/status", ctx)
+
+        assert "token（真数）" in capsys.readouterr().out
 
     def test_it_says_the_session_has_not_landed_yet(self, capsys):
         """会话是懒建的：还没说过话，盘上就没有那个文件——不该印一个不存在的路径配"落盘 0 条"。"""
