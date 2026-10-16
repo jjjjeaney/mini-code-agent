@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mini_code_agent.core.agent import RETRY_PAUSE_SECONDS, runagent
+from mini_code_agent.folding import fold_stale
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompting import make_ask_user
 from mini_code_agent.prompts import Answer
@@ -743,8 +744,8 @@ def test_each_request_only_appends_to_the_previous_one():
 
     这不是风格问题，是省钱的前提：这个端点的缓存以**整个请求**为单位匹配，只追加就几乎全
     命中，中间改一处就几乎全不中（实测 18,560 → 384 命中，每步贵 6 倍，见 known-issues 的
-    D5）。以前这里有一层"折叠"（把旧的工具结果换成占位符），删掉之后这条才成立——得有东西
-    守着它，不然谁再往中间加一层变换，账单上看不出来。
+    D5）。折叠（把旧的工具结果换成占位符）现在**只发生在两次调用之间**、而且只在缓存冷了的
+    时候——所以这一条守的是"**一次调用内部**别再加变换"。真往中间加一层，账单上看不出来。
     """
     def dump(kwargs: dict, ctx: ToolContext) -> str:
         return "x" * 3000
@@ -758,6 +759,60 @@ def test_each_request_only_appends_to_the_previous_one():
     runagent("读九次", provider, registry, max_steps=9)
 
     sent = [call["messages"] for call in provider.calls]
+    for earlier, later in zip(sent, sent[1:], strict=False):
+        assert later[: len(earlier)] == earlier, "后面那一发改动了前面"
+
+
+def a_folded_history() -> list[dict]:
+    """一份**折过**的历史：几条够长的工具结果，折完再拿去喂 `runagent`。"""
+    messages: list[dict] = [{"role": "user", "content": "先读几个文件"}]
+    for index in range(7):
+        call_id = f"old{index}"
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": call_id, "name": "dump", "input": {}}
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": "y" * 1000,
+                    }
+                ],
+            }
+        )
+    folded = fold_stale(messages)
+    assert folded is not messages, "没折到就没测到——先把常数调对再说"
+    return folded
+
+
+def test_a_folded_history_still_appends_only_within_the_turn():
+    """折叠发生在**两次 `runagent` 调用之间**（和压缩一样），所以上一条那个不变量没被碰。
+
+    这一条补的是另一半：带着一份**折过的**历史进去，它内部那几发之间照样只追加。
+    """
+    history = a_folded_history()
+
+    def dump(kwargs: dict, ctx: ToolContext) -> str:
+        return "x" * 500
+
+    registry = ToolRegistry([Tool(name="dump", description="", fn=dump, params={})])
+    provider = ScriptedProvider(
+        [*(tool_turn(f"t{i}", "dump", {}) for i in range(3)), text_turn("好了")]
+    )
+
+    runagent("接着读三次", provider, registry, messages=history, max_steps=3)
+
+    sent = [call["messages"] for call in provider.calls]
+    assert len(sent) == 4
+    assert sent[0][: len(history)] == history  # 折过的那份原样发出去
     for earlier, later in zip(sent, sent[1:], strict=False):
         assert later[: len(earlier)] == earlier, "后面那一发改动了前面"
 

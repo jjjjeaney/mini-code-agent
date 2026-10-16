@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 import typer
 
 from mini_code_agent import cli
+from mini_code_agent.folding import FOLD_AFTER_SECONDS, MIN_FOLD_CHARS
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompts import NullPrompter
@@ -551,3 +553,113 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
     assert "agent" in offered
     assert "ask_user" in offered  # 另一个 harness 注入的，顺带确认这条路没被改坏
     capsys.readouterr()
+
+
+def a_foldable_history(turns: int = 7) -> list[dict]:
+    """几轮"读了个大文件"的历史。够长的那些会在冷的时候被折掉。"""
+    messages: list[dict] = []
+    for index in range(turns):
+        call_id = f"t{index}"
+        messages.append({"role": "user", "content": f"第 {index} 句"})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": call_id, "name": "read_file", "input": {}}
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": f"第 {index} 条结果" + "x" * (MIN_FOLD_CHARS + 100),
+                    }
+                ],
+            }
+        )
+    return messages
+
+
+def result_contents(messages: list[dict]) -> list[str]:
+    """这几条消息里所有 tool_result 的 content，按出现顺序。"""
+    found: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                found.append(str(block.get("content")))
+    return found
+
+
+def age_the_file(session: Session) -> None:
+    """把会话文件做旧，装成"上一轮结束之后过了很久"——也就是缓存该冷了。
+
+    `is_stale` 判的就是这个文件的 mtime（每轮结束都会 append 一次，所以它等于"上一轮什么
+    时候结束的"）。做旧它比等 30 分钟强。
+    """
+    old = time.time() - FOLD_AFTER_SECONDS - 60
+    os.utime(session.path, (old, old))
+
+
+def test_a_stale_session_gets_folded_before_the_turn(monkeypatch, tmp_path):
+    """会话文件很久没被写过 = 缓存大概冷了 = 那时候折是纯赚。
+
+    折的判据只有"冷不冷"，不看多大——热的时候折是亏的（中间改一处会让整个前缀几乎全不中，
+    见 known-issues D5）。
+    """
+    history = a_foldable_history()
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append(history)
+    age_the_file(session)
+    provider = ScriptedProvider([text_turn("好")])
+
+    run_loop(
+        monkeypatch, provider, ["接着说", "/exit"], tmp_path, session=session, messages=history
+    )
+
+    sent = result_contents(provider.calls[0])
+    assert "已清除" in sent[0]  # 最早那条被折了
+    assert sent[-1].startswith("第 6 条结果")  # 最近那条一字不动
+    assert "已清除" not in sent[-1]
+
+
+def test_a_fresh_session_is_not_folded(monkeypatch, tmp_path):
+    """刚聊完接着聊，缓存还热着——这时候折会让整个前缀失效，是亏的。"""
+    history = a_foldable_history()
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append(history)  # 刚写过，mtime 是新的
+    provider = ScriptedProvider([text_turn("好")])
+
+    run_loop(
+        monkeypatch, provider, ["接着说", "/exit"], tmp_path, session=session, messages=history
+    )
+
+    assert "已清除" not in str(result_contents(provider.calls[0]))
+
+
+def test_folding_does_not_duplicate_or_overwrite_what_lands_on_disk(monkeypatch, tmp_path):
+    """**这一条守的是 `session.append(result.messages[len(state.messages):])` 那个偏移。**
+
+    折叠只换内存里那份的内容、**条数一条不变**，所以那个切片仍然正好是"这一轮新加的几条"
+    ——不会把折过的历史再写一遍。而且盘上拿回来的还是**原文**：折的是视图，不是文件。
+    """
+    history = a_foldable_history()
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append(history)
+    age_the_file(session)
+    provider = ScriptedProvider([text_turn("好")])
+
+    run_loop(
+        monkeypatch, provider, ["接着说", "/exit"], tmp_path, session=session, messages=history
+    )
+
+    _, _, stored = load(tmp_path, session.id)
+    # 原来那些一条不多一条不少，加上这一轮的用户那句和回答那句
+    assert len(stored) == len(history) + 2
+    assert "已清除" not in str(stored)  # 盘上还是完整的原文

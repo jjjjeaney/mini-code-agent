@@ -16,6 +16,7 @@ from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.core.subagent import make_agent_tool
+from mini_code_agent.folding import fold_stale, is_stale
 from mini_code_agent.memory import sync_index
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
@@ -135,6 +136,27 @@ def _chat(
         compact_once(force=True)
         return None
 
+    def fold_once() -> bool:
+        """折一次，返回"真折了没有"。
+
+        **没有手动入口**：折的判据是时间（`folding.is_stale`），不是"用户想不想"。原因是
+        这个动作**不该由人来判断**——它划不划算完全取决于"缓存冷不冷"，而那件事用户看不见
+        （我们自己也只能靠文件 mtime 猜），让他敲一条命令去赌反而容易亏。真嫌上下文长，
+        该敲的是 `/compact`。
+
+        **不花钱、也不落盘**：只把内存里这份历史里旧的工具结果换成"开头一段 + 一句说明"，
+        会话文件里原文一个字都不动。
+        """
+        before = state.messages
+        state.messages = fold_stale(state.messages)
+        if state.messages is before:
+            return False
+        # 消息的内容被换过了，锚点作废——它指的是折之前那份。理由和压缩那边一模一样
+        # （见 ChatState.forget_context）。注意**条数没变**，所以那个落盘偏移不受影响。
+        state.forget_context()
+        console.print("（把旧的工具结果折起来了；原文还在会话文件里）", style="dim", markup=False)
+        return True
+
     ctx = CommandContext(
         console=console,
         state=state,
@@ -158,6 +180,13 @@ def _chat(
                 break
             if outcome == "handled":
                 continue
+            # 缓存大概已经冷了（这个会话文件很久没被写过）就先折一次：那时候整段前缀反正要
+            # 按原价重算，改历史不额外损失任何东西，是纯赚。**热的时候折是亏的**——中间改一
+            # 处会让前缀几乎全不中（见 known-issues D5），所以判据只有 is_stale，不看大小。
+            #
+            # 排在压缩**前面**：折不要钱、压要一次模型调用，折完可能就不用到压那一步了。
+            if is_stale(session.path):
+                fold_once()
             # 太大就压一次再发。放在轮与轮之间，不放进 runagent——理由见 _compact。
             compact_once()
             system = build_system_prompt(cwd, state.permission_mode, model)
@@ -335,6 +364,10 @@ def main_command(
         console.print(f"> {prompt}", style="bold", markup=False)
         # 接上来的历史可能已经很长了，先压一次再发。**这一轮之前没有真请求**，所以没有锚点，
         # 只能整段按字符粗估——`--resume` 接上一个长历史时走的就是这条。
+        #
+        # 折在压前面，判据和 _chat 里那条一样（会话文件久没被写过 = 缓存大概冷了）。
+        if is_stale(session.path):
+            history = fold_stale(history)
         history = _compact(
             history,
             provider,
