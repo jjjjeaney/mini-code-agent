@@ -11,7 +11,15 @@ import pytest
 
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import PERMISSION_MODES
-from mini_code_agent.system_prompt import _branch_of, build_system_prompt
+from mini_code_agent.system_prompt import (
+    _STATIC,
+    _SUBAGENT_STATIC,
+    SUBAGENT_HEADS,
+    _branch_of,
+    build_subagent_prompt,
+    build_system_prompt,
+    project_context,
+)
 from mini_code_agent.tools.safety import MAX_TEXT_CHARS
 
 
@@ -389,3 +397,123 @@ class TestTheSkillsSection:
         text = build_system_prompt(tmp_path, "default")
 
         assert text.index("技能") < text.index("长期记忆")
+
+
+class TestTheAssemblyOrder:
+    """提示词是**拼**出来的，而顺序本身就是缓存策略（见 system_prompt.py 的模块说明）。
+
+    这里全是**结构断言**，不是整份快照——这个文件开头就写着"断言别直接对着整份提示词写"
+    （静态那半里什么词都可能有，撞上了就是假通过），而且这里面还有日期和 git 状态，
+    快照要么脆、要么得桩掉一堆东西。真正要守住的只有一件事：**谁在谁前面**。
+    """
+
+    def test_the_static_half_is_the_very_first_thing(self, tmp_path):
+        """静态那半一个字都不随运行变，所以它必须**在最前面**：它一动，后面整段缓存全废。"""
+        assert build_system_prompt(tmp_path, "default").startswith(_STATIC)
+
+    def test_the_first_three_keep_their_order(self, tmp_path):
+        """静态 -> 这次运行的实情 -> 档位。理由同上一半：越不稳的越往后。"""
+        text = build_system_prompt(tmp_path, "plan")
+
+        assert text.index(_STATIC) < text.index("这次运行：") < text.index("当前权限档位 plan")
+
+    def test_the_project_sections_are_appended_verbatim(self, tmp_path):
+        """`project_context` 返回什么就原样接在哪儿——分隔符、顺序、一个字都不改。
+
+        **这条钉的是"共用"这件事本身。** 主 agent 和子 agent 各拼各的前半段（身份、档位
+        不一样），但项目那几段是同一个函数给的。以后要是有人图省事把它们抄成两份，
+        两边就会开始漂——而漂了是不会有报错的。
+        """
+        (tmp_path / "AGENTS.md").write_text("项目自己的规矩：用 uv\n", encoding="utf-8")
+
+        text = build_system_prompt(tmp_path, "default")
+        context = project_context(tmp_path)
+
+        assert context  # 得真有东西，不然这条测试是空转
+        assert text.endswith("\n\n".join(context))
+
+    def test_the_project_sections_come_last_and_in_order(self, repo):
+        """那几段接在最末尾，彼此顺序是 AGENTS.md -> 技能 -> 记忆 -> git。
+
+        顺序的理由在 `project_context` 的 docstring 里（按"变得多勤"排，勤的垫底）。
+        """
+        (repo / "AGENTS.md").write_text("根上的规矩\n", encoding="utf-8")
+        a_skill(repo)
+        write(repo, Memory(name="some-note", description="一条记忆", type="user", body="正文"))
+
+        text = build_system_prompt(repo, "default")
+
+        assert (
+            text.index("当前权限档位")
+            < text.index("AGENTS.md")
+            < text.index("技能")
+            < text.index("长期记忆")
+            < text.index("这个仓库现在")
+        )
+
+    def test_an_empty_project_contributes_nothing(self, tmp_path):
+        """没有 AGENTS.md、没有技能、没有记忆、也不是仓库——那就一段都不加，别留空壳。"""
+        assert project_context(tmp_path) == []
+
+
+class TestSubagentPrompt:
+    """子 agent 那份：项目那几段和主 agent 共用，前排几样是它自己的。"""
+
+    def test_it_does_not_reuse_the_main_agents_static_half(self, tmp_path):
+        """**两边不共用静态头。** 那份写着"拿不准的就问用户"，而子 agent 问不了用户——
+        它对子 agent 是有害的（会让它要么卡住，要么编一个答案往下走）。"""
+        text = build_subagent_prompt(tmp_path, "explore", "default")
+
+        assert _STATIC not in text
+        assert _SUBAGENT_STATIC in text
+
+    def test_it_says_it_cannot_ask_the_user(self, tmp_path):
+        """这是子 agent 和主 agent 最要紧的一处不同：该问的事得写进最终回复交回去。"""
+        assert "你问不了用户" in build_subagent_prompt(tmp_path, "explore", "default")
+
+    def test_each_type_gets_its_own_head(self, tmp_path):
+        for name, head in SUBAGENT_HEADS.items():
+            assert head in build_subagent_prompt(tmp_path, name, "default")
+
+    def test_the_sections_keep_the_main_agents_order(self, repo):
+        """静态头 -> 类型那段 -> 这次运行的实情 -> 档位 -> 项目那几段。
+
+        顺序的理由和主 agent 那份一样（越不稳的越靠后，见 system_prompt.py 的模块说明），
+        它同时也是缓存前缀的形状——两边的形状得一致，省得以后有人只改了一边。
+        """
+        (repo / "AGENTS.md").write_text("根上的规矩\n", encoding="utf-8")
+
+        text = build_subagent_prompt(repo, "explore", "plan")
+
+        assert (
+            text.index(_SUBAGENT_STATIC)
+            < text.index(SUBAGENT_HEADS["explore"])
+            < text.index("这次运行：")
+            < text.index("当前权限档位 plan")
+            < text.index("根上的规矩")
+        )
+
+    def test_the_project_sections_are_the_same_ones_the_main_agent_gets(self, tmp_path):
+        """**这两份共用 `project_context`**——钉的是"共用"本身。
+
+        以后要是有人图省事把这几段抄成两份，两边就会开始漂，而且漂了不会有任何报错。
+        """
+        (tmp_path / "AGENTS.md").write_text("项目自己的规矩：用 uv\n", encoding="utf-8")
+
+        sub = build_subagent_prompt(tmp_path, "plan", "default")
+
+        assert sub.endswith("\n\n".join(project_context(tmp_path)))
+
+    def test_it_inherits_the_mode_it_is_handed(self, tmp_path):
+        """子 agent 继承主 agent 当前那一档，所以 plan 档那句要进去——不进去的话它会一路
+        试着改文件，吃满 deny 直到把步数烧完。"""
+        text = build_subagent_prompt(tmp_path, "general-purpose", "plan")
+
+        assert "只读" in text
+        assert "不要请求改文件" in text
+
+    def test_an_unknown_type_raises(self, tmp_path):
+        """认不出来就**报错，不兜底**：调用方是 harness，类型名是从那张表里来的，
+        到这一步还不认识说明是代码写错了（模型给的那个在 core/subagent.py 就拦下了）。"""
+        with pytest.raises(ValueError, match="没有名为"):
+            build_subagent_prompt(tmp_path, "nope", "default")

@@ -108,6 +108,25 @@ class ToolContext:
     # 它只需要知道往哪儿放。
     spill_dir: Path | None = None
 
+    # 这次运行跑在哪个权限档下（四档见 permissions.py）。
+    #
+    # **它和 prompter 不是一类东西，这正是它能在 ToolContext 里的原因。** prompter 是
+    # "能力"——工具能不能自己问用户，所以被挡在工具层外面（prompts.py 那条架构说明，
+    # 以及 test_prompt.py 里钉它的用例）。档位是"环境"：跟 cwd、allow_shell 一样，
+    # 回答的是"工具此刻跑在什么条件下"。permissions.decide_permission 的签名也没动，
+    # 它照旧只收那个字符串——那条例外写在那边的 docstring 里。
+    #
+    # 谁要用：**子 agent**。它必须继承主 agent 当前的档位，不然 plan 档下派一个
+    # general-purpose 子 agent 就能改文件，那是 plan 档的一个洞。而档位会被
+    # `/permission_mode` 中途改掉，所以不能靠"建工具那一刻"的值——只能每轮现读，
+    # 这就是它必须走 ctx 而不是闭包捕获的原因。
+    #
+    # 默认取 "default" 落在**会问**的那一侧（decide_permission 对写文件给的是 ask，
+    # 不是放行），漏传的后果是多问一句而不是少问一句。而且这个默认跟着 runagent 自己的
+    # `permission_mode: str = "default"` 走，没有另开一条路——生产代码里 ToolContext
+    # 只有 core/agent.py 一处构造，那里永远传的是真值。
+    permission_mode: str = "default"
+
 
 def _always_available(_: ToolContext) -> bool:
     """默认：一直能用。绝大多数工具都是这样。"""
@@ -149,6 +168,20 @@ class Tool:
     # 落盘——原文件本来就在盘上，start_line / end_line 能读回来，而且**读了会记
     # read_state**（改成读落盘的副本就断了这条，模型改原件时会被"你还没读过它"拦住）。
     spill: bool = False
+
+    # **只从外界取信息**：不写盘、不跑命令、不向用户输出、不改长期记忆。
+    #
+    # 判的是"这个动作会不会改变什么"，**不是**"它属于哪一类"——所以 `echo` 不算只读，
+    # 它往终端打印，那是输出。
+    #
+    # 谁在用：子 agent 里那两个只读类型（explore / plan）的工具池按它筛，见
+    # core/subagent.py。以后做工具并行时，"谁可以并行"基本也是这份名单。
+    #
+    # **默认 False，而且绝不能反过来。** 忘了给一个新工具标上的后果，是它被排除出只读池
+    # （少一个工具可用），不是它被放进 plan 子 agent 的池子里（那才是灾难）。
+    # tests/test_tools.py 里有两条例出整份名单的用例，加新工具时会红、逼人做这个决定
+    # ——那是这个默认值的安全网，别把它们删了。
+    read_only: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:

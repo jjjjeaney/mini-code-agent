@@ -180,6 +180,7 @@ def runagent(
     grants: Grants | None = None,
     messages: list[dict[str, Any]] | None = None,
     spill_dir: Path | None = None,
+    label: str = "",
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -196,11 +197,22 @@ def runagent(
     传进来那份**不会**被就地改——返回的是新的一份。
     spill_dir 是"太长而落盘的工具结果往哪儿放"，CLI 那边给的是这一次会话的目录
     （`.agent/tool-results/<会话 id>/`），这样删会话时能一起端掉；不传就落在共用的目录里。
+    label 是打在每一行前面的前缀（`[explore] ` 这种），**给子 agent 用的**——终端上要一眼看
+    得出哪几行是哪个子 agent 打的、钱花在谁身上。它**只进 console.print，不进 trace**：
+    trace 是这一轮的流水记录（要落盘、要交回调用方），不是给人实时看的东西。默认空串，
+    主 agent 那条路传的就是它，输出一个字节都不变。
     """
     registry = registry if registry is not None else default_tools()
     # ctx 得在挑工具**之前**建：哪些工具此刻能用，是照着它判的（没开 shell 就没有 bash）。
     # 一轮之内这张表是固定的——每步重算的话，缓存前缀会被反复冲掉（工具那半占前缀一多半）。
-    ctx = ToolContext(cwd or Path.cwd(), allow_shell=allow_shell, spill_dir=spill_dir)
+    # 权限档位也带进来：子 agent 要继承主 agent 当前那一档（见 tools/base.py 那个字段），
+    # 而被调用的工具是**每轮现读**它的，所以中途 `/permission_mode` 换档它也跟得上。
+    ctx = ToolContext(
+        cwd or Path.cwd(),
+        allow_shell=allow_shell,
+        spill_dir=spill_dir,
+        permission_mode=permission_mode,
+    )
     tools = registry.schemas(ctx)
     # 新拼一份，别就地改调用方手里那份。
     messages = [*(messages or []), {"role": "user", "content": prompt}]
@@ -244,7 +256,9 @@ def runagent(
                 ),
                 covered=len(sent),
             )
-        console.print(f"（这一发 token：{_usage_note(response)}）", style="dim", markup=False)
+        console.print(
+            f"{label}（这一发 token：{_usage_note(response)}）", style="dim", markup=False
+        )
         return response
 
     def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
@@ -267,7 +281,7 @@ def runagent(
             return send(sent, **kwargs)
         except TransientProviderError as exc:
             console.print(
-                f"（{exc}，等 {RETRY_PAUSE_SECONDS:g} 秒自动再试一次…）",
+                f"{label}（{exc}，等 {RETRY_PAUSE_SECONDS:g} 秒自动再试一次…）",
                 style="dim",
                 markup=False,
             )
@@ -295,7 +309,7 @@ def runagent(
             for call in response.tool_calls:
                 # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
                 trace.append(_render_call(call))
-                console.print(_render_call(call), style="cyan", markup=False)
+                console.print(f"{label}{_render_call(call)}", style="cyan", markup=False)
 
                 # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
                 result = _gate(call, prompter, allow_shell, permission_mode, grants)
@@ -304,7 +318,7 @@ def runagent(
 
                 trace.append(_render_result(result))
                 console.print(
-                    _render_result(result),
+                    f"{label}{_render_result(result)}",
                     style="red" if result.is_error else "green",
                     markup=False,
                 )

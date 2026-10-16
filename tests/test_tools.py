@@ -223,6 +223,48 @@ class TestDefaultTools:
 
         assert capsys.readouterr().out == "hi\n"
 
+    def test_the_read_only_ones_are_exactly_these(self):
+        """子 agent 里 explore / plan 两个类型只有这批工具（见 core/subagent.py）。
+
+        断言的是**整份名单**，不是"这几个在里面"：加一个新工具、忘了想它算不算只读，
+        这条就会红，逼人做那个决定。理由见 known-issues F1——靠名字列名单会漂，
+        而这里连"名单"都没有，全靠每处 `Tool(...)` 自己标。
+        """
+        read_only = {tool.name for tool in default_tools().list() if tool.read_only}
+
+        assert read_only == {
+            "list_files",
+            "project_tree",
+            "read_file",
+            "read_memory",
+            "read_skill",
+            "read_skill_file",
+            "glob",
+            "grep",
+            "read_tool_result",
+            "web_search",
+            "web_fetch",
+        }
+
+    def test_the_ones_that_change_something_are_not_read_only(self):
+        """剩下这六个都会改变点什么：写盘、跑命令、改长期记忆，或者——`echo`——往终端输出。
+
+        **`echo` 是这组里唯一值得犹豫的那个**：它不碰盘也不碰记忆，但它是给用户的输出，
+        不是从外界取信息。判据是"这个动作会不会改变什么"，所以它在这儿。
+        """
+        changes_something = {
+            tool.name for tool in default_tools().list() if not tool.read_only
+        }
+
+        assert changes_something == {
+            "echo",
+            "remember",
+            "write_file",
+            "edit_file",
+            "replace_lines",
+            "bash",
+        }
+
 
 class FakeTavilyClient:
     """顶掉真的 Tavily 客户端：不发网络请求，同时记下收到的参数。"""

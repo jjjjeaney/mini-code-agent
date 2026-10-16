@@ -107,6 +107,18 @@ def decide_permission(
 
     参数都是权限自己的东西（工具名、shell 开没开、档位），不认识 ToolContext 那种工具层的
     环境对象——权限不是工具的属性。
+
+    **档位现在是那个"工具层环境对象"里的一个字段，但上面这条没破**（`ToolContext` 里确实
+    带着 `permission_mode`，见 tools/base.py 那个字段的说明）。之所以不冲突，是因为要在
+    这里分清两样东西：
+
+    - **能力**——"工具能不能自己问用户"，也就是 prompter。它照旧被挡在工具层外面，
+      `ask_user` 依然是 harness 在 CLI 层注入的，test_prompt.py 里有用例钉着这条。
+    - **环境**——"工具此刻跑在什么条件下"，也就是 cwd、allow_shell、以及档位。档位属于
+      这一类，它进 `ToolContext` 是为了让**子 agent 继承主 agent 当前那一档**（不继承的话，
+      plan 档下派一个 general-purpose 子 agent 就能改文件）。
+
+    这个函数的签名因此一个字母都没变：它照旧只收那个字符串，不认识 ToolContext。
     """
     mode = parse_permission_mode(permission_mode)
 

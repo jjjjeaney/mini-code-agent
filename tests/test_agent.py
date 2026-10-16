@@ -192,6 +192,95 @@ def test_spill_dir_defaults_to_nothing(tmp_path):
     assert seen["spill_dir"] is None
 
 
+def test_permission_mode_reaches_the_tools(tmp_path):
+    """档位要一路走到工具层——子 agent 靠它继承主 agent 当前那一档。
+
+    不继承的后果不是难看：plan 档下派一个 general-purpose 子 agent，它就能改文件，
+    那是 plan 档的一个洞。
+    """
+    seen = {}
+
+    def peek(kwargs: dict, ctx: ToolContext) -> str:
+        seen["mode"] = ctx.permission_mode
+        return "看到了"
+
+    registry = ToolRegistry([Tool(name="peek", fn=peek)])
+    provider = ScriptedProvider([tool_turn("toolu_1", "peek", {}), text_turn("好")])
+
+    runagent("看一眼", provider, registry, cwd=tmp_path, permission_mode="plan")
+
+    assert seen["mode"] == "plan"
+
+
+def test_permission_mode_defaults_to_the_asking_one(tmp_path):
+    """不传就跟 runagent 自己的默认走。
+
+    **取 "default" 是有意的**：它落在"会问"的那一侧（decide_permission 对写文件给的是
+    ask，不是放行），所以漏传的后果是多问一句，不是少问一句。
+    """
+    seen = {}
+
+    def peek(kwargs: dict, ctx: ToolContext) -> str:
+        seen["mode"] = ctx.permission_mode
+        return "看到了"
+
+    registry = ToolRegistry([Tool(name="peek", fn=peek)])
+    provider = ScriptedProvider([tool_turn("toolu_1", "peek", {}), text_turn("好")])
+
+    runagent("看一眼", provider, registry, cwd=tmp_path)
+
+    assert seen["mode"] == "default"
+
+
+def test_the_label_prefixes_every_printed_line(registry, capsys):
+    """子 agent 打的每一行都带自己的标记——终端上要一眼看出是谁在干活、钱花在谁身上。
+
+    **"钱"那几行也算**（这里是用量行）：它恰恰是"这个子 agent 花了多少"的信号，
+    不标出来就分不清钱花在谁身上了。
+    """
+    provider = ScriptedProvider(
+        [
+            tool_turn("toolu_1", "add", {"a": 1, "b": 2}),
+            ModelResponse(
+                text="3",
+                assistant_content=[{"type": "text", "text": "3"}],
+                stop_reason="end_turn",
+                input_tokens=10,
+                output_tokens=2,
+            ),
+        ]
+    )
+
+    runagent("1+2", provider, registry, label="[explore] ")
+
+    out = capsys.readouterr().out
+    assert '[explore] → add({"a": 1, "b": 2})' in out
+    assert "[explore] ← add: 3" in out
+    assert "[explore] （这一发 token：" in out
+
+
+def test_the_label_reaches_the_retry_line_too(monkeypatch, capsys):
+    """重试也是在某个子 agent 里发生的——那一行不带标记的话，用户不知道是谁在重试。"""
+    monkeypatch.setattr("mini_code_agent.core.agent.time.sleep", lambda seconds: None)
+    provider = FlakyThenFine(failures=1, responses=[text_turn("补上了")])
+
+    runagent("问一句", provider, ToolRegistry([]), label="[plan] ")
+
+    assert "[plan] （连不上模型服务" in capsys.readouterr().out
+
+
+def test_the_label_stays_out_of_the_trace(registry):
+    """trace 是这一轮的流水记录（要落盘、要交回调用方），不是给人实时看的。
+
+    所以那个前缀只进 `console.print`，一个字都不许漏进 trace。
+    """
+    provider = ScriptedProvider([tool_turn("toolu_1", "add", {"a": 1, "b": 2}), text_turn("3")])
+
+    result = runagent("1+2", provider, registry, label="[explore] ")
+
+    assert result.trace == ['→ add({"a": 1, "b": 2})', "← add: 3", "3"]
+
+
 def test_multiple_tool_rounds_interleave_calls_and_results(registry):
     provider = ScriptedProvider(
         [

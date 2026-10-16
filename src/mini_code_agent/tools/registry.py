@@ -150,6 +150,10 @@ def default_tools() -> ToolRegistry:
 
     每次调用都返回新实例：调用方想往自己的那份里再注册工具时，
     不会污染到别人手里那份。
+
+    只读的那些标了 `read_only=True`（语义见 tools/base.py 那个字段）——子 agent 里
+    explore / plan 两个类型的工具池就是按它筛出来的（见 core/subagent.py）。标的时候
+    想的是"这个动作会不会改变什么"，所以 `echo` 不标：它往终端打印，那是输出。
     """
     return ToolRegistry(
         [
@@ -166,6 +170,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=list_files,
                 params=LIST_FILES_SCHEMA,
+                read_only=True,
             ),
             Tool(
                 name="project_tree",
@@ -175,6 +180,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=project_tree,
                 params=PROJECT_TREE_SCHEMA,
+                read_only=True,
             ),
             Tool(
                 name="read_file",
@@ -186,6 +192,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_file,
                 params=READ_FILE_SCHEMA,
+                read_only=True,
             ),
             Tool(
                 name="read_memory",
@@ -195,6 +202,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_memory,
                 params=READ_MEMORY_SCHEMA,
+                read_only=True,
                 # 一条记忆都没有就别发它——没清单的时候它只会让模型白试一次、花掉一步。
                 available=lambda ctx: bool(memory_index(ctx.cwd)),
             ),
@@ -218,6 +226,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_skill,
                 params=READ_SKILL_SCHEMA,
+                read_only=True,
                 # 同上：一份技能都没有就别发"取技能"的两个工具。
                 available=lambda ctx: bool(skill_index(ctx.cwd)),
             ),
@@ -229,6 +238,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_skill_file,
                 params=READ_SKILL_FILE_SCHEMA,
+                read_only=True,
                 available=lambda ctx: bool(skill_index(ctx.cwd)),
             ),
             Tool(
@@ -289,6 +299,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=glob,
                 params=GLOB_SCHEMA,
+                read_only=True,
             ),
             Tool(
                 name="grep",
@@ -298,6 +309,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=grep,
                 params=GREP_SCHEMA,
+                read_only=True,
             ),
             Tool(
                 name="web_search",
@@ -310,6 +322,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=web_search,
                 params=WEB_SEARCH_SCHEMA,
+                read_only=True,
                 # 没配 key 就别发这两个——发出去是必错的。
                 available=lambda _: is_configured(),
             ),
@@ -322,6 +335,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=web_fetch,
                 params=WEB_FETCH_SCHEMA,
+                read_only=True,
                 available=lambda _: is_configured(),
                 # 正文是花钱取回来的，网页下一刻也可能变——截掉的部分再要就得重新取一次。
                 spill=True,
@@ -335,6 +349,7 @@ def default_tools() -> ToolRegistry:
                 ),
                 fn=read_tool_result,
                 params=READ_TOOL_RESULT_SCHEMA,
+                read_only=True,
                 # **故意不加 available**：别的 `.agent` 工具是"有东西才发"（没记忆就没
                 # read_memory），这一个不行——落盘发生在**这一轮之内**，而工具表一轮只算
                 # 一次（在 runagent 开头），按"盘上有没有落盘文件"来判的话，模型在这一轮里

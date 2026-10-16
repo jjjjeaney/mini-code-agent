@@ -14,6 +14,10 @@
 单独一个模块，是因为它要读盘、要认识档位，而 `core/agent.py` 只该拿到一个现成的字符串。
 它只读**环境**——读盘、读几个环境变量、跑几条只读的 git 命令——不碰 provider、不碰会话状态；
 给定 cwd、档位、模型和当时的仓库状态就有确定的输出，测起来不用起 agent（起个临时仓库就够）。
+
+**子 agent 那份也在这儿拼**（`build_subagent_prompt`）：它的静态头是另一份（身份不同，
+而且它问不了用户），但 `project_context` 那几段和主 agent 共用——"这个项目自己是什么样"
+对谁都是一样的。
 """
 
 from __future__ import annotations
@@ -99,6 +103,72 @@ _MODE_HINTS = {
         "不要请求改文件，也不要请求会改动任何东西的命令。把打算怎么做讲清楚，等用户切档再动手。"
     ),
     "bypass permissions": "当前权限档位 bypass permissions：什么都不会问用户，照常干活。",
+}
+
+# ——— 子 agent 的那半 ———
+#
+# 它**不复用上面那份 `_STATIC`**，理由不是懒：那里写着"你是干活的、拿不准就问用户"，而子
+# agent **问不了用户**，身份也不是一回事。共用的只有 `project_context` 那几段——项目自己的
+# 规矩、有哪些技能和记忆，对谁都得知道。
+#
+# 这么分还有一个好处：主 agent 提示词的**字节一个都不动**，它的缓存前缀照旧。所以以后要改
+# 那份 `_STATIC`，改就是了，不会牵动这儿。
+#
+# 下面这份是**所有类型共用**的；每种类型自己那一段在 SUBAGENT_HEADS 里。
+_SUBAGENT_STATIC = """\
+你是一个**子 agent**，被主 agent 派出来做一件事。你看不到主 agent 和用户的对话，只看得到
+下面这段任务。
+
+你的最终回复会**原样交回**给主 agent，那是你唯一的产出——你的中间步骤它看不到（终端上那条
+流水是打给用户看的，不是给它的）。所以结论要写全：查到了什么、在哪个文件的哪一行、还有
+什么没查。别写"见上面""如前所述"这种指代，主 agent 手上没有你的上下文。
+
+## 系统
+
+- 有些调用会**先问用户**（改文件、跑命令）。被拒绝是正常的人机协商，不是错误：**换个做法**，
+  不要原样重试。
+- 当前权限档位在下面单独一行写着，它决定"哪些调用要先问"。
+- 工具参数里的路径一律相对于**当前工作目录**。
+- **你问不了用户。** 需要他拍板的事（两个方案选哪个、要不要动那个文件），写进最终回复里
+  交给主 agent，由它去问。别自己替他决定，也别因为问不了就随手猜一个往下走。
+
+## 做事的规矩
+
+- **改一个文件之前先读它。** 没读过的不许改，工具会拒绝。
+- 贴着周围的写法改：命名、注释密度、惯用法都跟着这个文件已有的来，别顺手翻新。
+- 只说你验证过的事——没读过的文件别描述它的内容，没跑过的命令别说它过了。
+
+## 语气与风格
+
+- **不用 emoji。**
+- 引用代码位置写成 `路径:行号`，例如 `src/cli.py:42`。
+- 说结论，别复述工具输出，也别把刚读到的内容再贴一遍。
+- 该短就短，但也别为省字数牺牲完整性——**主 agent 看不到你的思考过程**。
+"""
+
+# 每种类型那一段。**键要和 core/subagent.py 的 AGENT_TYPES 对得上**——那边有一条例出
+# 两份键集合的测试，对不上会红。
+SUBAGENT_HEADS: dict[str, str] = {
+    "general-purpose": (
+        "## 这件事\n\n"
+        "从头做完：该看的看，该改的改，该跑的跑。你有全部工具。\n\n"
+        "最后说清：改了哪些文件（写路径）、为什么这么改、验证过没有（跑没跑测试、结果是什么）。"
+        "没做完的说清卡在哪儿。"
+    ),
+    "explore": (
+        "## 这件事\n\n"
+        "**在代码库里找到事实，然后报告。** 你只能读，改不了任何东西。\n\n"
+        "报告里写清**路径和行号**（形如 `src/cli.py:42`）——主 agent 会照着这些去读原始文件，"
+        "写不清它就得多查一遍。它要的是位置和内容，不是你的评价。\n\n"
+        "没找到就说没找到，并列一下你搜过哪些地方：那本身也是信息，比猜一个答案强。"
+    ),
+    "plan": (
+        "## 这件事\n\n"
+        "**设计一个实施方案。** 你只能读，改不了任何东西。\n\n"
+        "方案要具体到能直接照着做：改哪个文件的哪一处、加什么、按什么顺序、有哪几个选择、"
+        "各自的代价是什么、有什么风险。别停在「建议重构一下某处」这种层面上。\n\n"
+        "把关键现状写进去（相关代码现在是怎么写的、在哪儿），主 agent 才知道你为什么这么设计。"
+    ),
 }
 
 
@@ -216,24 +286,21 @@ def _git_note(cwd: Path) -> str:
     return "\n".join(parts)
 
 
-def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = None) -> str:
-    """拼一份 system prompt：静态那半 + 这次运行的实情 + 档位 + AGENTS.md + 记忆 + git 状态。
+def project_context(cwd: Path) -> list[str]:
+    """项目自己的那几段：AGENTS.md、技能清单、记忆清单、git 状态。
 
-    顺序是**按"变得多勤"排的**（勤的靠后）：静态那半永远不变；这次运行的实情一天一变（平台、
-    模型一次运行里不动）；档位会在会话里换（`/permission_mode`），但一次运行里通常不动；
-    `AGENTS.md` 跟着仓库走；技能清单只在人加/删 skill 时变；记忆清单会随 `remember` 长一截；
-    **git 状态最勤**——模型每改一个文件它就变，所以垫底。这样任何一处变了，它**后面**的才掉
-    缓存，前面的照旧命中。
+    **顺序按"变得多勤"排的**（勤的靠后）：`AGENTS.md` 跟着仓库走；技能清单只在人加/删
+    skill 时变；记忆清单会随 `remember` 长一截；**git 状态最勤**——模型每改一个文件它就变，
+    所以垫底。这样任何一处变了，它**后面**的才掉缓存，前面的照旧命中。
 
-    `model` 不给就不写那半句——**不猜**。调用方手上有真 provider 就传 `provider.model`；
-    `Provider` 协议故意只声明了 complete（见 providers/base.py），所以这里也不假设它有。
+    单独拎出来是因为**两个 builder 共用它**：主 agent 那份（`build_system_prompt`）和子
+    agent 那份（`build_subagent_prompt`）。两边身份和档位那几段不一样，但"这个项目自己是
+    什么样"完全一样——子 agent 照样得知道 AGENTS.md 里的规矩、有哪些技能和记忆可以取。
 
-    交互那条路**每轮重拼一次**：记忆和 `AGENTS.md` 都可能中途变（模型刚 `remember` 了一条），
-    拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位同理——`/permission_mode` 能
-    中途换，所以它也得每轮现读。
+    返回的是**段**（每段一个字符串），不是拼好的整体：调用方接在自己那几段后面一起 join
+    就行。它在缓存前缀里的位置是固定的，别往中间插东西。
     """
-    mode = parse_permission_mode(permission_mode)
-    parts = [_STATIC, _session_note(model), _MODE_HINTS[mode]]
+    parts: list[str] = []
     rules = _read_rules(cwd)
     if rules:
         parts.append(f"项目自己的规矩（来自 {RULES_FILE}，要遵守）：\n\n{rules}")
@@ -266,6 +333,57 @@ def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = Non
     git = _git_note(cwd)
     if git:
         parts.append(git)
+    return parts
+
+
+def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = None) -> str:
+    """拼主 agent 的 system prompt：静态那半 + 这次运行的实情 + 档位 + 项目自己的那几段。
+
+    前三段在这儿拼，后面那四段（AGENTS.md、技能、记忆、git）由 `project_context` 给，
+    和子 agent 那份共用——**它的顺序理由写在那儿**。
+
+    前三段的顺序也是按"变得多勤"排的：静态那半永远不变；这次运行的实情一天一变（平台、
+    模型一次运行里不动）；档位会在会话里换（`/permission_mode`），但一次运行里通常不动。
+
+    `model` 不给就不写那半句——**不猜**。调用方手上有真 provider 就传 `provider.model`；
+    `Provider` 协议故意只声明了 complete（见 providers/base.py），所以这里也不假设它有。
+
+    交互那条路**每轮重拼一次**：记忆和 `AGENTS.md` 都可能中途变（模型刚 `remember` 了一条），
+    拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位同理——`/permission_mode` 能
+    中途换，所以它也得每轮现读。
+    """
+    mode = parse_permission_mode(permission_mode)
+    parts = [_STATIC, _session_note(model), _MODE_HINTS[mode], *project_context(cwd)]
+    return "\n\n".join(parts)
+
+
+def build_subagent_prompt(
+    cwd: Path, agent_type: str, permission_mode: str, model: str | None = None
+) -> str:
+    """拼子 agent 的 system prompt：公用静态头 + 这个类型那段 + 档位 + 项目那几段。
+
+    **和主 agent 那份只共用后半段。** 前面几样都不一样：它看不到主 agent 和用户的对话、
+    它问不了用户，所以"拿不准就问"那句对它是有害的。
+
+    **档位照旧要给它**：子 agent 继承主 agent 当前那一档（见 core/subagent.py），所以 plan
+    档下它得知道"改文件会被拒"——不然它会一路试到把步数烧完。
+
+    `agent_type` 认不出来就**报错，不兜底**：调用方是 harness，这个字符串是从那张表里来的，
+    到这一步还不认识说明是代码写错了。模型给的那个类型在 core/subagent.py 就已经拦下了，
+    变成一句给模型看的普通结果。
+    """
+    head = SUBAGENT_HEADS.get(agent_type)
+    if head is None:
+        options = "、".join(SUBAGENT_HEADS)
+        raise ValueError(f"没有名为 {agent_type!r} 的子 agent 类型。可选：{options}")
+    mode = parse_permission_mode(permission_mode)
+    parts = [
+        _SUBAGENT_STATIC,
+        head,
+        _session_note(model),
+        _MODE_HINTS[mode],
+        *project_context(cwd),
+    ]
     return "\n\n".join(parts)
 
 
