@@ -456,6 +456,34 @@ class TestTheAssemblyOrder:
         assert project_context(tmp_path) == []
 
 
+class TestDelegation:
+    """主 agent 那份提示词要催它派子 agent——**光有工具说明不够**（实测：模型不会主动去用），
+    跟记忆和技能那两节是同一个教训（见 system_prompt.py 里那两句"光把清单摆出来"）。
+    """
+
+    def test_the_main_prompt_says_when_to_delegate(self, tmp_path):
+        text = build_system_prompt(tmp_path, "default")
+
+        assert "## 什么时候派子 agent" in text
+        assert "`agent`" in text
+
+    def test_it_calls_out_the_planning_case(self, tmp_path):
+        """用户要"计划/方案"是最容易漏掉子 agent 的那种请求——模型会自己一路读下去。"""
+        assert "要计划、方案" in build_system_prompt(tmp_path, "default")
+
+    def test_it_warns_against_delegating_trivia(self, tmp_path):
+        """不写这句的后果是反方向的：模型把一件 `read_file` 就够的事也派出去。"""
+        assert "小事别派" in build_system_prompt(tmp_path, "default")
+
+    def test_the_subagent_prompt_does_not_tell_it_to_delegate(self, tmp_path):
+        """**子 agent 不能再派子 agent**（池子里没有 `agent` 工具）。
+
+        所以这段只能放主 agent 的静态头里，**不能放 `_MODE_HINTS`**——那个是两边共用的，
+        写在那儿等于让子 agent 去找一个它没有的工具。
+        """
+        assert "## 什么时候派子 agent" not in build_subagent_prompt(tmp_path, "plan", "plan")
+
+
 class TestSubagentPrompt:
     """子 agent 那份：项目那几段和主 agent 共用，前排几样是它自己的。"""
 
