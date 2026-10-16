@@ -16,7 +16,7 @@ from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.core.subagent import make_agent_tool
-from mini_code_agent.folding import fold_stale, is_stale
+from mini_code_agent.folding import fold_if_stale
 from mini_code_agent.memory import sync_index
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
@@ -51,7 +51,7 @@ def _compact(
     追加的那几条"（下面就是靠 result.messages[len(messages):] 落盘的）。压缩会改掉前缀，
     正好把这个前提破坏掉。
 
-    摘要调不动就当没压，照常跑这一轮——绝不能因为压缩把会话卡死。
+    **摘要调不动就当没压**，照常跑这一轮——绝不能因为压缩把会话卡死。
 
     **返回值是不是同一个 list 就是"压没压"的信号**：没压时原样返回传进来那个（`is` 相等），
     压了返回一个新的。调用方靠它决定要不要把锚点作废（见 ChatState.forget_context）。
@@ -105,6 +105,8 @@ def _chat(
     state = ChatState(permission_mode=permission_mode, messages=messages)
     # 模型的窗口一次运行里定死，所以不进 ChatState 那个"会变的东西"的盒子（见它的类注释）。
     window = window_for(model)
+    # 哪些工具的结果允许被折——一次运行里不变（见 tools/registry.py 的 foldable_names）。
+    foldable = registry.foldable_names()
 
     def size_now() -> int:
         """这段历史现在有多大（token）——有锚点就用锚点，没有就按字符粗估。"""
@@ -114,15 +116,11 @@ def _chat(
 
     def compact_once(*, force: bool = False) -> bool:
         """压一次（够不够大由 force 决定），返回"真压了没有"。"""
-        before = state.messages
-        state.messages = _compact(
-            state.messages, provider, session, size=size_now(), window=window, force=force
+        return state.replaced(
+            _compact(
+                state.messages, provider, session, size=size_now(), window=window, force=force
+            )
         )
-        if state.messages is before:
-            return False
-        # 消息被换掉了，锚点作废——不作废的话下一轮会以为还是压缩前那么大。见 ChatState。
-        state.forget_context()
-        return True
 
     def compact_now() -> str | None:
         """就地压一次，不管现在多长（`/compact` 用）。返回该跟用户补的一句话。
@@ -136,26 +134,17 @@ def _chat(
         compact_once(force=True)
         return None
 
-    def fold_once() -> bool:
-        """折一次，返回"真折了没有"。
+    def fold_once() -> None:
+        """折一次——**缓存真冷了才折**，判据在 folding 里。
 
-        **没有手动入口**：折的判据是时间（`folding.is_stale`），不是"用户想不想"。原因是
-        这个动作**不该由人来判断**——它划不划算完全取决于"缓存冷不冷"，而那件事用户看不见
-        （我们自己也只能靠文件 mtime 猜），让他敲一条命令去赌反而容易亏。真嫌上下文长，
-        该敲的是 `/compact`。
-
-        **不花钱、也不落盘**：只把内存里这份历史里旧的工具结果换成"开头一段 + 一句说明"，
-        会话文件里原文一个字都不动。
+        不花钱、也不落盘：只把内存里这份历史里旧的工具结果换成"开头一段 + 一句说明"，会话
+        文件里原文一个字都不动。为什么没有手动入口，见 folding.py 的模块说明。
         """
-        before = state.messages
-        state.messages = fold_stale(state.messages)
-        if state.messages is before:
-            return False
-        # 消息的内容被换过了，锚点作废——它指的是折之前那份。理由和压缩那边一模一样
-        # （见 ChatState.forget_context）。注意**条数没变**，所以那个落盘偏移不受影响。
-        state.forget_context()
+        if not state.replaced(
+            fold_if_stale(state.messages, foldable=foldable, path=session.path)
+        ):
+            return
         console.print("（把旧的工具结果折起来了；原文还在会话文件里）", style="dim", markup=False)
-        return True
 
     ctx = CommandContext(
         console=console,
@@ -180,14 +169,12 @@ def _chat(
                 break
             if outcome == "handled":
                 continue
-            # 缓存大概已经冷了（这个会话文件很久没被写过）就先折一次：那时候整段前缀反正要
-            # 按原价重算，改历史不额外损失任何东西，是纯赚。**热的时候折是亏的**——中间改一
-            # 处会让前缀几乎全不中（见 known-issues D5），所以判据只有 is_stale，不看大小。
+            # 缓存大概已经冷了就先折一次：那时候整段前缀反正要按原价重算，改历史不额外损失
+            # 任何东西，是纯赚。**热的时候折是亏的**（见 known-issues D5），所以判据只有
+            # "冷不冷"、不看大小——那一条在 folding 里，这儿只管排顺序。
             #
-            # 排在压缩**前面**：折不要钱、压要一次模型调用，折完可能就不用到压那一步了。
-            if is_stale(session.path):
-                fold_once()
-            # 太大就压一次再发。放在轮与轮之间，不放进 runagent——理由见 _compact。
+            # 折排在压缩**前面**：折不要钱、压要一次模型调用，折完可能就不用到压那一步了。
+            fold_once()
             compact_once()
             system = build_system_prompt(cwd, state.permission_mode, model)
             result = runagent(
@@ -366,8 +353,9 @@ def main_command(
         # 只能整段按字符粗估——`--resume` 接上一个长历史时走的就是这条。
         #
         # 折在压前面，判据和 _chat 里那条一样（会话文件久没被写过 = 缓存大概冷了）。
-        if is_stale(session.path):
-            history = fold_stale(history)
+        history = fold_if_stale(
+            history, foldable=registry.foldable_names(), path=session.path
+        )
         history = _compact(
             history,
             provider,

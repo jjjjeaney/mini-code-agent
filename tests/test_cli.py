@@ -16,7 +16,7 @@ from mini_code_agent.prompts import NullPrompter
 from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCall
 from mini_code_agent.sessions import SESSIONS_DIR, Session, load, start
 from mini_code_agent.system_prompt import build_system_prompt
-from mini_code_agent.tools import Tool, ToolRegistry, spill
+from mini_code_agent.tools import Tool, ToolRegistry, default_tools, spill
 from mini_code_agent.tools.safety import MAX_TOOL_CHARS
 
 
@@ -620,7 +620,14 @@ def test_a_stale_session_gets_folded_before_the_turn(monkeypatch, tmp_path):
     provider = ScriptedProvider([text_turn("好")])
 
     run_loop(
-        monkeypatch, provider, ["接着说", "/exit"], tmp_path, session=session, messages=history
+        monkeypatch,
+        provider,
+        ["接着说", "/exit"],
+        tmp_path,
+        session=session,
+        messages=history,
+        # 名单是从注册表现算的（`Tool.foldable`）：空注册表里一个可折的都没有。
+        registry=default_tools(),
     )
 
     sent = result_contents(provider.calls[0])
@@ -637,7 +644,14 @@ def test_a_fresh_session_is_not_folded(monkeypatch, tmp_path):
     provider = ScriptedProvider([text_turn("好")])
 
     run_loop(
-        monkeypatch, provider, ["接着说", "/exit"], tmp_path, session=session, messages=history
+        monkeypatch,
+        provider,
+        ["接着说", "/exit"],
+        tmp_path,
+        session=session,
+        messages=history,
+        # 注册表得带着可折的工具，不然这条会因为"压根没什么可折的"而假通过。
+        registry=default_tools(),
     )
 
     assert "已清除" not in str(result_contents(provider.calls[0]))
@@ -656,8 +670,17 @@ def test_folding_does_not_duplicate_or_overwrite_what_lands_on_disk(monkeypatch,
     provider = ScriptedProvider([text_turn("好")])
 
     run_loop(
-        monkeypatch, provider, ["接着说", "/exit"], tmp_path, session=session, messages=history
+        monkeypatch,
+        provider,
+        ["接着说", "/exit"],
+        tmp_path,
+        session=session,
+        messages=history,
+        registry=default_tools(),
     )
+
+    # 先确认**真折过**：不然下面两条会因为"什么都没发生"而假通过
+    assert "已清除" in result_contents(provider.calls[0])[0]
 
     _, _, stored = load(tmp_path, session.id)
     # 原来那些一条不多一条不少，加上这一轮的用户那句和回答那句

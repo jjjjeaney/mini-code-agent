@@ -75,6 +75,33 @@ def a_command(name: str, **kwargs) -> Command:
     return Command(name=name, run=lambda ctx, arg: "handled", **kwargs)
 
 
+class TestChatState:
+    """`ChatState` 上那两个"换历史"的东西——压缩和折叠都要走它，所以它自己得是对的。"""
+
+    def test_replacing_swaps_the_history_and_drops_the_anchor(self):
+        state = ChatState(permission_mode="default", messages=[{"role": "user", "content": "a"}])
+        state.remember_context(120_000, 1)
+        fresh = [{"role": "user", "content": "b"}]
+
+        assert state.replaced(fresh) is True
+
+        assert state.messages is fresh
+        assert state.context_tokens is None  # 锚点跟着作废了
+        assert state.context_covered == 0
+
+    def test_handing_the_same_one_back_is_not_a_replacement(self):
+        """压缩和折叠都是"没改动就原样返回传进来那份"，所以**对象身份**就是"换没换"的信号。
+
+        没换就不动能锚点——不然每轮都会白白退回粗估。
+        """
+        state = ChatState(permission_mode="default", messages=[{"role": "user", "content": "a"}])
+        state.remember_context(120_000, 1)
+
+        assert state.replaced(state.messages) is False
+
+        assert state.context_tokens == 120_000
+
+
 class TestDispatch:
     def test_a_plain_line_is_left_to_the_caller(self, capsys):
         """不是命令就返回 not_a_command，让调用方照常发给模型。"""

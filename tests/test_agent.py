@@ -772,7 +772,7 @@ def a_folded_history() -> list[dict]:
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "tool_use", "id": call_id, "name": "dump", "input": {}}
+                    {"type": "tool_use", "id": call_id, "name": "read_file", "input": {}}
                 ],
             }
         )
@@ -788,7 +788,7 @@ def a_folded_history() -> list[dict]:
                 ],
             }
         )
-    folded = fold_stale(messages)
+    folded = fold_stale(messages, foldable={"read_file"})
     assert folded is not messages, "没折到就没测到——先把常数调对再说"
     return folded
 

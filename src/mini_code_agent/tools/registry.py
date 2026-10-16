@@ -71,6 +71,15 @@ class ToolRegistry:
         """按注册顺序列出所有工具。"""
         return list(self.tools.values())
 
+    def foldable_names(self) -> frozenset[str]:
+        """这张表里**允许被折**的工具名（语义见 `Tool.foldable`，机制见 folding.py）。
+
+        由注册表**现算**，不写死一份名单。好处是 CLI 另外注入的 `agent` / `ask_user` 自动
+        落在外面——那两个没标那个字段，而**子 agent 交回来的结论正是最不该折的一类**（它
+        背后是一整趟子 agent，而且它交回来的就是"方向"本身）。
+        """
+        return frozenset(tool.name for tool in self.tools.values() if tool.foldable)
+
     def run(
         self, ctx: ToolContext, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
@@ -171,6 +180,7 @@ def default_tools() -> ToolRegistry:
                 fn=list_files,
                 params=LIST_FILES_SCHEMA,
                 read_only=True,
+                foldable=True,
             ),
             Tool(
                 name="project_tree",
@@ -193,6 +203,7 @@ def default_tools() -> ToolRegistry:
                 fn=read_file,
                 params=READ_FILE_SCHEMA,
                 read_only=True,
+                foldable=True,
             ),
             Tool(
                 name="read_memory",
@@ -289,6 +300,9 @@ def default_tools() -> ToolRegistry:
                 available=lambda ctx: ctx.allow_shell,
                 # 命令的输出取不回来——它有副作用，重跑一遍未必是同一件事。
                 spill=True,
+                # 但它也是历史里最肿的一块（测试日志、构建输出），而且落了盘就取得回来，
+                # 头一段里写着 id。
+                foldable=True,
             ),
             Tool(
                 name="glob",
@@ -300,6 +314,7 @@ def default_tools() -> ToolRegistry:
                 fn=glob,
                 params=GLOB_SCHEMA,
                 read_only=True,
+                foldable=True,
             ),
             Tool(
                 name="grep",
@@ -310,6 +325,7 @@ def default_tools() -> ToolRegistry:
                 fn=grep,
                 params=GREP_SCHEMA,
                 read_only=True,
+                foldable=True,
             ),
             Tool(
                 name="web_search",
@@ -323,6 +339,7 @@ def default_tools() -> ToolRegistry:
                 fn=web_search,
                 params=WEB_SEARCH_SCHEMA,
                 read_only=True,
+                foldable=True,
                 # 没配 key 就别发这两个——发出去是必错的。
                 available=lambda _: is_configured(),
             ),
@@ -336,6 +353,7 @@ def default_tools() -> ToolRegistry:
                 fn=web_fetch,
                 params=WEB_FETCH_SCHEMA,
                 read_only=True,
+                foldable=True,
                 available=lambda _: is_configured(),
                 # 正文是花钱取回来的，网页下一刻也可能变——截掉的部分再要就得重新取一次。
                 spill=True,

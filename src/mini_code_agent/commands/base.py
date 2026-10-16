@@ -57,13 +57,29 @@ class ChatState:
         self.context_covered = covered
 
     def forget_context(self) -> None:
-        """锚点作废——消息被压缩换掉了，旧的数还指着压缩前的历史。
+        """锚点作废——消息被换掉了（压缩或者折叠），旧的数还指着换之前的历史。
 
         不作废的话下一轮会以为上下文还是那么大：够阈值、又刚好攒够 7 轮，就会再压一次，
         阈值被架空成"每 7 轮压一次"。清掉之后下一轮退回粗估，再下一轮就有新的真数。
         """
         self.context_tokens = None
         self.context_covered = 0
+
+    def replaced(self, messages: list[dict]) -> bool:
+        """换一份历史（压缩或折叠之后的），并把锚点作废。返回"真换了吗"。
+
+        两个动作**必须成对**——换了历史不作废锚点，下一轮就会按换之前那个大小判断（见
+        forget_context）。合成一个方法是因为压缩和折叠都要做同一件事，分开写迟早有一条
+        漏掉，而漏掉是静默的。
+
+        "换没换"看的是**对象身份**：两条路都是"没改动就原样返回传进来那份"，所以 `is`
+        就是它们的信号（见 summarizing 和 folding 的模块说明）。
+        """
+        if messages is self.messages:
+            return False
+        self.messages = messages
+        self.forget_context()
+        return True
 
 
 @dataclass

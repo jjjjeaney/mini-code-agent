@@ -299,6 +299,15 @@ class TestTheAgentToolShape:
         """总结没有天然上限。不封顶的话，"只把结论拿回来"这句话就是空的。"""
         assert the_tool(ScriptedProvider([])).spill is True
 
+    def test_its_result_can_never_be_folded(self):
+        """**子 agent 交回来的结论不许被折掉。**
+
+        它是"方向"本身：折了模型就不知道自己在干什么了，而且它背后是一整趟子 agent——重跑
+        一遍是几分钟和几毛钱。做法是**什么都不做**：`foldable` 默认就是 False，这个工具没有
+        标它，折叠那边按 `Tool.foldable` 筛，自然落在外面（见 folding.py）。
+        """
+        assert the_tool(ScriptedProvider([])).foldable is False
+
 
 class TestRunningASubagent:
     def test_an_unknown_type_comes_back_as_a_plain_result(self, tmp_path):

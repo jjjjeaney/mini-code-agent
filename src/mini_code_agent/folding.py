@@ -15,11 +15,20 @@
 **折的是内存里的视图，不落盘。** 会话文件保持"实际发生过什么"的完整记录。盘上和内存因此会
 分叉，但那个分叉**下次到冷点会被重新折平**，所以没关系。压缩必须往盘上记一笔（因为它是一次
 花钱的模型调用，重算要再花一次钱），折叠重算不要钱，就不需要。
+
+**不是所有工具的结果都能折**：只有标了 `Tool.foldable` 的才进候选（见 tools/base.py）。子
+agent 交回来的结论就是"方向"本身、项目概览是"我现在在哪儿"的参照、模型特意去取回来的记忆和
+技能——那些折了就真丢了（而且重跑一遍可能是几分钟和几毛钱）。
+
+**没有手动入口**，这是有意的：它划不划算完全取决于"缓存冷不冷"，而那件事用户看不见（我们
+自己也只能靠文件 mtime 猜）。让人敲一条命令去赌，赌错了就是多付一次全价——真嫌上下文长，
+该敲的是 `/compact`。
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -73,10 +82,41 @@ def is_stale(
     return (time.time() if now is None else now) - last >= after
 
 
+def fold_if_stale(
+    messages: list[dict[str, Any]],
+    *,
+    foldable: Collection[str],
+    path: Path,
+    keep: int = KEEP_RECENT_RESULTS,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """缓存大概已经冷了（这个会话文件久没被写过）就折一次；不然原样返回（`is` 相等）。
+
+    "冷不冷"和"怎么折"合成一次调用，是为了让调用方那边只剩一行——**判据不该由调用方自己
+    拼**：两个常量（阈值和折叠规则）分在两处，改一个忘一个就是悄悄走错，而这条路上走错的
+    表现是"在缓存还热的时候折"，也就是钱。
+
+    没有折到就返回传进来那一份本身，和 `fold_stale` 一个信号。
+    """
+    if not is_stale(path, now=now):
+        return messages
+    return fold_stale(messages, foldable=foldable, keep=keep)
+
+
 def fold_stale(
-    messages: list[dict[str, Any]], *, keep: int = KEEP_RECENT_RESULTS
+    messages: list[dict[str, Any]],
+    *,
+    foldable: Collection[str],
+    keep: int = KEEP_RECENT_RESULTS,
 ) -> list[dict[str, Any]]:
     """把最近 `keep` 条以外的工具结果折成"开头一段 + 一句说明"。
+
+    **只有 `foldable` 里那些工具的结果进候选**——子 agent 的结论、项目概览、模型特意去取的
+    记忆和技能，一个都不动。而且 `keep` 数的也是**候选**里的，不是"最近几条工具结果"：不可
+    折的那些既不占名额、也不会被动。
+
+    `foldable` **没有默认值是有意的**：默认取空集等于"什么都不折"（功能悄悄没了），默认取
+    "全都折"更糟（子 agent 的结论会被折掉）。忘了传直接 TypeError，比静默走错强。
 
     **没折到就返回传进来那一份本身**（`is` 相等）——调用方靠这个判断"这一轮到底折没折"，
     和 `cli._compact` 用的是同一个信号。
@@ -92,13 +132,13 @@ def fold_stale(
     在别处是**共享引用**（`runagent` 只复制最外层那个列表），就地改会连调用方手里那份一起
     改掉。
     """
-    stale = _stale_positions(messages, keep)
+    stale = _stale_positions(messages, foldable, keep)
     if not stale:
         return messages
 
     replacements: dict[int, dict[int, str]] = {}
-    for message_index, block_index in stale:
-        folded = _fold(messages[message_index]["content"][block_index])
+    for message_index, block_index, name in stale:
+        folded = _fold(messages[message_index]["content"][block_index], name)
         if folded is not None:
             replacements.setdefault(message_index, {})[block_index] = folded
     if not replacements:
@@ -115,31 +155,59 @@ def fold_stale(
     return result
 
 
-def _stale_positions(
-    messages: list[dict[str, Any]], keep: int
-) -> list[tuple[int, int]]:
-    """要折的那几条工具结果在哪儿：`[(消息下标, 块下标), ...]`。
+def _tool_names(messages: list[dict[str, Any]]) -> dict[str, str]:
+    """`tool_use_id` → 工具名。
 
-    留最近 `keep` 个**块**（不是消息——一条消息里可能并排放着好几个），其余都是候选。
+    **`tool_result` 块自己不带工具名**——它只有 `tool_use_id`，名字在配对的那条 assistant
+    消息的 `tool_use` 块里。所以要认出一条结果属于哪个工具，得先把整份历史扫一遍。
     """
-    positions: list[tuple[int, int]] = []
+    names: dict[str, str] = {}
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                names[str(block.get("id"))] = str(block.get("name"))
+    return names
+
+
+def _stale_positions(
+    messages: list[dict[str, Any]], foldable: Collection[str], keep: int
+) -> list[tuple[int, int, str]]:
+    """要折的那几条在哪儿、各属于哪个工具：`[(消息下标, 块下标, 工具名), ...]`。
+
+    留最近 `keep` 个**候选**（不是"最近几条工具结果"，也不是最近几条消息——一条 assistant
+    回复里的多个 tool_use 会合成一条 user 消息回填，一条消息里可能并排放着好几个），其余的
+    都是要折的。
+
+    认不出工具名的（理论上不该有：配对错了请求本身就不合法）**当不可折处理**——宁可留着。
+    """
+    names = _tool_names(messages)
+    candidates: list[tuple[int, int, str]] = []
     for message_index, message in enumerate(messages):
         content = message.get("content")
         if not isinstance(content, list):
             continue
         for block_index, block in enumerate(content):
-            if isinstance(block, dict) and block.get("type") == "tool_result":
-                positions.append((message_index, block_index))
-    if len(positions) <= keep:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            name = names.get(str(block.get("tool_use_id")))
+            if name in foldable:
+                candidates.append((message_index, block_index, name))
+    if len(candidates) <= keep:
         return []
-    return positions[:-keep]
+    return candidates[:-keep]
 
 
-def _fold(block: dict[str, Any]) -> str | None:
+def _fold(block: dict[str, Any], name: str) -> str | None:
     """折一条结果，返回折完的文本；不值得折就返回 None。
 
-    **那句"不是工具出错"不能省**：模型看到结果突然变短，第一反应是"工具坏了、输出被截了"，
-    然后白跑一次去确认。说清这是历史整理，它才知道该不该重新要。
+    **工具名要写进去**：`tool_result` 自己不带它，模型看到一段没头没尾的说明，判不出被清掉的
+    是什么、也就判不出该不该重新要——那正是"丢了方向"的起点。
+
+    **"不是工具出错"和"怎么拿回来"两半也不能省**：模型看到结果突然变短，第一反应是"工具坏
+    了、输出被截了"，然后白跑一次去确认。
     """
     content = block.get("content")
     if not isinstance(content, str) or len(content) <= MIN_FOLD_CHARS:
@@ -147,5 +215,6 @@ def _fold(block: dict[str, Any]) -> str | None:
     dropped = len(content) - HEAD_CHARS
     return (
         f"{content[:HEAD_CHARS]}\n\n"
-        f"[后面的 {dropped:,} 个字符已清除：这是历史整理，不是工具出错]"
+        f"[{name} 的结果：后面 {dropped:,} 个字符已清除（历史整理，不是工具出错）。"
+        f"要原文可以重跑一次那个工具；上面写着落盘 id 的那种用 read_tool_result 取]"
     )

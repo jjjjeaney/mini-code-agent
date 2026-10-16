@@ -265,6 +265,56 @@ class TestDefaultTools:
             "bash",
         }
 
+    def test_the_foldable_ones_are_exactly_these(self):
+        """缓存冷了的时候能折的只有这几个（见 folding.py），**其余一律留着**。
+
+        判据是"又大、又能重新拿到"：文件能重读、搜索能重跑、命令和网页太长时本来就落过盘
+        （头一段里写着取回的 id）。断言整份名单而不是"这几个在里面"——加一个新工具、忘了想
+        它能不能折，这条就会红、逼人做那个决定。
+
+        **默认是"不折"**，所以漏标的那一侧是安全的：少省一点，不是丢东西。
+        """
+        foldable = {tool.name for tool in default_tools().list() if tool.foldable}
+
+        assert foldable == {
+            "list_files",
+            "read_file",
+            "glob",
+            "grep",
+            "web_search",
+            "web_fetch",
+            "bash",
+        }
+
+    def test_what_carries_conclusions_is_not_foldable(self):
+        """这几样折了就真丢了：项目概览是"我现在在哪儿"的参照，记忆和技能是模型**特意去取**
+        回来的，`read_tool_result` 取的也是它主动要的原文。
+
+        子 agent 那个工具（`agent`）不在这张表里——它在 CLI 层注入，压根没标 `foldable`。
+        它另有测试守着（见 tests/test_subagent.py）。
+        """
+        foldable = {tool.name for tool in default_tools().list() if tool.foldable}
+
+        assert not foldable & {
+            "project_tree",
+            "read_memory",
+            "read_skill",
+            "read_skill_file",
+            "read_tool_result",
+        }
+
+    def test_a_later_registered_tool_is_not_foldable(self):
+        """`foldable_names()` 是**现算**的，所以后注册的工具没标就不在内。
+
+        CLI 注入的 `agent` / `ask_user` 走的就是这条路——不必在折叠那边另写一份"这些不许
+        折"的名单，也就不存在两处名单漂移的问题。
+        """
+        registry = default_tools()
+        registry.register(Tool(name="agent", fn=lambda kwargs, ctx: ""))
+
+        assert "agent" not in registry.foldable_names()
+        assert "read_file" in registry.foldable_names()
+
 
 class FakeTavilyClient:
     """顶掉真的 Tavily 客户端：不发网络请求，同时记下收到的参数。"""
