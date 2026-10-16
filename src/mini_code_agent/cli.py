@@ -15,6 +15,7 @@ from mini_code_agent.commands import (
 from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
 from mini_code_agent.core.agent import runagent
+from mini_code_agent.core.subagent import make_agent_tool
 from mini_code_agent.memory import sync_index
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
@@ -321,6 +322,14 @@ def main_command(
     # provider 建一次就够（一次运行一个 HTTP 客户端）。system prompt 不在这儿建：一次性那条
     # 分支现拼一份，交互那条每轮重拼——记忆会中途变，见 _chat。
     provider = AnthropicProvider()
+    # 子 agent 那个工具在这儿装进去（`agent`），和上面的 `ask_user` 一样是 harness 才有的能力。
+    # **它排在 provider 后面，不是跟 ask_user 放一起**：那个工具要 provider 才能跑（子 agent
+    # 是要真发请求的），而 `registry` 建在 provider **之前**——那个顺序是有意的，见上面
+    # "接会话排在 provider 前面"那句。两条路（一次性、_chat）共用同一个 registry，所以装在
+    # 这儿两边都用得上。
+    registry.register(
+        make_agent_tool(provider=provider, prompter=prompter, grants=grants, model=provider.model)
+    )
     if prompt:
         # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
         console.print(f"> {prompt}", style="bold", markup=False)

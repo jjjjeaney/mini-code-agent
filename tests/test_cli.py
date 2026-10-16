@@ -508,3 +508,46 @@ def test_delete_takes_the_spilled_files_with_it(tmp_path, capsys, monkeypatch):
 
     assert "1 个落盘文件" in capsys.readouterr().out
     assert not directory.exists()
+
+
+class FakeOneShotProvider:
+    """一次性那条路上顶掉真 provider：不发请求，只记下模型见到了什么。"""
+
+    def __init__(self) -> None:
+        self.model = "fake"
+        self.tools: list[dict] | None = None
+
+    def complete(self, messages, tools=None, system=None) -> ModelResponse:
+        self.tools = tools
+        return ModelResponse(
+            text="好",
+            assistant_content=[{"type": "text", "text": "好"}],
+            stop_reason="end_turn",
+        )
+
+
+def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
+    """`agent` 是在 CLI 层 `registry.register()` 装进去的（和 `ask_user` 一样），
+    所以它**不在** `default_tools()` 里——而它必须真的发到模型手上。
+
+    这条走的是 `main_command` 那条真路：注册点排在 provider 后面（那个工具要 provider 才能
+    跑），所以光看单测验不到"它到底装没装上"。
+    """
+    provider = FakeOneShotProvider()
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda: provider)
+
+    cli.main_command(
+        prompt="你好",
+        cwd=tmp_path,
+        shell=False,
+        permission_mode="default",
+        continue_=False,
+        resume="",
+        list_=False,
+        delete_="",
+    )
+
+    offered = {schema["name"] for schema in provider.tools or []}
+    assert "agent" in offered
+    assert "ask_user" in offered  # 另一个 harness 注入的，顺带确认这条路没被改坏
+    capsys.readouterr()
