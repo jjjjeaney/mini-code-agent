@@ -7,11 +7,11 @@ prompting.py 里，那一层才 import typer。
 那个 ask_user 工具要问也是拿这个协议问。谁都只认这个协议，于是测试塞一个假实现就能把
 "问用户"那条路径整个跑起来。
 
-四种问法分两类：
+三种问法分两类：
 
-- `confirm_command` / `confirm_tool` / `confirm_edit` 是**守卫**：策略判了"要问"才轮到
-  它们。问不问由调用方（harness）决定，不由被问的东西决定——模型跳不过去。答案见 `Answer`：
-  除了准 / 不准，改文件那一档还能答"本会话这个文件别再问了"
+- `confirm_tool` / `confirm_edit` 是**守卫**：策略判了"要问"才轮到它们。问不问由调用方
+  （harness）决定，不由被问的东西决定——模型跳不过去。答案见 `Answer`：除了准 / 不准，
+  改文件那一档还能答"本会话这个文件别再问了"
 - `single_choice` 是**模型主动**想问用户：在若干选项里挑一个
 
 "该不该问"不在这儿判（那是 decide_permission 的事）。这儿只管怎么问、拿到答案之后
@@ -60,16 +60,16 @@ class Prompter(Protocol):
     "该不该问"不是。
     """
 
-    def confirm_command(self, command: str) -> Answer:
-        """让用户决定跑不跑这条命令。给的就是那条命令本身。
-
-        **不给"别再问了"那一档**：命令之间差异太大，记住其中一条没什么意义，而它又是唯一
-        没有 diff 可看的调用，逐条点头是对的。
-        """
-        ...
-
     def confirm_tool(self, request: PermissionRequest) -> Answer:
-        """让用户决定放不放行这次工具调用。不认得类别的那些走这一条。"""
+        """让用户决定放不放行这次工具调用。
+
+        **bash 也走这一条**：渲染该给的是那行命令本身、不是那串参数，但"命令藏在 args 的
+        哪个键上"是实现自己的事，harness 一路递的是整个 `request`。所以没单为它开一个
+        方法——开了也只是多一处要对齐的东西。
+
+        bash 那一档**不给"别再问了"**：命令之间差异太大，记住其中一条没什么意义，而它又是
+        唯一没有 diff 可看的调用，逐条点头是对的。
+        """
         ...
 
     def confirm_edit(self, request: PermissionRequest) -> Answer:
@@ -92,16 +92,13 @@ class Prompter(Protocol):
 class NullPrompter:
     """没人可问的时候用它。非交互的场景——测试、一次性跑一条指令——缺省就是它。
 
-    守卫类的三个答**拒绝**：没有安全的"问"法，但有安全的默认答案。挡下来，模型收到
+    守卫类的两个答**拒绝**：没有安全的"问"法，但有安全的默认答案。挡下来，模型收到
     一句"没人能批准这次调用"，换个不动文件的办法重来即可。这里绝不能等输入：等的是
     一个永远不会来的答案。
 
     `single_choice` 只能抛错：一道让用户做选择的问题没有缺省答案，替他挑一个就是替他
     做了决定。
     """
-
-    def confirm_command(self, command: str) -> Answer:
-        return Answer(False)
 
     def confirm_tool(self, request: PermissionRequest) -> Answer:
         return Answer(False)

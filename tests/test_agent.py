@@ -339,11 +339,6 @@ class RecordingPrompter:
         self.note = note
         self.tools: list[PermissionRequest] = []
 
-    def confirm_command(self, command: str) -> Answer:
-        # harness 现在不直接调这一条：bash 也走 confirm_tool，那行命令由 prompter 自己
-        # 认出来（见 prompting.py）。协议要求实现它，所以留着。
-        return self._answer()
-
     def confirm_tool(self, request: PermissionRequest) -> Answer:
         self.tools.append(request)
         return self._answer()
@@ -455,7 +450,10 @@ def test_bash_always_asks_even_in_accept_edits_mode():
     log: list[str] = []
     prompter = RecordingPrompter(allowed=True)
     provider = ScriptedProvider(
-        [tool_turn("t1", "bash", {"command": "pytest -q"}), text_turn("跑完了")]
+        [
+            tool_turn("t1", "bash", {"description": "跑一遍测试", "command": "pytest -q"}),
+            text_turn("跑完了"),
+        ]
     )
 
     runagent(
@@ -475,7 +473,9 @@ def test_bash_is_not_even_asked_when_shell_is_off():
     """没开 shell 的话它本来就跑不了。先弹一句询问、答完才发现跑不了，那是白问。"""
     log: list[str] = []
     prompter = RecordingPrompter(allowed=True)
-    provider = ScriptedProvider([tool_turn("t1", "bash", {"command": "ls"}), text_turn("好")])
+    provider = ScriptedProvider(
+        [tool_turn("t1", "bash", {"description": "列一下目录", "command": "ls"}), text_turn("好")]
+    )
 
     runagent("跑个测试", provider, gated_registry("bash", log), prompter=prompter)
 
@@ -505,7 +505,10 @@ def test_bypass_permissions_lets_commands_through_too():
     log: list[str] = []
     prompter = RecordingPrompter(allowed=False)
     provider = ScriptedProvider(
-        [tool_turn("t1", "bash", {"command": "pytest -q"}), text_turn("好")]
+        [
+            tool_turn("t1", "bash", {"description": "跑一遍测试", "command": "pytest -q"}),
+            text_turn("好"),
+        ]
     )
 
     runagent(
@@ -767,7 +770,10 @@ def test_a_dangerous_command_is_refused_even_after_the_user_says_yes():
     """
     prompter = RecordingPrompter(allowed=True)
     provider = ScriptedProvider(
-        [tool_turn("t1", "bash", {"command": "rm -rf /"}), text_turn("好")]
+        [
+            tool_turn("t1", "bash", {"description": "删掉根目录", "command": "rm -rf /"}),
+            text_turn("好"),
+        ]
     )
     registry = ToolRegistry([Tool(name="bash", description="", fn=bash, params=SHELL_SCHEMA)])
 

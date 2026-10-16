@@ -41,10 +41,6 @@ class RecordingPrompter:
         self.choice = choice
         self.asked: list = []
 
-    def confirm_command(self, command: str) -> Answer:
-        self.asked.append(("command", command))
-        return self.answer
-
     def confirm_tool(self, req: PermissionRequest) -> Answer:
         self.asked.append(("tool", req))
         return self.answer
@@ -191,16 +187,15 @@ class TestTheLabeledPrompter:
         assert "（[explore] 子 agent 请求：）" in capsys.readouterr().out
 
     def test_it_hands_every_method_through(self, capsys):
-        """四个方法都要转发——协议要完整，少一个就是把那句话吞了。"""
+        """三个方法都要转发——协议要完整，少一个就是把那句话吞了。"""
         inner = RecordingPrompter()
         labeled = _LabeledPrompter(inner, "plan")
 
-        labeled.confirm_command("pytest -q")
         labeled.confirm_tool(request())
         labeled.confirm_edit(request())
         labeled.single_choice("选哪个？", ["a", "b"])
 
-        assert [entry[0] for entry in inner.asked] == ["command", "tool", "edit", "choice"]
+        assert [entry[0] for entry in inner.asked] == ["tool", "edit", "choice"]
 
     def test_the_request_goes_through_untouched(self, capsys):
         """原样转发：内层收到的是**同一个** request 对象，一个字段都没改。"""

@@ -55,6 +55,21 @@ class TestPreviewCommand:
         assert "容器" in text
         assert "没有网络" in text
 
+    def test_the_models_own_description_rides_above_the_command(self):
+        """模型写的那句说明单独占一行，而且摆在**命令上面**。
+
+        分开摆是有意的：说明可能跟命令实际做的事对不上，而用户要放的是**命令**——
+        两样挨着但不混在一起，对不上才看得出来。
+        """
+        text = preview_command("pytest -q", "跑一遍测试")
+
+        assert "跑一遍测试" in text
+        assert text.index("跑一遍测试") < text.index("pytest -q")
+
+    def test_without_a_description_nothing_is_invented(self):
+        """没给说明就不写那一行——别编一个出来。"""
+        assert "模型说这条是用来" not in preview_command("ls")
+
 
 class TestPreviewEdit:
     def test_edit_file_shows_both_sides_of_the_change(self):
@@ -157,7 +172,9 @@ class TestTerminalPrompter:
     def test_a_yes_goes_through(self, monkeypatch):
         monkeypatch.setattr(prompting.typer, "prompt", answering("y"))
 
-        assert TerminalPrompter().confirm_command("pytest -q").allowed is True
+        prompter = TerminalPrompter()
+
+        assert prompter.confirm_tool(request("bash", command="pytest -q")).allowed is True
 
     def test_a_no_goes_through(self, monkeypatch):
         monkeypatch.setattr(prompting.typer, "prompt", answering("n"))
@@ -172,11 +189,25 @@ class TestTerminalPrompter:
 
         assert "pytest -q" in capsys.readouterr().err
 
+    def test_bash_shows_the_description_the_model_wrote(self, monkeypatch, capsys):
+        """模型给的那句说明一路传到预览里——它是用户判断的依据里的一部分。
+
+        harness 全程只递**整个** request（`_gate` 把模型给的参数原样装进去），所以
+        "description 藏在 tool_args 哪个键上"这件事只有 prompter 知道。
+        """
+        monkeypatch.setattr(prompting.typer, "prompt", answering("y"))
+
+        TerminalPrompter().confirm_tool(
+            request("bash", command="pytest -q", description="跑一遍测试")
+        )
+
+        assert "跑一遍测试" in capsys.readouterr().err
+
     def test_the_preview_goes_to_stderr_not_stdout(self, monkeypatch, capsys):
         """stdout 留给最终答案：`mca "..." > out.txt` 不该收到提示。"""
         monkeypatch.setattr(prompting.typer, "prompt", answering("y"))
 
-        TerminalPrompter().confirm_command("pytest -q")
+        TerminalPrompter().confirm_tool(request("bash", command="pytest -q"))
 
         captured = capsys.readouterr()
         assert "pytest -q" in captured.err
@@ -202,7 +233,7 @@ class TestTerminalPrompter:
     def test_a_command_does_not_offer_it(self, monkeypatch, capsys):
         monkeypatch.setattr(prompting.typer, "prompt", answering("a"))
 
-        answer = TerminalPrompter().confirm_command("pytest -q")
+        answer = TerminalPrompter().confirm_tool(request("bash", command="pytest -q"))
 
         assert answer.remember is False
         assert "本会话" not in capsys.readouterr().err  # 提示里也不该出现这一档
@@ -220,7 +251,9 @@ class TestTerminalPrompter:
         """直接回车不算回答：放行这种事不该有一个顺手敲过去就过的默认值。"""
         monkeypatch.setattr(prompting.typer, "prompt", answering("", "y"))
 
-        assert TerminalPrompter().confirm_command("pytest -q").allowed is True
+        prompter = TerminalPrompter()
+
+        assert prompter.confirm_tool(request("bash", command="pytest -q")).allowed is True
 
     def test_single_choice_returns_the_picked_option(self, monkeypatch):
         monkeypatch.setattr(prompting.typer, "prompt", answering("2"))
@@ -246,9 +279,6 @@ class FixedPrompter:
     def __init__(self, answer: str) -> None:
         self.answer = answer
         self.asked: list[tuple[str, list[str]]] = []
-
-    def confirm_command(self, command: str) -> Answer:
-        return Answer(True)
 
     def confirm_tool(self, request: PermissionRequest) -> Answer:
         return Answer(True)

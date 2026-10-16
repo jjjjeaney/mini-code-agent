@@ -173,7 +173,7 @@ class _LabeledPrompter:
     子 agent 要改文件时用户看到的提示和主 agent 一模一样——配上"Grants 两份共用"那条，
     他根本分不清"本会话别再问"批给了谁、批的是什么。
 
-    实现的是 `Prompter` 协议**全部四个方法**：协议要完整。`single_choice` 实际上到不了
+    实现的是 `Prompter` 协议**全部三个方法**：协议要完整。`single_choice` 实际上到不了
     （子 agent 的池子里没有 `ask_user`），但有它这条协议才是闭合的。
     """
 
@@ -183,10 +183,6 @@ class _LabeledPrompter:
 
     def _announce(self) -> None:
         console.print(f"（[{self._name}] 子 agent 请求：）", style="dim", markup=False)
-
-    def confirm_command(self, command: str) -> Answer:
-        self._announce()
-        return self._inner.confirm_command(command)
 
     def confirm_tool(self, request: PermissionRequest) -> Answer:
         self._announce()
@@ -214,8 +210,8 @@ def _describe() -> str:
         "所以当你要查清楚一件事、而查的过程本身要翻很多文件时，用它——省下的是上下文，"
         "不是钱（它每一步都是另外的请求）。\n\n"
         f"`type` 可选：\n{kinds}\n\n"
-        "**plan 档下只用 `explore` 或 `plan`。** 那一档里 `general-purpose` 改不了任何东西，"
-        "派了也是白烧步数。"
+        "**plan 档下只用 `explore` 或 `plan`。** 那一档里 `general-purpose` 改文件会被直接拒，"
+        "派了大概率白烧步数。"
     )
 
 

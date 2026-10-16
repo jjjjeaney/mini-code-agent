@@ -53,13 +53,20 @@ def _mark(text: str, sign: str) -> str:
     return "\n".join(f"{sign} {line}" for line in lines)
 
 
-def preview_command(command: str) -> str:
+def preview_command(command: str, description: str = "") -> str:
     """一条命令的预览。
 
     沙箱那几行要写全：用户判的就是"这条命令会碰到什么"，光给一条命令是判不动的。
+
+    `description` 是模型自己写的"这条命令要做什么"。它跟命令正文**分开摆、不拼进一行**，
+    这是有意的：说明可能跟命令实际做的事对不上，而用户要放的其实是**命令**——两样分开，
+    对不上才看得出来。也别指望它准，它只是给用户一个起点，命令原文还在下面摆着。
     """
+    head = "要跑这条命令："
+    if description:
+        head += f"\n\n{INDENT}模型说这条是用来：{description}"
     return (
-        f"要跑这条命令：\n\n{_block(command)}\n\n"
+        f"{head}\n\n{_block(command)}\n\n"
         f"{INDENT}（跑在一次性容器里：只有项目目录挂进去、可写；根文件系统只读；没有网络；"
         f"跑完就删）"
     )
@@ -148,19 +155,24 @@ def interpret_choice(raw: str, options: Sequence[str]) -> str | None:
 
 
 class TerminalPrompter:
-    """把四个问题摆到终端上的那一版。
+    """把三个问题摆到终端上的那一版。
 
     没有构造参数、不存状态：它只做两件事——把该看的给人看，把答案读回来。
     """
 
-    def confirm_command(self, command: str) -> Answer:
-        return self._ask(preview_command(command))
-
     def confirm_tool(self, request: PermissionRequest) -> Answer:
         # bash 走这一条进来，但要看的是那行命令本身、不是它前面那串参数——分派留在
         # prompter 里，harness 就不必知道"命令藏在 args 的哪个键上"。
+        #
+        # 那条说明也在这儿取：harness 一路传下来的是**整个** request（`_gate` 把模型给的
+        # 参数原样装进去），所以它不需要知道 "description" 这个键的存在。
         if request.tool_name == "bash":
-            return self.confirm_command(str(request.tool_args.get("command", "")))
+            return self._ask(
+                preview_command(
+                    str(request.tool_args.get("command", "")),
+                    str(request.tool_args.get("description", "")),
+                )
+            )
         return self._ask(preview_tool(request))
 
     def confirm_edit(self, request: PermissionRequest) -> Answer:

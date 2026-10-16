@@ -44,6 +44,13 @@ MAX_CAPTURED_BYTES = 2 * 1024 * 1024
 SHELL_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
+        "description": {
+            "type": "string",
+            "description": (
+                "这条命令要做什么，一句话说清。**写给用户看的**：放行之前要他点头，"
+                "而这一行就是他判断的依据——说清意图，别复述命令原文"
+            ),
+        },
         "command": {
             "type": "string",
             "description": "要执行的 shell 命令，交给容器里的 /bin/sh -c 跑",
@@ -56,7 +63,7 @@ SHELL_SCHEMA: dict[str, Any] = {
             ),
         },
     },
-    "required": ["command"],
+    "required": ["description", "command"],
 }
 
 
@@ -75,6 +82,10 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     太长的话由 registry 整篇落盘、上下文里只留预览（这个工具在那边标了 spill）。所以
     这里只留得住 MAX_CAPTURED_BYTES 以内——连这个都超的，才真的丢东西。
 
+    `description` 是模型自己写的"这条命令要做什么"，必填。它**不参与任何判定**（黑名单、
+    权限、沙箱都只看 `command`），去处只有一个：用户批准之前看到的那段预览（见
+    `prompting.preview_command`）。
+
     命令先过一道危险命令黑名单（`safety.py` 的 `DENY_PATTERNS`）：命中就直接拒，不执行。
     那是**启发式、不是边界**——边界是下面这个容器。
     """
@@ -87,6 +98,16 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     command = kwargs["command"]
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command 得是非空的字符串。")
+
+    # `description` 不是给我们看的元数据，是**给用户看的**：这条命令要跑得他点头，而他手上
+    # 只有这一行说明和下面那条命令。空着就等于把那一步判断推回给"读命令原文自己猜"，
+    # 而省掉那个正是它存在的理由。它**不参与任何判定**——黑名单、权限、沙箱照旧只看
+    # `command`；这里卡一道只是不让模型把它交了差。
+    description = kwargs.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError(
+            "description 得是非空的字符串：一句话说清这条命令要做什么，它是给用户看的。"
+        )
 
     # 危险命令黑名单。放在这儿（工具的闸门里）意味着它**在权限闸门之后**：用户先被问过、
     # 点了头，这儿照样能拒——"批准"不等于"这件事就安全"，和路径围栏、读-before-写一个道理。

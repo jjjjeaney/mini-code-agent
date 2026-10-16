@@ -61,24 +61,36 @@ class TestBashGuards:
         ctx = ToolContext(cwd=tmp_path)
 
         with pytest.raises(ShellDisabledError, match="没开命令执行能力"):
-            bash({"command": "echo hi"}, ctx)
+            bash({"description": "试一条命令", "command": "echo hi"}, ctx)
 
     def test_an_empty_command_is_rejected(self, shell_ctx):
         with pytest.raises(ValueError, match="非空"):
-            bash({"command": "   "}, shell_ctx)
+            bash({"description": "跑一条空命令", "command": "   "}, shell_ctx)
 
     def test_a_non_string_command_is_rejected(self, shell_ctx):
         with pytest.raises(ValueError, match="非空"):
-            bash({"command": 123}, shell_ctx)
+            bash({"description": "跑一条非字符串命令", "command": 123}, shell_ctx)
 
     def test_a_dangerous_command_is_refused_before_anything_runs(self, shell_ctx):
         """黑名单在工具里、在起容器之前——所以这条不需要 docker，也不需要真有危险。"""
         with pytest.raises(DangerousCommandError, match="黑名单"):
-            bash({"command": "rm -rf /"}, shell_ctx)
+            bash({"description": "删掉根目录", "command": "rm -rf /"}, shell_ctx)
 
     def test_the_refusal_names_the_rule(self, shell_ctx):
         with pytest.raises(DangerousCommandError, match="格式化或抹掉设备"):
-            bash({"command": "mkfs.ext4 /dev/sda1"}, shell_ctx)
+            bash({"description": "格式化一块设备", "command": "mkfs.ext4 /dev/sda1"}, shell_ctx)
+
+    def test_a_missing_description_is_rejected(self, shell_ctx):
+        """说明是必填的：它不参与任何判定，但**用户是靠它决定放不放行**的。
+
+        空着的话，那一步判断就被推回给"读命令原文自己猜"——而省掉那个正是它存在的理由。
+        """
+        with pytest.raises(ValueError, match="description"):
+            bash({"command": "echo hi"}, shell_ctx)
+
+    def test_a_blank_description_is_rejected_too(self, shell_ctx):
+        with pytest.raises(ValueError, match="description"):
+            bash({"description": "   ", "command": "echo hi"}, shell_ctx)
 
 
 def _mounts(argv: list[str]) -> list[str]:
@@ -192,27 +204,36 @@ class TestTimeoutClamping:
 @needs_docker
 class TestBashInDocker:
     def test_it_runs_a_command(self, shell_ctx):
-        out = bash({"command": "echo hello"}, shell_ctx)
+        out = bash({"description": "打个招呼", "command": "echo hello"}, shell_ctx)
 
         assert "[退出码 0]" in out
         assert "hello" in out
 
     def test_a_nonzero_exit_code_is_a_result_not_an_exception(self, shell_ctx):
         """命令失败是**结果**——交回模型让它自己改。工具出错才是异常。"""
-        out = bash({"command": "exit 3"}, shell_ctx)
+        out = bash({"description": "故意让命令失败", "command": "exit 3"}, shell_ctx)
 
         assert "[退出码 3]" in out
 
     def test_the_project_directory_is_mounted(self, shell_ctx, tmp_path):
         (tmp_path / "marker.txt").write_bytes(b"from the host\n")
 
-        out = bash({"command": "cat /workspace/marker.txt"}, shell_ctx)
+        out = bash(
+            {"description": "读挂进来的文件", "command": "cat /workspace/marker.txt"},
+            shell_ctx,
+        )
 
         assert "from the host" in out
 
     def test_it_can_write_the_workspace_but_not_the_root(self, shell_ctx, tmp_path):
         out = bash(
-            {"command": "touch /workspace/new.txt && echo wrote; touch /etc/nope || echo blocked"},
+            {
+                "description": "往工作区和根分区各写一个文件",
+                "command": (
+                    "touch /workspace/new.txt && echo wrote; "
+                    "touch /etc/nope || echo blocked"
+                ),
+            },
             shell_ctx,
         )
 
@@ -233,14 +254,19 @@ class TestBashInDocker:
             "cat /workspace/.agent/note.md && "
             "touch /workspace/.agent/x || echo blocked"
         )
-        out = bash({"command": command}, shell_ctx)
+        out = bash(
+            {"description": "读 .agent 里的文件，再试着往里写", "command": command}, shell_ctx
+        )
 
         assert "看得见吗" in out  # 读得到
         assert "blocked" in out  # 写不了
         assert not (tmp_path / ".agent" / "x").exists()
 
     def test_output_is_redacted(self, shell_ctx):
-        out = bash({"command": "echo 'DEEPSEEK_API_KEY=sk-live-abcdef'"}, shell_ctx)
+        out = bash(
+            {"description": "打印一个假密钥", "command": "echo 'DEEPSEEK_API_KEY=sk-live-abcdef'"},
+            shell_ctx,
+        )
 
         assert "sk-live-abcdef" not in out
         assert "已涂黑" in out
@@ -251,7 +277,10 @@ class TestBashInDocker:
         monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(int=0))
         name = "mca-0000000000"
 
-        out = bash({"command": "sleep 30", "timeout_seconds": 2}, shell_ctx)
+        out = bash(
+            {"description": "睡 30 秒，用来看超时", "command": "sleep 30", "timeout_seconds": 2},
+            shell_ctx,
+        )
 
         assert "已超时" in out
         still_running = subprocess.run(
@@ -268,7 +297,13 @@ class TestBashInDocker:
         以前是 8000 字节一刀切，尾巴直接丢——而测试失败的清单恰恰在尾巴上。现在那个尾巴会
         跟着落盘文件一起留下来，上下文里换成的是一段预览。
         """
-        out = bash({"command": "python -c \"print('x' * 20000)\""}, shell_ctx)
+        out = bash(
+            {
+                "description": "打印两万个字符，用来看落盘",
+                "command": "python -c \"print('x' * 20000)\"",
+            },
+            shell_ctx,
+        )
 
         assert "被截断" not in out and "输出太多" not in out
         assert out.count("x") == 20000
@@ -286,7 +321,14 @@ class TestBashInDocker:
         )
         result = registry.dispatch(
             shell_ctx,
-            ToolCall(id="t1", name="bash", arguments={"command": command}),
+            ToolCall(
+                id="t1",
+                name="bash",
+                arguments={
+                    "description": "打印假密钥和两万个字符，用来看涂黑和落盘",
+                    "command": command,
+                },
+            ),
         )
 
         spilled = list((shell_ctx.cwd / ".agent" / "tool-results").glob("bash-*.txt"))

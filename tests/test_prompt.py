@@ -16,10 +16,9 @@ def request(name: str = "write_file") -> PermissionRequest:
 
 
 class TestNullPrompter:
-    def test_it_answers_no_to_the_three_guards(self):
+    def test_it_answers_no_to_the_guards(self):
         prompter = NullPrompter()
 
-        assert prompter.confirm_command("pytest -q").allowed is False
         assert prompter.confirm_tool(request()).allowed is False
         assert prompter.confirm_edit(request("edit_file")).allowed is False
 
@@ -44,10 +43,6 @@ class FakePrompter:
 
     def __init__(self) -> None:
         self.asked: list[str] = []
-
-    def confirm_command(self, command: str) -> Answer:
-        self.asked.append(command)
-        return Answer(True)
 
     def confirm_tool(self, request: PermissionRequest) -> Answer:
         self.asked.append(request.tool_name)
@@ -75,7 +70,6 @@ class TestItIsNotPartOfTheToolLayer:
         """harness 只认协议：换一个实现进来就够了，不用经过 ToolContext。"""
         fake = FakePrompter()
 
-        assert fake.confirm_command("pytest -q").allowed is True
         assert fake.confirm_tool(request()).allowed is True
         assert fake.confirm_edit(request("edit_file")).allowed is False
         assert fake.single_choice("用哪个？", ["a", "b"]) == "a"

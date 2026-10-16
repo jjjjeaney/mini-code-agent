@@ -353,7 +353,9 @@ EDIT_TOOLS = ("write_file", "edit_file", "replace_lines")
 
 **已定：维持现状**——plan 下 bash 仍然问，不直接拒。理由是不想把"计划阶段跑 `git status`、`pytest --collect-only` 这类只读命令"一起堵死；靠拒掉 bash 来兑现"只读"，代价是计划阶段什么都查不了。
 
-**代价，以及配套**：于是"plan = 只读"实际靠的是**模型自己只用读命令**——那是引导，不是强制。配套是在 system prompt 里把这条写明（**还没有默认 system prompt，见 D2**；在那之前 plan 的只读承诺是空的，界面上不该说成"只读"）。被否掉的那条路是 plan 下直接拒 bash；真要做"只读命令白名单"，那是另一摊工作，而且白名单本身是启发式、会漏。
+**代价，以及配套**：于是"plan = 只读"实际靠的是**模型自己只用读命令**——那是引导，不是强制。配套已经写在那儿了：`system_prompt.py` 的 `_MODE_HINTS["plan"]` 里明说了"只用读类工具和只读命令……不要请求会改动任何东西的命令"（那句要有个默认 system prompt 才发得出去，而 D2 2026-10-12 已修）。界面上也没说错——`/permission_mode` 报 plan 时印的是"只读：改文件直接拒（bash 仍然要问）"。被否掉的那条路是 plan 下直接拒 bash；真要做"只读命令白名单"，那是另一摊工作，而且白名单本身是启发式、会漏。
+
+**子 agent 那边同理**：plan 档下派出的 `general-purpose` 子 agent 继承这一档，所以 `bash` 在它手里照样是"问"——见 H6。
 
 ### F3. 改文件的确认没有真 diff —— 取舍
 
@@ -525,18 +527,29 @@ EDIT_TOOLS = ("write_file", "edit_file", "replace_lines")
 
 **为什么不做递归**：深度不可控，成本也不可控（每层第一发全价，见 H2）。真需要就手工分两步派。
 
-### H6. plan 档下派 `general-purpose` 子 agent 是白烧步数 —— 已处理（只在文字里）
+### H6. plan 档下的 `general-purpose` 子 agent **并没有**被锁成只读 —— 已处理（只在文字里拦）
 
-**现在的行为**：子 agent **继承**主 agent 当前那一档。所以 plan 档下的 `general-purpose`
-子 agent 写操作会被闸门 `deny`，而它系统提示词里那句（继承来的 `_MODE_HINTS["plan"]`）也在
-说"只做调查，不要请求改文件"。两头一夹，它实际只能读——和 `explore` 没区别。模型要是不认账、
-反复试写，会一路吃 deny 直到把步数烧完。
+**现在的行为**：子 agent **继承**主 agent 当前那一档。所以 plan 档下派出的 `general-purpose`
+和同一档下的主 agent 处境完全一样：
+
+- 改文件那三个（`write_file` / `edit_file` / `replace_lines`）被闸门 **deny**；
+- **`bash` 是 ask，不是 deny**——跟 F2 记的是同一件事。用户点头，它照样能跑命令，而命令能
+  改项目里任何文件、绕过文件工具的全部闸门（见 A1）。
+
+**所以它和 `explore` 不是一回事，别混。** `explore` / `plan` 是**池子里压根没有** bash
+（`bash` 标的是 `read_only=False`，筛掉了——硬性的，没有绕过的余地）；`general-purpose`
+是**用户得自己拦**。这是两种不同性质的"不能"。
 
 **为什么不做机制上的限制**：`type` 的枚举写死在 schema 里（`Tool.params` 不随 `ctx` 变），
 收不窄。改成按档位动态生成工具表是另一摊事——而且工具表一变，主 agent 的缓存前缀当场作废。
 
+**代价**：模型要是不认账、反复试写文件，会一路吃 deny 直到把步数烧完（**这一步才是"白烧
+步数"**，不是"它只能读"）。
+
 **怎么处理的**：在 `agent` 工具的说明里明写"**plan 档下只用 `explore` 或 `plan`**"，
-测试里有一条盯着那句话还在（`test_the_description_warns_about_plan_mode`）。
+测试里有一条盯着那句话还在（`test_the_description_warns_about_plan_mode`）。加上
+`_LabeledPrompter` 打的那行来源标记，用户至少看得出这条确认来自子 agent——但**"同意"在
+plan 档下意味着什么，得他自己知道**。
 
 ### H7. 子 agent 的总结落盘，但它自己不落盘 —— 取舍
 
