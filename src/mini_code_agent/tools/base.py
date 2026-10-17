@@ -189,20 +189,34 @@ class Tool:
     # **默认 False 落在安全的那一侧**：新加一个工具忘了标，后果是"它的结果不会被折"（少省
     # 一点），而不是"它的结论被折没了"。和 `read_only` 是同一个道理。
     #
-    # 该标的是那类"**又大、又能重新拿到**"的结果——文件能重读、搜索能重跑、太长的那些本来
-    # 就落过盘（头一段里写着取回的 id）。反过来，**结论和方向不能折**：子 agent 交回来的
-    # 方案、项目概览、模型特意去取的记忆和技能，那些折了就真没了（它背后可能是一整趟子
-    # agent，重跑一遍是几分钟和几毛钱）。
-    #
-    # 它还和 `spill` 是一对：spill 决定"太长的那条要不要留一份在盘上"，foldable 决定
-    # "旧的那条能不能从上下文里拿掉"。两个都开 = 拿掉了也取得回来。
+    # 该标的是那类"又大、又**不再需要时丢了也不心疼**"的结果。按"还能不能拿回来"分两种，
+    # 见下面的 `fold_persist`。反过来，**结论和方向不能折**：子 agent 交回来的方案、项目
+    # 概览、模型特意去取的记忆和技能，那些折了就真没了（它背后可能是一整趟子 agent，重跑
+    # 一遍是几分钟和几毛钱）。
     foldable: bool = False
+
+    # 折叠**之前先留一份到盘上**（见 tools/spill.py），上下文里只留路径和 id。
+    #
+    # 给"**重跑拿不回来**"的那几类标：`bash`（命令有副作用）、`web_fetch`（网页会变）、
+    # `web_search`（重搜花钱、结果会漂）。反过来，`read_file` / `grep` / `glob` /
+    # `list_files` **不标**——重跑一次免费，而且拿到的还是当前内容；存一份旧快照反而可能
+    # 让模型照着过期的东西改。
+    #
+    # **隐含 `foldable`**（`__post_init__` 会拦）：不折的工具根本走不到那条路上。
+    #
+    # 和 `spill` 的分工：`spill` 管"**执行时**结果太长要不要留一份"，`fold_persist` 管
+    # "**很久以后**这条旧结果被折掉时要不要先留一份"。两个都开 = 哪条路都不会真丢。
+    fold_persist: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("工具名不能为空")
         if not callable(self.fn):
             raise TypeError(f"工具 {self.name!r} 的 fn 必须可调用")
+        if self.fold_persist and not self.foldable:
+            raise ValueError(
+                f"工具 {self.name!r} 标了 fold_persist 却没标 foldable——不折的工具走不到那条路"
+            )
 
     def to_anthropic_schema(self) -> dict[str, Any]:
         """转成 Messages API 的 tools 条目。description 为空时不带这个键，免得发 null 过去。"""

@@ -315,6 +315,28 @@ class TestDefaultTools:
         assert "agent" not in registry.foldable_names()
         assert "read_file" in registry.foldable_names()
 
+    def test_the_fold_persist_ones_are_exactly_these(self):
+        """折叠时"重跑拿不回来"、所以必须先落一份的，只有这三个。
+
+        判据是**重跑一次未必等价**：命令有副作用、网页会变、搜索花钱还会漂。`read_file` /
+        `grep` / `glob` / `list_files` 不在里面——重跑免费，而且拿到的还是当前内容。
+        """
+        persist = {tool.name for tool in default_tools().list() if tool.fold_persist}
+
+        assert persist == {"bash", "web_search", "web_fetch"}
+
+    def test_fold_persist_implies_foldable(self):
+        """不折的工具根本走不到那条路上，标了就是配错了——直接报出来，别静默失效。"""
+        with pytest.raises(ValueError):
+            Tool(name="x", fn=lambda kwargs, ctx: "", fold_persist=True)
+
+    def test_a_later_registered_tool_is_not_fold_persisted(self):
+        registry = default_tools()
+        registry.register(Tool(name="agent", fn=lambda kwargs, ctx: "", spill=True))
+
+        assert "agent" not in registry.fold_persist_names()
+        assert "bash" in registry.fold_persist_names()
+
 
 class FakeTavilyClient:
     """顶掉真的 Tavily 客户端：不发网络请求，同时记下收到的参数。"""
@@ -587,7 +609,7 @@ class TestSpilling:
     def test_an_ill_shaped_id_falls_back_to_the_old_name(self, ctx):
         """`tool_use_id` 是**服务端响应**里的字符串，不能无条件拼进路径。
 
-        形状不对就退回 `<工具名>-<随机>`：照常落盘、照常取得回来，只是名字回到旧格式。
+        形状不对就退回 `<工具名>-<摘要>`：照常落盘、照常取得回来，只是名字回到旧格式。
         卡的是写文件——读那边另有围栏，但写比读更糟，那边至少还有兜底。
         """
         registry = self.registry(lambda kwargs, c: "x" * self.LONG, spill=True)
@@ -601,3 +623,39 @@ class TestSpilling:
         assert saved[0].parent == ctx.cwd / TOOL_RESULTS_DIR
         assert saved[0].stem.startswith("chatty-")
         assert saved[0].stem in result.result
+
+    def test_the_ill_shaped_id_fallback_is_deterministic(self, ctx):
+        """回退名必须稳定：折叠每次都从没改过的会话文件重算，随机名会让
+        "已经存在就不写"永不命中，每折一次多一个文件。
+        """
+        first = spill.save(ctx, "chatty", "../../x", "一份")
+        second = spill.save(ctx, "chatty", "../../x", "另一份")
+
+        assert first == second
+        assert first is not None and first.stem.startswith("chatty-")
+
+    def test_saving_the_same_id_twice_does_not_overwrite(self, ctx):
+        """同一个 id 第二次落盘**什么都不做**——折叠会反复重算，不能每算一次就重写一遍。"""
+        first = spill.save(ctx, "chatty", "t1", "第一份")
+        assert first is not None
+        first.write_text("被改过", encoding="utf-8")
+
+        second = spill.save(ctx, "chatty", "t1", "第二份")
+
+        assert second == first
+        assert first.read_text(encoding="utf-8") == "被改过"
+
+    def test_a_failed_save_into_returns_none(self, tmp_path, monkeypatch):
+        def boom(*args, **kwargs):
+            raise OSError("盘满了")
+
+        monkeypatch.setattr(spill, "_write_atomic", boom)
+
+        assert spill.save_into(tmp_path, "chatty", "t1", "正文") is None
+
+    def test_display_path_is_relative_inside_and_absolute_outside(self, tmp_path):
+        inside = tmp_path / ".agent" / "tool-results" / "s1" / "t1.txt"
+        outside = tmp_path.parent / "elsewhere" / "t1.txt"
+
+        assert spill.display_path(tmp_path, inside) == ".agent/tool-results/s1/t1.txt"
+        assert spill.display_path(tmp_path, outside) == outside.as_posix()

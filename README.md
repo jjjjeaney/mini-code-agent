@@ -36,7 +36,7 @@ uv run mca
 
 会话按目录存在 `.agent/sessions/` 里。`--list` 列出有过哪些（连同各自的 id），`--resume <id>` 接上某一次；`--continue` 接最近一次**说过话**的。
 
-工具输出太长时（`bash` 的命令输出、`web_fetch` 取回的网页），完整内容落在 `.agent/tool-results/<会话 id>/` 里，上下文里只留一段预览——需要的时候模型用 `read_tool_result` 把它取回来。这样截断不再是不可逆的：长日志的**尾巴**（测试失败清单就在那儿）也留得住。按会话分目录是为了让 `--delete` 能把它们连同会话一起删掉（删之前会告诉你一共有几个）。
+工具输出太长时（`bash` 的命令输出、`web_fetch` 取回的网页），完整内容落在 `.agent/tool-results/<会话 id>/` 里，上下文里只留一段预览——需要的时候模型用 `read_tool_result` 把它取回来。这样截断不再是不可逆的：长日志的**尾巴**（测试失败清单就在那儿）也留得住。按会话分目录是为了让 `--delete` 能把它们连同会话一起删掉（删之前会告诉你一共有几个）。缓存冷了之后折叠旧工具结果时，重跑拿不回来的那几类（`bash`、`web_fetch`、`web_search`）也会先按工具调用 id 存一份进来，同样用 `read_tool_result` 取。
 
 ```bash
 uv run mca --list

@@ -598,6 +598,33 @@ def result_contents(messages: list[dict]) -> list[str]:
     return found
 
 
+def a_bash_history(turns: int = 7) -> list[dict]:
+    """几轮"跑了个长命令"的历史——`bash` 是那类"折掉之后重跑不等价"的工具。"""
+    messages: list[dict] = []
+    for index in range(turns):
+        call_id = f"t{index}"
+        messages.append({"role": "user", "content": f"第 {index} 句"})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": call_id, "name": "bash", "input": {}}],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": f"第 {index} 条结果" + "x" * (MIN_FOLD_CHARS + 100),
+                    }
+                ],
+            }
+        )
+    return messages
+
+
 def age_the_file(session: Session) -> None:
     """把会话文件做旧，装成"上一轮结束之后过了很久"——也就是缓存该冷了。
 
@@ -687,3 +714,102 @@ def test_folding_does_not_duplicate_or_overwrite_what_lands_on_disk(monkeypatch,
     # 原来那些一条不多一条不少，加上这一轮的用户那句和回答那句
     assert len(stored) == len(history) + 2
     assert "已清除" not in str(stored)  # 盘上还是完整的原文
+
+
+def test_folding_persists_unrecoverable_results_to_the_session_directory(
+    monkeypatch, tmp_path
+):
+    """`bash` 的结果折掉之后重跑不等价，所以折之前先按 `tool_use_id` 落一份到会话目录。"""
+    history = a_bash_history()
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append(history)
+    age_the_file(session)
+    provider = ScriptedProvider([text_turn("好")])
+
+    run_loop(
+        monkeypatch,
+        provider,
+        ["接着说", "/exit"],
+        tmp_path,
+        session=session,
+        messages=history,
+        registry=default_tools(),
+    )
+
+    saved = spill.session_dir(tmp_path, session.id) / "t0.txt"
+    assert saved.is_file()
+    assert saved.read_text(encoding="utf-8") == history[2]["content"][0]["content"]
+
+    sent = result_contents(provider.calls[0])
+    assert ".agent/tool-results/" in sent[0]
+    assert 'id 传 "t0"' in sent[0]
+    assert "重跑" not in sent[0]  # 别让模型去重跑一条有副作用的命令
+
+
+def test_folding_never_overwrites_a_file_that_is_already_there(monkeypatch, tmp_path):
+    """已经存在就不动它——折叠会反复重算，不能把之前那份覆盖掉。"""
+    history = a_bash_history()
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append(history)
+    age_the_file(session)
+    existing = spill.session_dir(tmp_path, session.id) / "t0.txt"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("原来是这份", encoding="utf-8")
+    provider = ScriptedProvider([text_turn("好")])
+
+    run_loop(
+        monkeypatch,
+        provider,
+        ["接着说", "/exit"],
+        tmp_path,
+        session=session,
+        messages=history,
+        registry=default_tools(),
+    )
+
+    assert existing.read_text(encoding="utf-8") == "原来是这份"
+
+
+def test_folding_a_bash_history_still_appends_only_new_messages(monkeypatch, tmp_path):
+    """落盘是消息列表之外的动作——`session.append` 那个偏移一点没动。"""
+    history = a_bash_history()
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append(history)
+    age_the_file(session)
+    provider = ScriptedProvider([text_turn("好")])
+
+    run_loop(
+        monkeypatch,
+        provider,
+        ["接着说", "/exit"],
+        tmp_path,
+        session=session,
+        messages=history,
+        registry=default_tools(),
+    )
+
+    assert "已清除" in result_contents(provider.calls[0])[0]
+    _, _, stored = load(tmp_path, session.id)
+    assert len(stored) == len(history) + 2
+    assert "已清除" not in str(stored)
+
+
+def test_the_one_shot_path_persists_before_folding(monkeypatch, tmp_path):
+    history = a_bash_history()
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+    session.append(history)
+    age_the_file(session)
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda: FakeOneShotProvider())
+
+    cli.main_command(
+        prompt="接着说",
+        cwd=tmp_path,
+        shell=False,
+        permission_mode="default",
+        continue_=False,
+        resume=session.id,
+        list_=False,
+        delete_="",
+    )
+
+    assert (spill.session_dir(tmp_path, session.id) / "t0.txt").is_file()

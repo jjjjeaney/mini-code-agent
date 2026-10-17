@@ -5,6 +5,11 @@
 都不知道，只能重跑一遍，而命令有副作用、网页下一刻会变，重跑未必等价。落盘把它留在
 手边，代价只有一个文件。
 
+**折叠也会用到它**（见 folding.py）。旧的工具结果在缓存冷了的时候会被折掉，其中"重跑拿不
+回来"的那三类（bash / web_fetch / web_search）折之前先在这里留一份，上下文里只留开头一段
+加上路径和 id。read_file / grep / glob / list_files 不走这条路——重跑一次免费，而且拿到的
+是当前内容。
+
 **落在 `.agent/` 底下**，和长期记忆、skill 一样。那里在沙箱里是只读挂载：模型自己的
 bash 改不动它。工具结果常常是它后面照着做事的依据，让它能被自己的命令改写不合适。
 
@@ -22,9 +27,11 @@ files.py 里的 read_tool_result，和 read_memory / read_skill 一个形状。�
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import shutil
-import uuid
+import tempfile
 from pathlib import Path
 
 from mini_code_agent.tools.base import ToolContext
@@ -47,12 +54,71 @@ def session_dir(cwd: Path, session_id: str) -> Path:
 # 拼进路径会跑出 tool-results/ 去，而写文件比读文件更糟——那边至少还有围栏兜着。
 _SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
+# 落盘预览的开头那句。`preview_message` 用它拼第一行，`is_preview` 也认它——一处定义，
+# 两处不会漂。
+PREVIEW_PREFIX = "[输出太长"
+
+
+def is_preview(text: str) -> bool:
+    """这段正文是不是"已经落过盘"的那条预览。
+
+    折叠判断它，是为了**不要拿预览再去落一次盘**：真正的原文已经在盘上了。老会话里落盘的
+    文件名还是旧的 `<工具名>-<随机>` 形状，这个判断也照样认。
+    """
+    return text.startswith(PREVIEW_PREFIX)
+
 
 def _name_for(tool_name: str, tool_use_id: str) -> str:
-    """落盘文件的主干：正常的 id 直接用；形状不对的退回老格式（工具名 + 随机）。"""
+    """落盘文件的主干：正常的 id 直接用；形状不对的退回 `<工具名>-<确定性摘要>`。
+
+    **回退那支必须确定性**，不能用随机：折叠是从没被改过的会话文件反复算出来的，随机名会让
+    "已经存在就不写"永远不命中，每折一次就多一个文件。
+    """
     if _SAFE_ID.fullmatch(str(tool_use_id or "")):
         return str(tool_use_id)
-    return f"{tool_name}-{uuid.uuid4().hex[:12]}"
+    digest = hashlib.sha256(f"{tool_name}\0{tool_use_id}".encode()).hexdigest()[:12]
+    return f"{tool_name}-{digest}"
+
+
+def _write_atomic(target: Path, text: str) -> None:
+    """先写同目录的临时文件，再一步顶替过去。
+
+    **不能直接 write_text**：既然"已经存在就不写"成了主路径，中途崩掉留下的半截文件就会被
+    当成完整的，永远修不回来。
+    """
+    handle, name = tempfile.mkstemp(dir=target.parent, prefix=".tmp-", suffix=".txt")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(name, target)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
+def save_into(
+    directory: Path, tool_name: str, tool_use_id: str, text: str
+) -> Path | None:
+    """把整篇内容写进 `directory`，返回文件路径；写不成返回 None。
+
+    **已经有了就不动它**：折叠会从没被改过的会话文件反复重算，同一批内容接一次会话就会再折
+    一遍；再写一次没有意义，而且会覆盖掉之前那份。
+
+    名字就是那次工具调用的 id（见 `_name_for`）：服务端保证一次调用一个，天然不撞名；同一个
+    id 反复落盘也指向同一个文件。
+    """
+    target = directory / f"{_name_for(tool_name, tool_use_id)}.txt"
+    if target.exists():
+        return target
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        _write_atomic(target, text)
+    except OSError:
+        return None
+    return target
 
 
 def save(
@@ -63,10 +129,6 @@ def save(
     写到 `ctx.spill_dir`（CLI 那边给的是这次会话的目录）；没给就落在共用的
     `.agent/tool-results/` 里——测试、以及不经 CLI 直接调 `runagent` 的那条路走的就是它。
 
-    **名字就是那次工具调用的 id**。服务端保证一次调用一个，所以不撞名；而且同一个 id 反复
-    落盘写的是同一个路径——**幂等**。折叠那边是从没被改过的会话文件重新算出来的，同一批内容
-    接一次会话就会再折一遍，靠的正是这一条。
-
     代价是文件名不再能一眼看出是哪个工具（`toolu_...` 认不出来）。这是换来的：名字短、模型
     抄的出错面小，而工具名本来就写在配对的那条 assistant 消息里，不缺这一份。
 
@@ -74,13 +136,16 @@ def save(
     那条路：少给一点，总比报个错让模型以为工具坏了强。
     """
     directory = ctx.spill_dir if ctx.spill_dir is not None else ctx.cwd / TOOL_RESULTS_DIR
-    target = directory / f"{_name_for(tool_name, tool_use_id)}.txt"
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
-    except OSError:
-        return None
-    return target
+    return save_into(directory, tool_name, tool_use_id, text)
+
+
+def display_path(cwd: Path, saved: Path) -> str:
+    """给模型看的路径：能相对项目根就相对（它自己就在那儿活动），否则退回绝对路径。
+
+    退回绝对的那一支是给"spill_dir 被指到项目外面"用的——印一条错的相对路径比印绝对路径糟。
+    """
+    inside = saved.is_relative_to(cwd)
+    return saved.relative_to(cwd).as_posix() if inside else saved.as_posix()
 
 
 def find_spilled(cwd: Path, name: str) -> str | None:
@@ -140,7 +205,7 @@ def preview_message(text: str, *, name: str, where: str) -> str:
     lines = text.count("\n") + 1
     return "\n".join(
         [
-            f"[输出太长（{len(text):,} 字符 / {lines:,} 行），完整内容存在 {where}。",
+            f"{PREVIEW_PREFIX}（{len(text):,} 字符 / {lines:,} 行），完整内容存在 {where}。",
             f'要用就用 read_tool_result 取：id 传 "{name}"，'
             f"配 start_line / end_line 可以只取一段（一共 {lines} 行）。",
             "",

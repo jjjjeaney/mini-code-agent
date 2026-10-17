@@ -16,7 +16,7 @@ from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
 from mini_code_agent.core.agent import runagent
 from mini_code_agent.core.subagent import make_agent_tool
-from mini_code_agent.folding import fold_if_stale
+from mini_code_agent.folding import PersistText, fold_if_stale
 from mini_code_agent.memory import sync_index
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
@@ -76,6 +76,27 @@ def _compact(
     return [summary_message(summary), *messages[cut:]]
 
 
+def _persister(cwd: Path, session: Session) -> PersistText:
+    """折叠时的落盘动作：把正文写进**这次会话**的目录，回给模型一个真能用的 id。
+
+    **`session.id` 要在回调里现读**：会话文件名撞名时 `Session._open` 会把它改掉，提前算死
+    目录会把同一批文件劈到两个地方。
+
+    回的是（给人看的路径, 落盘后的真实文件名）——后者可能不是原 id（形状不合格的会被换成
+    `<工具名>-<摘要>`），占位符里必须写这一个。
+    """
+
+    def persist(tool_name: str, tool_use_id: str, text: str) -> tuple[str, str] | None:
+        saved = spill.save_into(
+            spill.session_dir(cwd, session.id), tool_name, tool_use_id, text
+        )
+        if saved is None:
+            return None
+        return spill.display_path(cwd, saved), saved.stem
+
+    return persist
+
+
 def _chat(
     provider: Provider,
     registry: ToolRegistry,
@@ -107,6 +128,9 @@ def _chat(
     window = window_for(model)
     # 哪些工具的结果允许被折——一次运行里不变（见 tools/registry.py 的 foldable_names）。
     foldable = registry.foldable_names()
+    # 其中哪些"重跑拿不回来"、折之前得先落一份（见 fold_persist_names）。
+    fold_persist = registry.fold_persist_names()
+    persist = _persister(cwd, session)
 
     def size_now() -> int:
         """这段历史现在有多大（token）——有锚点就用锚点，没有就按字符粗估。"""
@@ -137,14 +161,25 @@ def _chat(
     def fold_once() -> None:
         """折一次——**缓存真冷了才折**，判据在 folding 里。
 
-        不花钱、也不落盘：只把内存里这份历史里旧的工具结果换成"开头一段 + 一句说明"，会话
-        文件里原文一个字都不动。为什么没有手动入口，见 folding.py 的模块说明。
+        不花钱。把内存里这份历史里旧的工具结果换成"开头一段 + 一句说明"，会话文件里原文一个字
+        都不动；其中重跑拿不回来的那几类（bash / web_fetch / web_search）折之前先落一份盘，
+        上下文里只留路径和 id。为什么没有手动入口，见 folding.py 的模块说明。
         """
         if not state.replaced(
-            fold_if_stale(state.messages, foldable=foldable, path=session.path)
+            fold_if_stale(
+                state.messages,
+                foldable=foldable,
+                path=session.path,
+                persist=persist,
+                persist_tools=fold_persist,
+            )
         ):
             return
-        console.print("（把旧的工具结果折起来了；原文还在会话文件里）", style="dim", markup=False)
+        console.print(
+            "（把旧的工具结果折起来了；拿不回来的那几类另存了一份）",
+            style="dim",
+            markup=False,
+        )
 
     ctx = CommandContext(
         console=console,
@@ -354,7 +389,11 @@ def main_command(
         #
         # 折在压前面，判据和 _chat 里那条一样（会话文件久没被写过 = 缓存大概冷了）。
         history = fold_if_stale(
-            history, foldable=registry.foldable_names(), path=session.path
+            history,
+            foldable=registry.foldable_names(),
+            path=session.path,
+            persist=_persister(workdir, session),
+            persist_tools=registry.fold_persist_names(),
         )
         history = _compact(
             history,

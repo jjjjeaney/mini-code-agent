@@ -12,9 +12,15 @@
 
 所以这不是"要不要折"，是"**什么时候折**"。冷不冷由 `is_stale` 判断。
 
-**折的是内存里的视图，不落盘。** 会话文件保持"实际发生过什么"的完整记录。盘上和内存因此会
-分叉，但那个分叉**下次到冷点会被重新折平**，所以没关系。压缩必须往盘上记一笔（因为它是一次
-花钱的模型调用，重算要再花一次钱），折叠重算不要钱，就不需要。
+**折的是内存里的视图，会话文件不动。** 盘上和内存因此会分叉，但那个分叉**下次到冷点会被
+重新折平**，所以没关系。压缩必须往会话文件里记一笔（因为它是一次花钱的模型调用，重算要再
+花一次钱），折叠重算不要钱，就不需要。
+
+**但"重跑拿不回来"的那几类要先落盘**（`persist_tools`，目前是 `bash` / `web_fetch` /
+`web_search`）：命令有副作用、网页会变、搜索要花钱。折之前把完整内容写进
+`.agent/tool-results/<会话 id>/<tool_use_id>.txt`，上下文里只留开头一段加上路径和 id。
+写不成就不折这一条——宁可让它继续占着上下文，也不能给模型一个指向空处的引用。
+`read_file` / `grep` / `glob` / `list_files` 不走这条路：重跑免费，而且拿到的还是当前内容。
 
 **不是所有工具的结果都能折**：只有标了 `Tool.foldable` 的才进候选（见 tools/base.py）。子
 agent 交回来的结论就是"方向"本身、项目概览是"我现在在哪儿"的参照、模型特意去取回来的记忆和
@@ -28,9 +34,18 @@ agent 交回来的结论就是"方向"本身、项目概览是"我现在在哪�
 from __future__ import annotations
 
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any
+
+from mini_code_agent.tools import spill
+
+# 折叠前"把正文留一份到盘上"的那个动作：(工具名, tool_use_id, 正文) → (给人看的路径,
+# 落盘后的**真实文件名**)，存不下来就是 None。
+#
+# **必须回传真实文件名**：形状不合格的 id 会被换成 `<工具名>-<摘要>`，占位符里写的 id 得是
+# 模型取的时候真能用的那个。
+PersistText = Callable[[str, str, str], tuple[str, str] | None]
 
 # 保留最近这么多条工具结果不折。**按块数，不按消息数**——同一条 assistant 回复里的多个
 # tool_use 会合成一条 user 消息回填（见 core/agent.py），一条消息里可能并排放着好几个。
@@ -43,10 +58,10 @@ KEEP_RECENT_RESULTS = 5
 # （`read_file` 的正文、`grep` 的 `文件:行号:内容`）。
 HEAD_CHARS = 200
 
-# 原内容短于这个数就不折。折完那条说明自己就有两百多字符，原文比它还短的话，折了反而变长。
-# 它顺带把"折过的又折一遍"挡住——折过的结果正好落在这条线以下，所以折叠是幂等的。
+# 原内容短于这个数就不折：折完那条说明自己就有两百多字符，原文比它还短的话，折了反而变长。
 #
-# **必须大于 HEAD_CHARS 加上那句说明的长度**，否则幂等那条就不成立了。
+# **折完的结果必须落在这条线以下**（`_fold` 里有一道显式的闸）。这是幂等的保证：折过的结果
+# 下一次会被开头那道早退挡住。路径和 id 让说明变长了，所以不能再假设"说明一定短"。
 MIN_FOLD_CHARS = 400
 
 # 会话文件多久没被写过，就认为缓存冷了。
@@ -89,6 +104,8 @@ def fold_if_stale(
     path: Path,
     keep: int = KEEP_RECENT_RESULTS,
     now: float | None = None,
+    persist: PersistText | None = None,
+    persist_tools: Collection[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """缓存大概已经冷了（这个会话文件久没被写过）就折一次；不然原样返回（`is` 相等）。
 
@@ -100,7 +117,13 @@ def fold_if_stale(
     """
     if not is_stale(path, now=now):
         return messages
-    return fold_stale(messages, foldable=foldable, keep=keep)
+    return fold_stale(
+        messages,
+        foldable=foldable,
+        keep=keep,
+        persist=persist,
+        persist_tools=persist_tools,
+    )
 
 
 def fold_stale(
@@ -108,6 +131,8 @@ def fold_stale(
     *,
     foldable: Collection[str],
     keep: int = KEEP_RECENT_RESULTS,
+    persist: PersistText | None = None,
+    persist_tools: Collection[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """把最近 `keep` 条以外的工具结果折成"开头一段 + 一句说明"。
 
@@ -117,6 +142,9 @@ def fold_stale(
 
     `foldable` **没有默认值是有意的**：默认取空集等于"什么都不折"（功能悄悄没了），默认取
     "全都折"更糟（子 agent 的结论会被折掉）。忘了传直接 TypeError，比静默走错强。
+
+    `persist_tools` 里的工具**折之前先经 `persist` 落一份盘**（结果重跑未必等价）。两个都
+    给了才有意义——只给名单不给回调是**配置错误**，会直接报出来，不能悄悄退回"重跑"措辞。
 
     **没折到就返回传进来那一份本身**（`is` 相等）——调用方靠这个判断"这一轮到底折没折"，
     和 `cli._compact` 用的是同一个信号。
@@ -132,13 +160,22 @@ def fold_stale(
     在别处是**共享引用**（`runagent` 只复制最外层那个列表），就地改会连调用方手里那份一起
     改掉。
     """
+    if persist_tools and persist is None:
+        raise ValueError(
+            "persist_tools 非空时必须给 persist——否则那些结果会被当成能重跑的折掉"
+        )
     stale = _stale_positions(messages, foldable, keep)
     if not stale:
         return messages
 
     replacements: dict[int, dict[int, str]] = {}
     for message_index, block_index, name in stale:
-        folded = _fold(messages[message_index]["content"][block_index], name)
+        folded = _fold(
+            messages[message_index]["content"][block_index],
+            name,
+            persist=persist,
+            persist_tools=persist_tools,
+        )
         if folded is not None:
             replacements.setdefault(message_index, {})[block_index] = folded
     if not replacements:
@@ -200,21 +237,52 @@ def _stale_positions(
     return candidates[:-keep]
 
 
-def _fold(block: dict[str, Any], name: str) -> str | None:
-    """折一条结果，返回折完的文本；不值得折就返回 None。
+def _fold(
+    block: dict[str, Any],
+    name: str,
+    *,
+    persist: PersistText | None,
+    persist_tools: Collection[str],
+) -> str | None:
+    """折一条结果，返回折完的文本；不值得折（或者不该折）就返回 None。
 
     **工具名要写进去**：`tool_result` 自己不带它，模型看到一段没头没尾的说明，判不出被清掉的
     是什么、也就判不出该不该重新要——那正是"丢了方向"的起点。
 
     **"不是工具出错"和"怎么拿回来"两半也不能省**：模型看到结果突然变短，第一反应是"工具坏
     了、输出被截了"，然后白跑一次去确认。
+
+    **拿不回来的那几类先落盘**（`persist_tools`）。写不成就不折这一条——折了就真丢了，宁可
+    让它继续占着上下文，也不能给模型一个指向空处的引用。已经落过盘的（正文是那条预览）不再
+    写第二次：真正的原文就在盘上。
     """
     content = block.get("content")
     if not isinstance(content, str) or len(content) <= MIN_FOLD_CHARS:
         return None
+
     dropped = len(content) - HEAD_CHARS
-    return (
-        f"{content[:HEAD_CHARS]}\n\n"
-        f"[{name} 的结果：后面 {dropped:,} 个字符已清除（历史整理，不是工具出错）。"
-        f"要原文可以重跑一次那个工具；上面写着落盘 id 的那种用 read_tool_result 取]"
-    )
+    tool_use_id = str(block.get("tool_use_id") or "")
+    note = f"\n\n[{name} 的结果：后面 {dropped:,} 个字符已清除（历史整理，不是工具出错）。"
+
+    if name in persist_tools:
+        if spill.is_preview(content):
+            # 超过 MAX_TOOL_CHARS 的那条早就落过盘了，开头那段里带着取回的 id。
+            note += "原文已经落过盘，取法在保留的开头那段里。]"
+        else:
+            saved = persist(name, tool_use_id, content) if persist is not None else None
+            if saved is None:
+                return None
+            where, saved_name = saved
+            note += (
+                f"完整内容存在 {where}。"
+                f'要就用 read_tool_result 取：id 传 "{saved_name}"。]'
+            )
+    else:
+        note += "要原文可以重跑一次那个工具。]"
+
+    folded = content[:HEAD_CHARS] + note
+    # 折完必须比原文短、而且落在 MIN_FOLD_CHARS 以下。后者是**幂等的保证**：折过的结果下一次
+    # 会被开头那道早退挡住。路径和 id 让说明变长了，不能再假设"说明一定短"。
+    if len(folded) >= len(content) or len(folded) > MIN_FOLD_CHARS:
+        return None
+    return folded

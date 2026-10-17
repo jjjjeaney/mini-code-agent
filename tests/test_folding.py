@@ -6,6 +6,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from mini_code_agent.folding import (
     FOLD_AFTER_SECONDS,
     HEAD_CHARS,
@@ -150,11 +152,13 @@ class TestFoldStale:
         assert "grep 的结果" in contents(fold(messages))[0]
 
     def test_it_says_how_to_get_it_back(self):
-        """只说"清掉了"不够——得说清怎么拿回来，不然模型要么放弃、要么白跑一趟。"""
+        """只说"清掉了"不够——得说清怎么拿回来，不然模型要么放弃、要么白跑一趟。
+
+        能重跑的那几类说"重跑"；拿不回来的那几类由 `persist` 那条路负责（见落盘那些用例）。
+        """
         first = contents(fold(a_history(6)))[0]
 
         assert "不是工具出错" in first
-        assert "read_tool_result" in first
         assert "重跑" in first
 
     def test_only_the_content_changes(self):
@@ -254,12 +258,146 @@ class TestFoldStale:
         assert "整篇输出" in got  # 照着它取，照样取得到
 
 
+class RecordingPersist:
+    """顶掉落盘动作：只记下被要求存了什么，不碰盘。"""
+
+    def __init__(self, *, fail_for: set[str] | None = None) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.fail_for = fail_for or set()
+
+    def __call__(self, name: str, tool_use_id: str, text: str):
+        self.calls.append((name, tool_use_id, text))
+        if tool_use_id in self.fail_for:
+            return None
+        return f".agent/tool-results/s1/{tool_use_id}.txt", tool_use_id
+
+
+def fold_with(
+    messages: list[dict],
+    persist,
+    *,
+    persist_tools: frozenset[str] = frozenset({"bash"}),
+    keep: int = KEEP_RECENT_RESULTS,
+) -> list[dict]:
+    return fold_stale(
+        messages,
+        foldable=FOLDABLE,
+        keep=keep,
+        persist=persist,
+        persist_tools=persist_tools,
+    )
+
+
+class TestPersisting:
+    """**重跑拿不回来的那几类，折之前先落一份。**"""
+
+    def test_it_persists_before_folding_and_points_at_the_file(self):
+        persist = RecordingPersist()
+        messages = a_history(KEEP_RECENT_RESULTS + 1, tool="bash")
+        original = contents(messages)[0]
+
+        folded = fold_with(messages, persist)
+
+        assert persist.calls == [("bash", "t0", original)]
+        first = contents(folded)[0]
+        assert ".agent/tool-results/s1/t0.txt" in first
+        assert 'id 传 "t0"' in first
+        assert "重跑" not in first  # 别让模型去重跑一条有副作用的命令
+
+    def test_a_failed_persist_leaves_that_result_in_place(self):
+        """存不下来就不折——折了就真丢了，宁可让它继续占着上下文。"""
+        persist = RecordingPersist(fail_for={"t0"})
+        messages = a_history(KEEP_RECENT_RESULTS + 1, tool="bash")
+
+        folded = fold_with(messages, persist)
+
+        assert folded is messages
+
+    def test_one_failure_does_not_stop_the_others(self):
+        persist = RecordingPersist(fail_for={"t0"})
+        messages = a_history(KEEP_RECENT_RESULTS + 2, tool="bash")
+
+        folded = fold_with(messages, persist)
+
+        assert contents(folded)[0] == contents(messages)[0]  # 没存下来的那条留着
+        assert "已清除" in contents(folded)[1]  # 另一条照折
+
+    def test_only_persist_tools_reach_the_callback(self):
+        persist = RecordingPersist()
+        messages = a_history(KEEP_RECENT_RESULTS + 1, tool="read_file")
+
+        folded = fold_with(messages, persist)
+
+        assert persist.calls == []
+        assert "重跑" in contents(folded)[0]
+
+    def test_the_recent_window_is_never_persisted(self):
+        persist = RecordingPersist()
+        messages = a_history(KEEP_RECENT_RESULTS + 3, tool="bash")
+
+        fold_with(messages, persist)
+
+        assert [call[1] for call in persist.calls] == ["t0", "t1", "t2"]
+
+    def test_an_existing_preview_is_not_written_again(self):
+        """正文已经是落盘预览了——原文就在盘上，别拿预览再写一份。"""
+        persist = RecordingPersist()
+        preview = spill.preview_message(
+            "整篇输出\n" * 300,
+            name="toolu_abc123",
+            where=".agent/tool-results/s1/toolu_abc123.txt",
+        )
+        messages = [
+            *a_pair(preview, call_id="toolu_abc123", tool="bash"),
+            *a_history(KEEP_RECENT_RESULTS),
+        ]
+
+        folded = fold_with(messages, persist)
+
+        assert persist.calls == []
+        first = contents(folded)[0]
+        assert "toolu_abc123" in first
+        assert "已经落过盘" in first
+
+    def test_persist_tools_without_a_callback_is_a_config_error(self):
+        """只给名单不给回调会悄悄退回"重跑"措辞——不如直接报出来。"""
+        with pytest.raises(ValueError):
+            fold_stale(
+                a_history(KEEP_RECENT_RESULTS + 1, tool="bash"),
+                foldable=FOLDABLE,
+                persist_tools={"bash"},
+            )
+
+    def test_a_long_id_does_not_make_it_refoldable(self):
+        """路径和 id 会把这句说明撑长，所以幂等不能靠"说明一定短"——靠长度的硬闸。"""
+        long_id = "t" * 128
+        messages = [
+            *a_pair("x" * LONG, call_id=long_id, tool="bash"),
+            *a_history(KEEP_RECENT_RESULTS),
+        ]
+
+        once = fold_with(messages, RecordingPersist())
+        twice = fold_with(once, RecordingPersist())
+
+        assert twice is once
+
+    def test_folding_never_makes_a_result_longer(self):
+        """说明比原文还长的时候不折——折了反而更占地方。"""
+        long_id = "t" * 128
+        messages = [
+            *a_pair("x" * (MIN_FOLD_CHARS + 1), call_id=long_id, tool="bash"),
+            *a_history(KEEP_RECENT_RESULTS),
+        ]
+
+        assert fold_with(messages, RecordingPersist()) is messages
+
+
 class TestFoldIsIdempotentByConstruction:
     def test_what_folding_produces_falls_below_the_threshold(self):
         """折完那条必须落在这道闸下面，否则"折过的又折一遍"，上面那条幂等就不成立了。
 
-        这条断言的是两个常量之间的关系（`MIN_FOLD_CHARS > HEAD_CHARS + 说明的长度`），
-        所以改动那两个数、或者把工具名加长时，它会跟着响。
+        这条现在由 `_fold` 里那道显式的长度闸保证（路径和 id 让说明变长了，不能再靠两个常量
+        之间碰巧的关系），所以改动措辞时它会跟着响。
         """
         folded = contents(fold(a_history(6)))[0]
 
@@ -297,6 +435,38 @@ class TestFoldIfStale:
         messages = a_history(8)
 
         assert fold_if_stale(messages, foldable=FOLDABLE, path=tmp_path / "nope.jsonl") is messages
+
+    def test_it_forwards_the_persist_callback(self, tmp_path: Path):
+        path = tmp_path / "s.jsonl"
+        path.write_text("{}", encoding="utf-8")
+        old = time.time() - FOLD_AFTER_SECONDS - 60
+        os.utime(path, (old, old))
+        persist = RecordingPersist()
+
+        fold_if_stale(
+            a_history(KEEP_RECENT_RESULTS + 1, tool="bash"),
+            foldable=FOLDABLE,
+            path=path,
+            persist=persist,
+            persist_tools={"bash"},
+        )
+
+        assert len(persist.calls) == 1
+
+    def test_a_warm_session_never_persists(self, tmp_path: Path):
+        path = tmp_path / "s.jsonl"
+        path.write_text("{}", encoding="utf-8")
+        persist = RecordingPersist()
+
+        fold_if_stale(
+            a_history(KEEP_RECENT_RESULTS + 1, tool="bash"),
+            foldable=FOLDABLE,
+            path=path,
+            persist=persist,
+            persist_tools={"bash"},
+        )
+
+        assert persist.calls == []
 
 
 class TestIsStale:

@@ -80,6 +80,14 @@ class ToolRegistry:
         """
         return frozenset(tool.name for tool in self.tools.values() if tool.foldable)
 
+    def fold_persist_names(self) -> frozenset[str]:
+        """折叠时**必须先落一份到盘上**的工具名（语义见 `Tool.fold_persist`）。
+
+        和 `foldable_names` 同一个套路：**现算**，不写死名单，CLI 后来注入的工具自动落在
+        外面（它们没标那个字段）。
+        """
+        return frozenset(tool.name for tool in self.tools.values() if tool.fold_persist)
+
     def run(
         self, ctx: ToolContext, name: str, arguments: dict[str, Any] | None = None
     ) -> Any:
@@ -152,11 +160,9 @@ def _spill_if_too_long(
     saved = spill.save(ctx, name, tool_use_id, result)
     if saved is None:
         return truncate_text(result, MAX_TOOL_CHARS)
-    # 给模型看的路径尽量相对项目根（它自己就在那儿活动）；万一不在（spill_dir 被指到别处），
-    # 退回绝对路径，总比印一条错的强。
-    inside = saved.is_relative_to(ctx.cwd)
-    where = saved.relative_to(ctx.cwd).as_posix() if inside else saved.as_posix()
-    return spill.preview_message(result, name=saved.stem, where=where)
+    return spill.preview_message(
+        result, name=saved.stem, where=spill.display_path(ctx.cwd, saved)
+    )
 
 
 def default_tools() -> ToolRegistry:
@@ -308,6 +314,8 @@ def default_tools() -> ToolRegistry:
                 # 但它也是历史里最肿的一块（测试日志、构建输出），而且落了盘就取得回来，
                 # 头一段里写着 id。
                 foldable=True,
+                # 折叠也算"拿不回来"的一种：折之前先留一份，别让它只剩 200 个字符。
+                fold_persist=True,
             ),
             Tool(
                 name="glob",
@@ -345,6 +353,8 @@ def default_tools() -> ToolRegistry:
                 params=WEB_SEARCH_SCHEMA,
                 read_only=True,
                 foldable=True,
+                # 重搜一次要花钱，结果还会漂——折之前先留一份。
+                fold_persist=True,
                 # 没配 key 就别发这两个——发出去是必错的。
                 available=lambda _: is_configured(),
             ),
@@ -362,6 +372,8 @@ def default_tools() -> ToolRegistry:
                 available=lambda _: is_configured(),
                 # 正文是花钱取回来的，网页下一刻也可能变——截掉的部分再要就得重新取一次。
                 spill=True,
+                # 同 bash：折掉了同样拿不回来。
+                fold_persist=True,
             ),
             Tool(
                 name="read_tool_result",
