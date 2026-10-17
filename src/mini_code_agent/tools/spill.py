@@ -22,6 +22,7 @@ files.py 里的 read_tool_result，和 read_memory / read_skill 一个形状。�
 
 from __future__ import annotations
 
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -40,20 +41,40 @@ def session_dir(cwd: Path, session_id: str) -> Path:
     return cwd / TOOL_RESULTS_DIR / session_id
 
 
-def save(ctx: ToolContext, tool_name: str, text: str) -> Path | None:
+# 允许直接当文件名用的 `tool_use_id`。正常的长这样 `toolu_01AbCd...`。
+#
+# 卡这一道不是洁癖：它是**服务端响应里的字符串**，不是我们自己造的名字。`../../x` 这种形状
+# 拼进路径会跑出 tool-results/ 去，而写文件比读文件更糟——那边至少还有围栏兜着。
+_SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _name_for(tool_name: str, tool_use_id: str) -> str:
+    """落盘文件的主干：正常的 id 直接用；形状不对的退回老格式（工具名 + 随机）。"""
+    if _SAFE_ID.fullmatch(str(tool_use_id or "")):
+        return str(tool_use_id)
+    return f"{tool_name}-{uuid.uuid4().hex[:12]}"
+
+
+def save(
+    ctx: ToolContext, tool_name: str, tool_use_id: str, text: str
+) -> Path | None:
     """把一整条工具结果写下来，返回文件路径；写不成返回 None。
 
     写到 `ctx.spill_dir`（CLI 那边给的是这次会话的目录）；没给就落在共用的
     `.agent/tool-results/` 里——测试、以及不经 CLI 直接调 `runagent` 的那条路走的就是它。
 
-    名字是 `<工具名>-<随机 12 位十六进制>`：随机那截保证不撞名（这也让取回来时的"搜"只需
-    要按名字找），工具名那截是为了人一眼能看出这是什么。
+    **名字就是那次工具调用的 id**。服务端保证一次调用一个，所以不撞名；而且同一个 id 反复
+    落盘写的是同一个路径——**幂等**。折叠那边是从没被改过的会话文件重新算出来的，同一批内容
+    接一次会话就会再折一遍，靠的正是这一条。
+
+    代价是文件名不再能一眼看出是哪个工具（`toolu_...` 认不出来）。这是换来的：名字短、模型
+    抄的出错面小，而工具名本来就写在配对的那条 assistant 消息里，不缺这一份。
 
     写不成（磁盘满、权限不对）**不该让这次调用失败**——调用方接住 None，退回"就截断"
     那条路：少给一点，总比报个错让模型以为工具坏了强。
     """
     directory = ctx.spill_dir if ctx.spill_dir is not None else ctx.cwd / TOOL_RESULTS_DIR
-    target = directory / f"{tool_name}-{uuid.uuid4().hex[:12]}.txt"
+    target = directory / f"{_name_for(tool_name, tool_use_id)}.txt"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")

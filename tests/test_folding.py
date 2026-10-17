@@ -235,11 +235,11 @@ class TestFoldStale:
         """
         directory = tmp_path / spill.TOOL_RESULTS_DIR
         directory.mkdir(parents=True)
-        (directory / "bash-abc123.txt").write_text("整篇输出\n" * 300, encoding="utf-8")
+        (directory / "toolu_abc123.txt").write_text("整篇输出\n" * 300, encoding="utf-8")
         preview = spill.preview_message(
             "整篇输出\n" * 300,
-            name="bash-abc123",
-            where=".agent/tool-results/bash-abc123.txt",
+            name="toolu_abc123",
+            where=".agent/tool-results/toolu_abc123.txt",
         )
         messages = [
             *a_pair(preview, call_id="t0", tool="bash"),
@@ -249,8 +249,8 @@ class TestFoldStale:
         first = contents(fold(messages))[0]
 
         assert "已清除" in first  # 真折了
-        assert "bash-abc123" in first  # id 还在留着的那段里
-        got = read_tool_result({"id": "bash-abc123"}, ToolContext(cwd=tmp_path))
+        assert "toolu_abc123" in first  # id 还在留着的那段里
+        got = read_tool_result({"id": "toolu_abc123"}, ToolContext(cwd=tmp_path))
         assert "整篇输出" in got  # 照着它取，照样取得到
 
 

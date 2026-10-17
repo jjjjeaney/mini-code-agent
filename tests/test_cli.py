@@ -487,8 +487,9 @@ def test_spilled_output_lands_in_this_sessions_directory(monkeypatch, tmp_path):
         monkeypatch, provider, ["跑一下", "/exit"], tmp_path, registry=ToolRegistry([chatty])
     )
 
-    saved = list(spill.session_dir(tmp_path, session.id).glob("chatty-*.txt"))
+    saved = list(spill.session_dir(tmp_path, session.id).glob("*.txt"))
     assert len(saved) == 1
+    assert saved[0].stem == "t1"  # 文件名是那次工具调用的 id
     assert saved[0].read_text(encoding="utf-8") == "x" * (MAX_TOOL_CHARS + 1)
 
 

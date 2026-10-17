@@ -492,7 +492,7 @@ class TestSpilling:
         return registry.dispatch(ctx, ToolCall(id="t1", name="chatty", arguments={}))
 
     def spill_files(self, ctx: ToolContext) -> list[Path]:
-        return sorted((ctx.cwd / TOOL_RESULTS_DIR).glob("chatty-*.txt"))
+        return sorted((ctx.cwd / TOOL_RESULTS_DIR).glob("*.txt"))
 
     def test_a_long_result_lands_on_disk_whole(self, ctx):
         text = "行\n" * self.LONG
@@ -502,7 +502,9 @@ class TestSpilling:
         saved = self.spill_files(ctx)
         assert len(saved) == 1
         assert saved[0].read_text(encoding="utf-8") == text  # 一个字都没少
-        assert str(saved[0].stem) in result.result
+        # 文件名就是那次工具调用的 id——同一个 id 反复落盘是同一个文件
+        assert saved[0].stem == "t1"
+        assert 'id 传 "t1"' in result.result
 
     def test_the_context_only_gets_a_preview(self, ctx):
         result = self.call(
@@ -575,8 +577,27 @@ class TestSpilling:
 
         result = self.call(self.registry(lambda kwargs, c: "x" * self.LONG, spill=True), ctx)
 
-        saved = list(session_dir.glob("chatty-*.txt"))
+        saved = list(session_dir.glob("*.txt"))
         assert len(saved) == 1
+        assert saved[0].stem == "t1"
         assert saved[0].read_text(encoding="utf-8") == "x" * self.LONG
         # 给模型看的那条路径要指到会话目录里去，不能只说个文件名
-        assert ".agent/tool-results/20260101-000000-0001abcd/chatty-" in result.result
+        assert ".agent/tool-results/20260101-000000-0001abcd/t1.txt" in result.result
+
+    def test_an_ill_shaped_id_falls_back_to_the_old_name(self, ctx):
+        """`tool_use_id` 是**服务端响应**里的字符串，不能无条件拼进路径。
+
+        形状不对就退回 `<工具名>-<随机>`：照常落盘、照常取得回来，只是名字回到旧格式。
+        卡的是写文件——读那边另有围栏，但写比读更糟，那边至少还有兜底。
+        """
+        registry = self.registry(lambda kwargs, c: "x" * self.LONG, spill=True)
+
+        result = registry.dispatch(
+            ctx, ToolCall(id="../../逃出去", name="chatty", arguments={})
+        )
+
+        saved = self.spill_files(ctx)
+        assert len(saved) == 1
+        assert saved[0].parent == ctx.cwd / TOOL_RESULTS_DIR
+        assert saved[0].stem.startswith("chatty-")
+        assert saved[0].stem in result.result

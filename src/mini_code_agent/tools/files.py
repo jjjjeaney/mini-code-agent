@@ -480,8 +480,9 @@ def read_tool_result(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     # 引用消息里印的路径带 .txt，模型可能整个抄过来。两种写法都收，省一次来回。
     if name.endswith(".txt"):
         name = name[: -len(".txt")]
-    # **只认名字本身，不认路径**——id 就是 `bash-0123abcd` 这种。带路径的一律拒，理由不是
-    # 安全（下面还有围栏兜着），而是"你这个 id 格式不对"比"越界了"更能指出该改什么。
+    # **只认名字本身，不认路径**——id 就是落盘那次调用的 `tool_use_id`（`toolu_...`）。
+    # 带路径的一律拒，理由不是安全（下面还有围栏兜着），而是"你这个 id 格式不对"比"越界了"
+    # 更能指出该改什么。
     if name != Path(name).name:
         raise ValueError(f"id 只能是名字本身，不带路径（收到的是 {raw!r}）。")
 

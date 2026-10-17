@@ -129,22 +129,27 @@ class ToolRegistry:
         tool = self.tools.get(call.name)
         # 没注册的工具走不到这儿——上面 run 已经抛过 KeyError 了。
         if tool is not None and tool.spill:
-            result = _spill_if_too_long(ctx, call.name, result)
+            result = _spill_if_too_long(ctx, call.name, call.id, result)
         return ToolResult(id=call.id, name=call.name, result=result)
 
 
-def _spill_if_too_long(ctx: ToolContext, name: str, result: Any) -> Any:
+def _spill_if_too_long(
+    ctx: ToolContext, name: str, tool_use_id: str, result: Any
+) -> Any:
     """太长的结果整篇存到盘上，返回"预览 + 存哪儿"那一段话。
 
     只有**标了 spill 的工具**会走到这儿（调用方判的）。为什么搁在这一层而不是工具里：
     工具拿不到"多长算长"这把统一的尺，而落盘这种通用机制也不该在十几个工具里各写一遍。
+
+    `tool_use_id` 一路传下去当**文件名**（见 spill.save）：它是一次调用的身份，比随机串更适合
+    当键——同一个 id 反复落盘是同一个文件，不会越攒越多。
 
     落盘失败（盘满、权限不对）就**退回普通限额截断**——不能让一次盘写失败把几 MB 的文本
     原样放进上下文，那正是这个机制要防的事。
     """
     if not isinstance(result, str) or len(result) <= MAX_TOOL_CHARS:
         return result
-    saved = spill.save(ctx, name, result)
+    saved = spill.save(ctx, name, tool_use_id, result)
     if saved is None:
         return truncate_text(result, MAX_TOOL_CHARS)
     # 给模型看的路径尽量相对项目根（它自己就在那儿活动）；万一不在（spill_dir 被指到别处），

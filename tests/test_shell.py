@@ -331,7 +331,7 @@ class TestBashInDocker:
             ),
         )
 
-        spilled = list((shell_ctx.cwd / ".agent" / "tool-results").glob("bash-*.txt"))
+        spilled = list((shell_ctx.cwd / ".agent" / "tool-results").glob("t1.txt"))
         assert len(spilled) == 1, "这条输出够长，应该落盘了"
         for text in (result.result, spilled[0].read_text(encoding="utf-8")):
             assert "sk-live-abcdef" not in text
