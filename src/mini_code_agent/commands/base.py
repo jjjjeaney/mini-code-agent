@@ -19,6 +19,7 @@ from mini_code_agent.sessions import Session
 if TYPE_CHECKING:
     # 只在标注里用。命令层只调任务表的几个公开方法，不需要它的实现。
     from mini_code_agent.core.tasks import TaskManager
+    from mini_code_agent.interaction import PermissionBroker
 
 # 一条命令跑完只有两种结果：办完了接着读下一行，或者该退出循环了。
 CommandOutcome = Literal["handled", "stop"]
@@ -128,6 +129,10 @@ class CommandContext:
     # 后台子 agent 的任务表（见 core/tasks.py）。`/tasks` 看状态/取消、`/status` 报个数。
     # 默认 None：测试和一次性路径没有它，命令要能对着空表说话。
     tasks: TaskManager | None = None
+
+    # 后台任务的授权请求表（见 interaction.py）。只用来报"有几个在等批准"；真正问用户的是
+    # 读键盘线程，不是命令。
+    broker: PermissionBroker | None = None
 
 
 @dataclass

@@ -10,7 +10,7 @@ from mini_code_agent.core.agent import CANCELLED_ERROR, RETRY_PAUSE_SECONDS, run
 from mini_code_agent.folding import fold_stale
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompting import make_ask_user
-from mini_code_agent.prompts import Answer
+from mini_code_agent.prompts import Answer, NullPrompter
 from mini_code_agent.providers.base import (
     ModelResponse,
     ProviderError,
@@ -1129,3 +1129,29 @@ class TestHandoff:
 
         assert background.error == CANCELLED_ERROR
         assert provider.calls == []
+
+    def test_the_background_half_uses_the_prompter_factory(self, registry):
+        """交互会话靠它把后台的权限请求换成排队版本；工厂拿到的必须是任务自己的 cancel。"""
+        provider = ScriptedProvider([text_turn("好")])
+        work: list = []
+        seen: list = []
+
+        def factory(cancel):
+            seen.append(cancel)
+            return NullPrompter()
+
+        result = runagent(
+            "你好",
+            provider,
+            registry,
+            background_after=0.0,
+            handoff=lambda continuation: work.append(continuation) or "bg-1",
+            background_prompter=factory,
+        )
+        assert result.handoff == "bg-1"
+
+        cancel = threading.Event()
+        background = work[0](lambda text, style: None, cancel)
+
+        assert seen == [cancel]
+        assert background.final == "好"

@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from mini_code_agent.console import console
-from mini_code_agent.permissions import EDIT_TOOLS, Grants, PermissionRequest, decide_permission
+from mini_code_agent.interaction import ask_permission
+from mini_code_agent.permissions import Grants, PermissionRequest, decide_permission
 from mini_code_agent.prompts import Answer, BackgroundPrompter, NullPrompter, Prompter
 from mini_code_agent.providers.base import (
     ModelResponse,
@@ -146,22 +147,10 @@ def _render_result(result: ToolResult) -> str:
 def _ask(prompter: Prompter, request: PermissionRequest, grants: Grants) -> Answer:
     """真的去问一次用户。本会话批过的就不问了，直接放行。
 
-    问**哪一种**由这里定：改文件的给他看改动、别的看参数（bash 也走这条，prompter 认得
-    工具名，自己会去取那行命令）。渲染成什么样是 prompter 的事，但"该问哪一种"只有 harness
-    知道——它手上才有工具名。
-
-    用户答"本会话别再问"时在这里记一笔；记成什么粒度是 Grants 的事。
+    问**哪一种**、什么时候记 Grants 的细节在 `interaction.ask_permission` 里——读键盘线程服务
+    后台请求时用的是同一份，两处不能各写一套。
     """
-    if grants.covers(request):
-        return Answer(True)
-    if request.tool_name in EDIT_TOOLS:
-        answer = prompter.confirm_edit(request)
-    else:
-        answer = prompter.confirm_tool(request)
-    if answer.allowed and answer.remember:
-        # 前提是 allowed：一个"拒绝但记住"的答案不该把文件记进去。
-        grants.remember(request)
-    return answer
+    return ask_permission(prompter, request, grants)
 
 
 def _gate(
@@ -226,6 +215,7 @@ def runagent(
     emit: Emit | None = None,
     notices: Callable[[], str | None] | None = None,
     allow_background: bool = False,
+    background_prompter: Callable[[threading.Event], Prompter] | None = None,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -267,6 +257,9 @@ def runagent(
     - `emit` 是输出路由（默认直接打终端）。后台那一半拿到的是一个缓冲写入口。
     - `notices` 在每一发之前问一次"有没有后台任务完成了"；有就纯追加一条 user 消息。
     - `allow_background` 交给 `ToolContext`，`agent` 工具据此决定认不认 `run_in_background`。
+    - `background_prompter` 决定后台那一半用哪份 prompter（参数是它自己的 cancel event）。
+      交互会话传 `BrokerPrompter`——请求排队、由读键盘线程在持有终端时问；不传就退回一律
+      拒绝的 `BackgroundPrompter`（一次性模式、测试）。
     """
     registry = registry if registry is not None else default_tools()
     # 新拼一份，别就地改调用方手里那份。**得在 ctx 之前**：fork 那份现场要用它（见 ForkContext）。
@@ -429,11 +422,18 @@ def runagent(
                         _snapshot: list[dict[str, Any]] = snapshot,
                         _rest: int = rest,
                     ) -> AgentResult:
+                        # 有 broker 的交互会话给的是 BrokerPrompter（请求会被排队、由读键盘
+                        # 线程去问）；没有就退回一律拒绝的 BackgroundPrompter。
+                        background = (
+                            background_prompter(cancel_event)
+                            if background_prompter is not None
+                            else BackgroundPrompter()
+                        )
                         return drive(
                             _snapshot,
                             _rest,
                             emit=emit_fn,
-                            prompter=BackgroundPrompter(),
+                            prompter=background,
                             cancel=cancel_event,
                             allow_handoff=False,
                             notices=None,

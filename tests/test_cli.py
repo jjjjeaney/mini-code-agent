@@ -14,9 +14,11 @@ from mini_code_agent import cli
 from mini_code_agent.core.agent import AgentResult
 from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.folding import FOLD_AFTER_SECONDS, MIN_FOLD_CHARS
+from mini_code_agent.interaction import PermissionBroker
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants, PermissionRequest
-from mini_code_agent.prompts import NullPrompter
+from mini_code_agent.prompting import TerminalPrompter
+from mini_code_agent.prompts import Answer, NullPrompter, Prompter
 from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCall
 from mini_code_agent.sessions import SESSIONS_DIR, Session, load, start
 from mini_code_agent.system_prompt import build_system_prompt
@@ -71,6 +73,8 @@ def run_loop(
     grants: Grants | None = None,
     allow_fork: bool = False,
     tasks: TaskManager | None = None,
+    broker: PermissionBroker | None = None,
+    prompter: Prompter | None = None,
 ) -> Session:
     """喂一串「用户输入」，把交互循环跑起来。最后一句给 /exit 收尾。"""
     answers = iter(lines)
@@ -84,10 +88,11 @@ def run_loop(
         cwd=tmp_path,
         allow_shell=False,
         permission_mode="default",
-        prompter=NullPrompter(),
+        prompter=prompter if prompter is not None else NullPrompter(),
         grants=grants if grants is not None else Grants(),
         allow_fork=allow_fork,
         tasks=tasks,
+        broker=broker,
     )
     return session
 
@@ -1021,3 +1026,97 @@ class TestBackgroundReporting:
 
         # 那一轮的第二发之前，`notices` 把结果并进了上下文；所以只有两发，没有额外的汇报回合。
         assert len(provider.calls) == 2
+
+
+def a_write_request(path: str = "a.txt") -> PermissionRequest:
+    return PermissionRequest(tool_name="write_file", tool_args={"path": path, "content": "x"})
+
+
+class TestBackgroundApprovals:
+    """后台任务排队等授权；读键盘线程在持有终端时处理它。"""
+
+    def test_a_pending_request_is_denied_when_the_prompter_cannot_ask(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """`NullPrompter` 是测试/一次性模式的缺省：它不问，直接拒绝，也不消耗脚本行。"""
+        broker = PermissionBroker()
+        item = broker.defer(a_write_request(), "[general-purpose] ")
+        provider = ScriptedProvider([text_turn("好")])
+
+        run_loop(monkeypatch, provider, ["你好", "/exit"], tmp_path, broker=broker)
+
+        assert item.future.result(timeout=0.1).allowed is False
+        assert "后台任务请求" in capsys.readouterr().out
+        assert len(provider.calls) == 1  # 用户那一行照常处理
+
+    def test_the_real_prompter_asks_and_the_answer_reaches_the_task(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        broker = PermissionBroker()
+        item = broker.defer(a_write_request(), "[general-purpose] ")
+        provider = ScriptedProvider([text_turn("好")])
+
+        run_loop(
+            monkeypatch,
+            provider,
+            ["y", "你好", "/exit"],
+            tmp_path,
+            prompter=TerminalPrompter(),
+            broker=broker,
+        )
+
+        assert item.future.result(timeout=0.1) == Answer(True)
+        # 预览走 stderr（和前台权限提示同一份渲染），用户那一行照常处理
+        assert "要写 a.txt" in capsys.readouterr().err
+        assert len(provider.calls) == 1
+
+    def test_a_no_answer_denies_it(self, monkeypatch, tmp_path, capsys):
+        broker = PermissionBroker()
+        item = broker.defer(a_write_request(), "[general-purpose] ")
+        provider = ScriptedProvider([text_turn("好")])
+
+        run_loop(
+            monkeypatch,
+            provider,
+            ["n", "你好", "/exit"],
+            tmp_path,
+            prompter=TerminalPrompter(),
+            broker=broker,
+        )
+
+        assert item.future.result(timeout=0.1).allowed is False
+        capsys.readouterr()
+
+    def test_leaving_the_loop_closes_the_broker(self, monkeypatch, tmp_path):
+        broker = PermissionBroker()
+
+        run_loop(monkeypatch, ScriptedProvider([]), ["/exit"], tmp_path, broker=broker)
+
+        # close 之后新的 submit 立刻拒绝，不会挂住一个已经没人处理的队列
+        assert broker.submit(a_write_request(), "[x] ").allowed is False
+
+    def test_leaving_the_loop_cancels_running_tasks(self, monkeypatch, tmp_path):
+        manager = TaskManager()
+        began = threading.Event()
+
+        def work(emit, cancel):
+            began.set()
+            cancel.wait(2)
+            return AgentResult(
+                final=None, trace=[], messages=[], error="已取消"
+            )
+
+        task_id = manager.start(
+            work,
+            label="[explore] ",
+            agent_type="explore",
+            description="找压缩逻辑",
+            cwd=tmp_path,
+            spill_dir=None,
+        )
+        assert began.wait(2)
+
+        run_loop(monkeypatch, ScriptedProvider([]), ["/exit"], tmp_path, tasks=manager)
+
+        assert manager.wait(task_id, timeout=2)
+        assert manager.get(task_id).status == "cancelled"

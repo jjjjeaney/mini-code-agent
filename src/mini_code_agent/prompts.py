@@ -113,7 +113,10 @@ class NullPrompter:
 
 
 class BackgroundPrompter:
-    """后台子 agent 用的那一版：**不碰终端，需要当场批准的一律拒绝**。
+    """没有 broker 时后台子 agent 用的兜底：**不碰终端，需要当场批准的一律拒绝**。
+
+    交互会话里有 `interaction.PermissionBroker`，那边用 `BrokerPrompter` 把请求排队、由读键盘
+    线程去问；这个类只剩一次性模式和没注入 broker 的测试在用了。
 
     为什么不是 `NullPrompter`：用户需要知道"这不是没人，是这时候问不了"。后台任务跑的
     时候主循环可能在提示符上、也可能在跑别的一轮，任何读键盘的动作都会和它抢 stdin。

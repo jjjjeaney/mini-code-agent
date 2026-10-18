@@ -23,6 +23,7 @@ from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
 from mini_code_agent.core.agent import CANCELLED_ERROR, AgentResult
 from mini_code_agent.core.tasks import TaskManager
+from mini_code_agent.interaction import PermissionBroker
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.sessions import SESSIONS_DIR, Session, start
 from mini_code_agent.summarizing import COMPACT_AT
@@ -41,6 +42,7 @@ def make_ctx(
     context_tokens: int | None = None,
     context_covered: int = 0,
     tasks: TaskManager | None = None,
+    broker: PermissionBroker | None = None,
 ) -> CommandContext:
     """一份手边的东西。全给上默认值，测哪一块就只改哪一块。
 
@@ -64,6 +66,7 @@ def make_ctx(
         grants=grants if grants is not None else Grants(),
         compact=compact if compact is not None else (lambda: None),
         tasks=tasks,
+        broker=broker,
     )
 
 
@@ -344,6 +347,17 @@ class TestStatus:
 
         assert "后台任务：" not in capsys.readouterr().out
 
+    def test_it_reports_pending_approvals(self, capsys):
+        broker = PermissionBroker()
+        broker.defer(
+            PermissionRequest(tool_name="write_file", tool_args={"path": "a.py"}),
+            "[general-purpose] ",
+        )
+
+        default_commands().dispatch("/status", make_ctx(broker=broker))
+
+        assert "后台授权：1 个在等" in capsys.readouterr().out
+
 
 def a_finished_task(tmp_path, final: str = "找到三处"):
     manager = TaskManager()
@@ -445,6 +459,20 @@ class TestTasks:
         )
 
         assert "看不懂" in capsys.readouterr().out
+
+    def test_it_reports_pending_approvals(self, capsys, tmp_path):
+        manager, _ = a_finished_task(tmp_path)
+        broker = PermissionBroker()
+        broker.defer(
+            PermissionRequest(tool_name="write_file", tool_args={"path": "a.py"}),
+            "[general-purpose] ",
+        )
+
+        default_commands().dispatch(
+            "/tasks", make_ctx(cwd=tmp_path, tasks=manager, broker=broker)
+        )
+
+        assert "授权请求在等" in capsys.readouterr().out
 
 
 class TestCompact:

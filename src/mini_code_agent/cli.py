@@ -20,10 +20,11 @@ from mini_code_agent.core.agent import AgentResult, runagent
 from mini_code_agent.core.subagent import make_agent_tool
 from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.folding import PersistText, fold_if_stale
+from mini_code_agent.interaction import PermissionBroker, ask_permission
 from mini_code_agent.memory import sync_index
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
-from mini_code_agent.prompts import NullPrompter, Prompter
+from mini_code_agent.prompts import Answer, NullPrompter, Prompter
 from mini_code_agent.providers.anthropic import AnthropicProvider
 from mini_code_agent.providers.base import Provider
 from mini_code_agent.sessions import Session, delete, describe, load, start, summary_message
@@ -114,6 +115,7 @@ def _chat(
     model: str | None = None,
     allow_fork: bool = False,
     tasks: TaskManager | None = None,
+    broker: PermissionBroker | None = None,
 ) -> None:
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
@@ -307,32 +309,85 @@ def _chat(
         grants=grants,
         compact=compact_now,
         tasks=tasks,
+        broker=broker,
     )
     # 建一次就够：命令表在循环里不变。它抓着的 ctx / state 都是上面那两个活着的对象——
     # 命令改档位、看历史、清批准，动到的都是循环这一轮真要用的那份。
     commands = default_commands()
 
-    # 两个生产者、一个消费者：用户敲的一行，和后台任务完成的事件。放在同一条队列上，
-    # 主循环就不必为了"等任务"去轮询。
+    # 三个生产者、一个消费者：用户敲的一行、后台任务完成的事件、以及"有请求在等授权"的提醒。
     events: queue.Queue[tuple[str, object]] = queue.Queue()
-    # 只有主循环空闲时才让读键盘线程去要输入——模型跑的时候屏幕上不多一个悬着的 `> `。
-    idle = threading.Event()
+
+    # 终端所有权：`wants_line` 是主循环在等输入，`using_terminal` 是读键盘线程正占用终端
+    # （问权限或读一行）。只有读键盘线程会在 `using_terminal=True` 时碰 stdin——这是那条
+    # "任何时刻只有一个读者"的不变式。
+    gate = threading.Condition()
+    wants_line = False
+    using_terminal = False
+
+    def service_approvals() -> None:
+        """把后台任务排队等着的授权请求问掉。**只在读键盘线程里调。**
+
+        这里用的 `prompter` 是主线程那一份真的 `TerminalPrompter`：预览格式、y/n/a、用户
+        写下的拒绝理由，和前台权限提示完全一致。
+        """
+        if broker is None:
+            return
+        while (item := broker.take()) is not None:
+            if item.cancel is not None and item.cancel.is_set():
+                broker.resolve(item, Answer(False, note="任务已取消。"))
+                continue
+            console.print(f"（{item.label}后台任务请求：）", style="dim", markup=False)
+            try:
+                # remember=False：拿到答案之后再决定记不记——问的过程中任务可能被取消了。
+                answer = ask_permission(prompter, item.request, grants, remember=False)
+            except (EOFError, KeyboardInterrupt, typer.Abort):
+                broker.resolve(item, Answer(False, note="没有回答，按拒绝处理。"))
+                raise
+            except Exception as exc:  # noqa: BLE001 - 一条处理坏了不能把读键盘线程带走
+                console.print(
+                    f"（处理后台授权请求失败：{type(exc).__name__}: {exc}；按拒绝处理）",
+                    style="red",
+                    markup=False,
+                )
+                broker.resolve(item, Answer(False, note=f"授权请求没处理成：{exc}"))
+                continue
+            if (
+                answer.allowed
+                and answer.remember
+                and (item.cancel is None or not item.cancel.is_set())
+            ):
+                grants.remember(item.request)
+            broker.resolve(item, answer)
 
     def read_lines() -> None:
+        nonlocal wants_line, using_terminal
         while True:
-            idle.wait()
-            idle.clear()
+            with gate:
+                while not wants_line or using_terminal:
+                    gate.wait()
+                wants_line = False
+                using_terminal = True
             try:
+                service_approvals()  # 等在提示符后面的请求先处理掉
                 line = typer.prompt("> ")
+                service_approvals()  # 用户刚敲完一行：先处理请求，再把这一行交出去
             except (EOFError, KeyboardInterrupt, typer.Abort):
                 events.put(("stop", None))
                 return
+            finally:
+                with gate:
+                    using_terminal = False
             events.put(("line", line))
 
     # 先把"任务结束了往哪儿报"接上，再开读键盘线程：顺序反过来的话，一个刚完成的任务可能
-    # 落在两者中间，事件就丢了（测试里那个"先等读键盘就绪再放任务"的同步点也靠这个顺序）。
+    # 落在两者中间，事件就丢了。
     if tasks is not None:
         tasks.set_on_finish(lambda record: events.put(("task", record.id)))
+    if broker is not None:
+        # 请求进队时如果读键盘线程正闲着，主循环会被叫醒打一句提示；用户停在 `> ` 上时
+        # 只能等到下一次回车——这是行输入终端的限制。
+        broker.on_defer = lambda: events.put(("approval", None))
     # daemon：进程退出时它跟着走。Ctrl+C 只会打在主线程上（主线程正阻塞在 events.get()），
     # 所以这条线程不需要自己处理中断。
     threading.Thread(target=read_lines, name="repl-input", daemon=True).start()
@@ -342,16 +397,22 @@ def _chat(
             try:
                 kind, payload = events.get_nowait()
             except queue.Empty:
-                # **先确认队列真空了**再去读键盘：否则"队列里已经有一行、读键盘线程又打印了
-                # 一个 > "的事就会发生。
-                idle.set()
+                # 只有读键盘线程没占着终端时才让它去要输入；否则屏幕上会多一个 `> `。
+                with gate:
+                    if not using_terminal:
+                        wants_line = True
+                        gate.notify()
                 kind, payload = events.get()
-            idle.clear()
 
             if kind == "stop":
                 break
             if kind == "task":
                 report_background()
+                continue
+            if kind == "approval":
+                console.print(
+                    "（后台任务在等授权；按回车后处理）", style="dim", markup=False
+                )
                 continue
 
             line = str(payload).strip()
@@ -369,8 +430,12 @@ def _chat(
         typer.echo()
     finally:
         if tasks is not None:
-            # 循环没了，再往队列里放事件只会积在那里。任务本身（daemon）跟着进程一起走。
+            # 循环没了：让还在跑的任务在下一步之前停下，再往队列里放事件只会积在那里。
             tasks.set_on_finish(None)
+            tasks.cancel_all()
+        if broker is not None:
+            broker.on_defer = None
+            broker.close("用户离开了，后台任务不能再请求授权。")
 
 
 def _delete_session(cwd: Path, session_id: str, *, assume_yes: bool) -> None:
@@ -500,6 +565,9 @@ def main_command(
     provider = AnthropicProvider()
     # 后台任务表：`agent` 工具把跑长的活交给它，`/tasks` 和空闲时唤醒的汇报回合共用同一份。
     tasks = TaskManager()
+    # 后台任务的授权请求表：后台线程往里放，读键盘线程在持有终端时取出来问用户。**要在
+    # `make_agent_tool` 之前建**——那个工具的闭包会抓着它。
+    broker = PermissionBroker()
     # 子 agent 那个工具在这儿装进去（`agent`），和上面的 `ask_user` 一样是 harness 才有的能力。
     # **它排在 provider 后面，不是跟 ask_user 放一起**：那个工具要 provider 才能跑（子 agent
     # 是要真发请求的），而 `registry` 建在 provider **之前**——那个顺序是有意的，见上面
@@ -512,6 +580,7 @@ def main_command(
             grants=grants,
             model=provider.model,
             tasks=tasks,
+            broker=broker,
         )
     )
     # fork 不单独注册：它是 `agent` 的 `type` 枚举里的一项。开没开 `--fork` 由
@@ -584,6 +653,7 @@ def main_command(
         model=provider.model,
         allow_fork=fork,
         tasks=tasks,
+        broker=broker,
     )
     print("bye")
 

@@ -248,6 +248,13 @@ def make_status() -> Command:
                     f"后台任务：{live} 个在跑，{len(records) - live} 个已结束（/tasks 看）",
                     markup=False,
                 )
+        if ctx.broker is not None:
+            pending = ctx.broker.pending()
+            if pending:
+                ctx.console.print(
+                    f"后台授权：{len(pending)} 个在等（回到提示符时处理）",
+                    markup=False,
+                )
         if session.opened:
             where = f"{_relative(session.path, ctx.cwd)}（落盘 {session.written} 条消息）"
         else:
@@ -323,21 +330,28 @@ def make_tasks() -> Command:
                     "模型也可以直接要 run_in_background）",
                     markup=False,
                 )
-                return "handled"
-            ctx.console.print("后台子 agent：", markup=False)
-            for record in records:
-                status = _TASK_STATUS.get(record.status, record.status)
-                elapsed = format_duration(record.elapsed())
+            else:
+                ctx.console.print("后台子 agent：", markup=False)
+                for record in records:
+                    status = _TASK_STATUS.get(record.status, record.status)
+                    elapsed = format_duration(record.elapsed())
+                    ctx.console.print(
+                        f"  {record.id}  {status:<4}  {record.agent_type:<15}  "
+                        f"{elapsed:>6}  「{record.description}」",
+                        markup=False,
+                    )
                 ctx.console.print(
-                    f"  {record.id}  {status:<4}  {record.agent_type:<15}  "
-                    f"{elapsed:>6}  「{record.description}」",
+                    "\n/tasks show <id> 看过程和结论；/tasks cancel <id> 让它在下一步之前停下",
+                    style="dim",
                     markup=False,
                 )
-            ctx.console.print(
-                "\n/tasks show <id> 看过程和结论；/tasks cancel <id> 让它在下一步之前停下",
-                style="dim",
-                markup=False,
-            )
+            if ctx.broker is not None:
+                pending = ctx.broker.pending()
+                if pending:
+                    ctx.console.print(
+                        f"还有 {len(pending)} 个授权请求在等（回到提示符时处理）",
+                        markup=False,
+                    )
             return "handled"
 
         parts = arg.split(None, 1)

@@ -25,8 +25,9 @@
 - **不跨进程**：任务表在内存里，daemon 线程随进程退出被硬杀。只读任务没有副作用，所以这是
   可以接受的；`--resume` 之后历史里那些 id 是死的，`collect` 那类入口不存在，也不会有人去
   按 id 找。
-- **后台不碰终端**：交接过去的 prompter 是 `BackgroundPrompter`，需要当场批准的调用一律拒绝。
-  主线程可能正停在提示符上，任何读键盘的动作都会和它抢 stdin。
+- **后台不直接碰终端**：交接过去的 prompter 可能是 `BrokerPrompter`（交互会话）——它把请求
+  放进 `interaction.PermissionBroker`，由读键盘线程在持有终端时去问；没有 broker 的时候退回
+  一律拒绝的 `BackgroundPrompter`。后台线程自己永远不读键盘。
 - 并发上限不在这里：`subagent` 在**主动要后台**时硬拦，自动交接不受限（它本来就在跑了）。
 """
 
@@ -236,6 +237,15 @@ class TaskManager:
             return False
         record.cancel_event.set()
         return True
+
+    def cancel_all(self) -> None:
+        """让所有还在跑的任务在下一步之前停下。交互循环退出时用——那时已经没人能处理它们的
+        授权请求，也没人会看它们的结论了。"""
+        with self._lock:
+            records = list(self._tasks.values())
+        for record in records:
+            if record.is_running():
+                record.cancel_event.set()
 
     def take_notices(self) -> str | None:
         """取走"已经结束、还没通知过"的那些，拼成一段话；没有就返回 None。

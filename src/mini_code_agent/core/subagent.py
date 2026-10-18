@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 
 from mini_code_agent.console import console
 from mini_code_agent.core.agent import runagent
+from mini_code_agent.interaction import BrokerPrompter, PermissionBroker
 from mini_code_agent.prompts import Answer, Prompter
 from mini_code_agent.system_prompt import build_subagent_prompt
 from mini_code_agent.tools import Tool, ToolRegistry, default_tools
@@ -268,8 +269,9 @@ def _describe() -> str:
         f"**跑满 {int(BACKGROUND_AFTER_SECONDS)} 秒会自动转后台**，不用你特意说。"
         "`run_in_background=true` 则是一开始就转：立刻拿到任务 id，先去做别的。"
         "后台任务的结果会作为一条通知自动出现在你后面的请求里；太长的话会落盘，"
-        "用 `read_tool_result` 按任务 id 取。**转后台之后它不能再请求新的权限批准**——"
-        "需要用户点头的改动，让它写进结论里。"
+        "用 `read_tool_result` 按任务 id 取。**转后台之后需要当场批准的新调用仍然会问你**——"
+        "请求会在你回到提示符时排上来；只有 `ask_user` 那道选择题不行，需要用户拍板的事"
+        "让它写进结论里。"
     )
 
 
@@ -291,6 +293,7 @@ def make_agent_tool(
     model: str | None = None,
     tasks: TaskManager | None = None,
     background_after: float = BACKGROUND_AFTER_SECONDS,
+    broker: PermissionBroker | None = None,
 ) -> Tool:
     """造出 `agent` 工具——主 agent 拿它派子 agent。
 
@@ -394,6 +397,16 @@ def make_agent_tool(
 
             start_background = _start
 
+        # 后台那一半的权限问题：有 broker 就入队、等读键盘线程在持有终端时来问；没有
+        # （一次性模式、测试没注入）就退回一律拒绝的 BackgroundPrompter。
+        background_prompter = None
+        if broker is not None:
+
+            def _background_prompter(cancel):
+                return BrokerPrompter(broker, cancel, label)
+
+            background_prompter = _background_prompter
+
         # 头尾这两行由这里打：runagent 自己那些行会带同一个 label，但它不知道"派的是谁、
         # 派去干什么"。
         console.print(f"▶ {label}{kwargs['description']}", style="cyan", markup=False)
@@ -417,6 +430,7 @@ def make_agent_tool(
             tool_schemas=tool_schemas,
             background_after=after,
             handoff=start_background,
+            background_prompter=background_prompter,
         )
         if result.handoff is not None:
             console.print(f"◀ {label}转到后台：{result.handoff}", style="dim", markup=False)

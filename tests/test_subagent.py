@@ -276,7 +276,13 @@ def text_turn(text: str) -> ModelResponse:
 
 
 def the_tool(
-    provider, *, prompter=None, grants=None, tasks=None, background_after=120.0
+    provider,
+    *,
+    prompter=None,
+    grants=None,
+    tasks=None,
+    background_after=120.0,
+    broker=None,
 ) -> Tool:
     return make_agent_tool(
         provider=provider,
@@ -285,6 +291,7 @@ def the_tool(
         model="test-model",
         tasks=tasks,
         background_after=background_after,
+        broker=broker,
     )
 
 
@@ -585,10 +592,55 @@ class TestBackground:
         for record in manager.list():
             manager.wait(record.id, timeout=2)
 
-    def test_the_background_half_cannot_ask_for_new_approvals(self):
-        """后台不碰终端：需要当场批准的事只能写进结论，交给主 agent。"""
+    def test_without_a_broker_the_background_half_cannot_ask(self):
+        """没有 broker（一次性模式、测试）时退回兜底：需要当场批准的事写进结论。"""
         answer = BackgroundPrompter().confirm_edit(request())
 
         assert answer.allowed is False
         assert "后台任务" in answer.note
         assert "结论" in answer.note
+
+    def test_a_background_task_can_ask_through_a_broker(self, tmp_path):
+        """有 broker 时，后台的写文件请求进队列，而不是被兜底 prompter 直接拒掉。"""
+
+        class FakeBroker:
+            def __init__(self):
+                self.requests = []
+
+            def submit(self, request, label, cancel=None):
+                self.requests.append((request, label))
+                return Answer(False, note="测试里拒绝")
+
+        broker = FakeBroker()
+        manager = TaskManager()
+        provider = ScriptedProvider(
+            [
+                tool_turn("w1", "write_file", {"path": "a.txt", "content": "x"}),
+                text_turn("结论"),
+            ]
+        )
+        tool = the_tool(provider, tasks=manager, background_after=0.0, broker=broker)
+        ctx = ToolContext(cwd=tmp_path, allow_background=True)
+
+        call_the_tool(tool, ctx, kind="general-purpose", run_in_background=True)
+        assert manager.wait(manager.list()[0].id, timeout=2)
+
+        assert [req.tool_name for req, _ in broker.requests] == ["write_file"]
+        assert broker.requests[0][1] == "[general-purpose] "
+
+    def test_without_a_broker_the_background_half_still_denies(self, tmp_path):
+        manager = TaskManager()
+        provider = ScriptedProvider(
+            [
+                tool_turn("w1", "write_file", {"path": "a.txt", "content": "x"}),
+                text_turn("结论"),
+            ]
+        )
+        tool = the_tool(provider, tasks=manager, background_after=0.0)
+        ctx = ToolContext(cwd=tmp_path, allow_background=True)
+
+        call_the_tool(tool, ctx, kind="general-purpose", run_in_background=True)
+        assert manager.wait(manager.list()[0].id, timeout=2)
+
+        # 第二发请求里才带着被拒绝的 tool_result（第一发只有任务本身）
+        assert "后台任务" in str(provider.calls[1]["messages"])
