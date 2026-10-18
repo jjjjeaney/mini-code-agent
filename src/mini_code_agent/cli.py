@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 from pathlib import Path
 
 import typer
@@ -14,14 +16,15 @@ from mini_code_agent.commands import (
 )
 from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
-from mini_code_agent.core.agent import runagent
+from mini_code_agent.core.agent import AgentResult, runagent
 from mini_code_agent.core.fork import make_fork_tool
 from mini_code_agent.core.subagent import make_agent_tool
+from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.folding import PersistText, fold_if_stale
 from mini_code_agent.memory import sync_index
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
-from mini_code_agent.prompts import Prompter
+from mini_code_agent.prompts import NullPrompter, Prompter
 from mini_code_agent.providers.anthropic import AnthropicProvider
 from mini_code_agent.providers.base import Provider
 from mini_code_agent.sessions import Session, delete, describe, load, start, summary_message
@@ -111,6 +114,7 @@ def _chat(
     grants: Grants,
     model: str | None = None,
     allow_fork: bool = False,
+    tasks: TaskManager | None = None,
 ) -> None:
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
@@ -121,6 +125,10 @@ def _chat(
 
     这一行先过命令表（见 commands/）：认出来的命令就地办掉、**不发给模型**，也不落盘——
     命令是用户对程序说的话，不是对话的一部分，接上历史时不该看见它。
+
+    **读键盘在另一条线程上**（见下面 `read_lines`）：后台任务结束时要把这条循环从提示符上
+    唤醒，而 `typer.prompt` 是阻塞的，主线程自己读就没法被叫醒。事件队列把"用户敲了一行"
+    和"有个后台任务完成了"放在同一条路上。
 
     抽成函数是为了能测——`main_command` 里写死了 `AnthropicProvider()`，塞不进假的；这里收
     一个 provider 进来，测试就能拿剧本化的假 provider 跑两轮，看第二轮有没有带上第一轮。
@@ -185,6 +193,111 @@ def _chat(
             markup=False,
         )
 
+    def absorb(result: AgentResult) -> None:
+        """把一轮的结果接回循环：落盘、换历史、更新锚点。
+
+        普通一轮和后台任务的汇报回合共用这一段。两处各写一遍的话，迟早有一处忘了落盘，
+        而那种漏是静默的。
+        """
+        # 长度得在 messages 被换掉**之前**取。
+        session.append(result.messages[len(state.messages) :])
+        state.messages = result.messages
+        if result.anchor is not None:
+            # 这一轮带工具的最后一发有多大——下一轮判断要不要压就看它。
+            state.remember_context(result.anchor.tokens, result.anchor.covered)
+
+    def run_turn(line: str) -> None:
+        """用户说了一句话：折、压、发、接回历史、打印。"""
+        # 缓存大概已经冷了就先折一次：那时候整段前缀反正要按原价重算，改历史不额外损失
+        # 任何东西，是纯赚。**热的时候折是亏的**（见 known-issues D5），所以判据只有
+        # "冷不冷"、不看大小——那一条在 folding 里，这儿只管排顺序。
+        #
+        # 折排在压缩**前面**：折不要钱、压要一次模型调用，折完可能就不用到压那一步了。
+        fold_once()
+        compact_once()
+        system = build_system_prompt(
+            cwd, state.permission_mode, model, allow_fork=state.allow_fork
+        )
+        result = runagent(
+            line,
+            provider,
+            registry,
+            system=system,
+            cwd=cwd,
+            allow_shell=allow_shell,
+            permission_mode=state.permission_mode,
+            prompter=prompter,
+            grants=grants,
+            messages=state.messages,
+            # 落盘的工具结果按**这次会话**分目录（`.agent/tool-results/<id>/`），
+            # 这样 `--delete` 能连同这些文件一起删。session.id 在 start() 那一刻就定死
+            # 了，跑到一半不会变。
+            spill_dir=spill.session_dir(cwd, session.id),
+            allow_fork=state.allow_fork,
+            # 交互模式才有"下一轮"可以送后台结果；一次性模式那边不传。
+            allow_background=True,
+            notices=tasks.take_notices if tasks is not None else None,
+        )
+        absorb(result)
+        if result.error:
+            # 这一轮没能把请求发出去（网络、限流、配置……）。**会话不结束**——用户再发一次
+            # 就行；上面那句已经把这一轮**已经发生过的**工具调用落盘了，不会白丢。
+            typer.echo(f"这一轮没跑成：{result.error}", err=True)
+            return
+        if result.final is None:
+            typer.echo(
+                f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
+                err=True,
+            )
+            return
+        console.print(f"\n{result.final}", markup=False)
+
+    def report_background() -> None:
+        """后台任务完成了：让模型**自己开口**告诉用户。
+
+        只打一行程序通知是不够的——用户要的是模型知道这件事、并且用自己的话说出来。
+        所以这里跑一个短回合：同一份 system、同一张工具表、同一段历史，只追加一条 user
+        消息，前缀照旧命中缓存。
+
+        `max_steps=1` + `NullPrompter`：这一回合只许说话。用户可能正停在提示符上输入，
+        不能弹权限问题；也不该借"汇报"之名开始新的工作。
+        """
+        if tasks is None:
+            return
+        notice = tasks.take_notices()
+        if not notice:
+            # 主 agent 正在跑的那一轮可能已经把这条并进自己的上下文了；take_notices 取走
+            # 即标记，所以这里拿到空就说明已经说过了，不重复开口。
+            return
+        fold_once()
+        system = build_system_prompt(
+            cwd, state.permission_mode, model, allow_fork=state.allow_fork
+        )
+        result = runagent(
+            f"{notice}\n\n"
+            "用一两句话把这件事告诉用户：哪个任务完成了、结论是什么。"
+            "不要调用工具，不要开始新的工作。",
+            provider,
+            registry,
+            system=system,
+            max_steps=1,
+            cwd=cwd,
+            allow_shell=allow_shell,
+            permission_mode=state.permission_mode,
+            prompter=NullPrompter(),
+            grants=grants,
+            messages=state.messages,
+            spill_dir=spill.session_dir(cwd, session.id),
+            allow_fork=state.allow_fork,
+            allow_background=False,
+        )
+        absorb(result)
+        if result.error:
+            typer.echo(f"后台任务的汇报没发出去：{result.error}", err=True)
+            return
+        if result.final is not None:
+            console.print(f"\n{result.final}", markup=False)
+
     ctx = CommandContext(
         console=console,
         state=state,
@@ -194,13 +307,55 @@ def _chat(
         session=session,
         grants=grants,
         compact=compact_now,
+        tasks=tasks,
     )
     # 建一次就够：命令表在循环里不变。它抓着的 ctx / state 都是上面那两个活着的对象——
     # 命令改档位、看历史、清批准，动到的都是循环这一轮真要用的那份。
     commands = default_commands()
+
+    # 两个生产者、一个消费者：用户敲的一行，和后台任务完成的事件。放在同一条队列上，
+    # 主循环就不必为了"等任务"去轮询。
+    events: queue.Queue[tuple[str, object]] = queue.Queue()
+    # 只有主循环空闲时才让读键盘线程去要输入——模型跑的时候屏幕上不多一个悬着的 `> `。
+    idle = threading.Event()
+
+    def read_lines() -> None:
+        while True:
+            idle.wait()
+            idle.clear()
+            try:
+                line = typer.prompt("> ")
+            except (EOFError, KeyboardInterrupt, typer.Abort):
+                events.put(("stop", None))
+                return
+            events.put(("line", line))
+
+    # 先把"任务结束了往哪儿报"接上，再开读键盘线程：顺序反过来的话，一个刚完成的任务可能
+    # 落在两者中间，事件就丢了（测试里那个"先等读键盘就绪再放任务"的同步点也靠这个顺序）。
+    if tasks is not None:
+        tasks.set_on_finish(lambda record: events.put(("task", record.id)))
+    # daemon：进程退出时它跟着走。Ctrl+C 只会打在主线程上（主线程正阻塞在 events.get()），
+    # 所以这条线程不需要自己处理中断。
+    threading.Thread(target=read_lines, name="repl-input", daemon=True).start()
+
     try:
         while True:
-            line = typer.prompt("> ").strip()
+            try:
+                kind, payload = events.get_nowait()
+            except queue.Empty:
+                # **先确认队列真空了**再去读键盘：否则"队列里已经有一行、读键盘线程又打印了
+                # 一个 > "的事就会发生。
+                idle.set()
+                kind, payload = events.get()
+            idle.clear()
+
+            if kind == "stop":
+                break
+            if kind == "task":
+                report_background()
+                continue
+
+            line = str(payload).strip()
             if not line:
                 continue
             outcome = commands.dispatch(line, ctx)
@@ -208,56 +363,15 @@ def _chat(
                 break
             if outcome == "handled":
                 continue
-            # 缓存大概已经冷了就先折一次：那时候整段前缀反正要按原价重算，改历史不额外损失
-            # 任何东西，是纯赚。**热的时候折是亏的**（见 known-issues D5），所以判据只有
-            # "冷不冷"、不看大小——那一条在 folding 里，这儿只管排顺序。
-            #
-            # 折排在压缩**前面**：折不要钱、压要一次模型调用，折完可能就不用到压那一步了。
-            fold_once()
-            compact_once()
-            system = build_system_prompt(
-                cwd, state.permission_mode, model, allow_fork=state.allow_fork
-            )
-            result = runagent(
-                line,
-                provider,
-                registry,
-                system=system,
-                cwd=cwd,
-                allow_shell=allow_shell,
-                permission_mode=state.permission_mode,
-                prompter=prompter,
-                grants=grants,
-                messages=state.messages,
-                # 落盘的工具结果按**这次会话**分目录（`.agent/tool-results/<id>/`），
-                # 这样 `--delete` 能连同这些文件一起删。session.id 在 start() 那一刻就定死
-                # 了，跑到一半不会变。
-                spill_dir=spill.session_dir(cwd, session.id),
-                allow_fork=state.allow_fork,
-            )
-            # 落盘、接下历史——两边要的是同一批东西：这一轮新增的那几条。
-            # 长度得在 messages 被换掉**之前**取。
-            session.append(result.messages[len(state.messages) :])
-            state.messages = result.messages
-            if result.anchor is not None:
-                # 这一轮带工具的最后一发有多大——下一轮判断要不要压就看它。
-                state.remember_context(result.anchor.tokens, result.anchor.covered)
-            if result.error:
-                # 这一轮没能把请求发出去（网络、限流、配置……）。**会话不结束**——用户再发一次
-                # 就行；上面那句已经把这一轮**已经发生过的**工具调用落盘了，不会白丢。
-                typer.echo(f"这一轮没跑成：{result.error}", err=True)
-                continue
-            if result.final is None:
-                typer.echo(
-                    f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
-                    err=True,
-                )
-                continue
-            console.print(f"\n{result.final}", markup=False)
+            run_turn(line)
     except (typer.Abort, EOFError, KeyboardInterrupt):
         # Ctrl+C / Ctrl+D 都当正常退出。打断时提示符后面没有换行，先补一个，
         # 免得 bye 紧跟在 "^C" 后面。
         typer.echo()
+    finally:
+        if tasks is not None:
+            # 循环没了，再往队列里放事件只会积在那里。任务本身（daemon）跟着进程一起走。
+            tasks.set_on_finish(None)
 
 
 def _delete_session(cwd: Path, session_id: str, *, assume_yes: bool) -> None:
@@ -385,13 +499,21 @@ def main_command(
     # provider 建一次就够（一次运行一个 HTTP 客户端）。system prompt 不在这儿建：一次性那条
     # 分支现拼一份，交互那条每轮重拼——记忆会中途变，见 _chat。
     provider = AnthropicProvider()
+    # 后台任务表：`agent` 工具把跑长的活交给它，`/tasks` 和空闲时唤醒的汇报回合共用同一份。
+    tasks = TaskManager()
     # 子 agent 那个工具在这儿装进去（`agent`），和上面的 `ask_user` 一样是 harness 才有的能力。
     # **它排在 provider 后面，不是跟 ask_user 放一起**：那个工具要 provider 才能跑（子 agent
     # 是要真发请求的），而 `registry` 建在 provider **之前**——那个顺序是有意的，见上面
     # "接会话排在 provider 前面"那句。两条路（一次性、_chat）共用同一个 registry，所以装在
     # 这儿两边都用得上。
     registry.register(
-        make_agent_tool(provider=provider, prompter=prompter, grants=grants, model=provider.model)
+        make_agent_tool(
+            provider=provider,
+            prompter=prompter,
+            grants=grants,
+            model=provider.model,
+            tasks=tasks,
+        )
     )
     # fork 也在这儿装。**无条件注册**：开没开 `--fork` 由它的 `available` 判——关着的时候
     # ToolContext.fork 是 None，这个工具就不会发到模型手上。这样主 agent 的工具表在两种情况下
@@ -463,6 +585,7 @@ def main_command(
         # 只声明了 complete，认得它不等于认得 model；手上这份是真的 AnthropicProvider。
         model=provider.model,
         allow_fork=fork,
+        tasks=tasks,
     )
     print("bye")
 

@@ -11,9 +11,11 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 
 from mini_code_agent.commands.base import Command, CommandContext, CommandOutcome
+from mini_code_agent.core.tasks import format_duration
 from mini_code_agent.permissions import PERMISSION_MODES, parse_permission_mode
 from mini_code_agent.sessions import SESSIONS_DIR, list_sessions
 from mini_code_agent.summarizing import COMPACT_AT, context_size
+from mini_code_agent.tools.safety import truncate_text
 
 # 只在类型标注里用得上，而且那边（registry）反过来要 import 这儿——真去 import 就成环了。
 # 标注本身是懒的（`from __future__ import annotations`），不 import 也跑得起来。
@@ -238,6 +240,14 @@ def make_status() -> Command:
         ctx.console.print(f"权限档位：{mode}（{GLOSS.get(mode, '')}）", markup=False)
         ctx.console.print(f"命令执行：{shell}", markup=False)
         ctx.console.print(f"fork：{fork}", markup=False)
+        if ctx.tasks is not None:
+            records = ctx.tasks.list()
+            if records:
+                live = sum(1 for record in records if record.status == "running")
+                ctx.console.print(
+                    f"后台任务：{live} 个在跑，{len(records) - live} 个已结束（/tasks 看）",
+                    markup=False,
+                )
         if session.opened:
             where = f"{_relative(session.path, ctx.cwd)}（落盘 {session.written} 条消息）"
         else:
@@ -282,6 +292,110 @@ def make_sessions() -> Command:
     return Command(name="sessions", run=run, summary="列出这个目录下有过哪些会话")
 
 
+# 任务状态怎么念给用户听。放在这里而不是 core/tasks.py：那边是数据，这边是界面。
+_TASK_STATUS = {
+    "running": "在跑",
+    "done": "完成",
+    "failed": "没跑成",
+    "cancelled": "已取消",
+}
+
+
+def make_tasks() -> Command:
+    """看后台子 agent 的任务，或者让其中一个停下。
+
+    **为什么要有这个入口**：后台任务是花了钱、在用户看不见的地方跑着的。不给一个看得见、
+    停得下的入口，它就成了一个黑箱——尤其进程退出会把它们硬杀掉，用户至少该在那之前知道
+    还有几个在跑、在跑什么。
+    """
+
+    def run(ctx: CommandContext, arg: str) -> CommandOutcome:
+        manager = ctx.tasks
+        if manager is None:
+            ctx.console.print("这次运行没有后台任务表。", style="dim", markup=False)
+            return "handled"
+
+        if not arg:
+            records = manager.list()
+            if not records:
+                ctx.console.print(
+                    "还没有后台任务。（子 agent 跑满两分钟会自动转过去，"
+                    "模型也可以直接要 run_in_background）",
+                    markup=False,
+                )
+                return "handled"
+            ctx.console.print("后台子 agent：", markup=False)
+            for record in records:
+                status = _TASK_STATUS.get(record.status, record.status)
+                elapsed = format_duration(record.elapsed())
+                ctx.console.print(
+                    f"  {record.id}  {status:<4}  {record.agent_type:<15}  "
+                    f"{elapsed:>6}  「{record.description}」",
+                    markup=False,
+                )
+            ctx.console.print(
+                "\n/tasks show <id> 看过程和结论；/tasks cancel <id> 让它在下一步之前停下",
+                style="dim",
+                markup=False,
+            )
+            return "handled"
+
+        parts = arg.split(None, 1)
+        action = parts[0].lower()
+        if action not in ("show", "cancel") or len(parts) < 2:
+            ctx.console.print(
+                f"看不懂 {arg!r}——用 /tasks、/tasks show <id>、/tasks cancel <id>。",
+                style="red",
+                markup=False,
+            )
+            return "handled"
+
+        task_id = parts[1].strip()
+        record = manager.get(task_id)
+        if record is None:
+            ctx.console.print(f"没有 {task_id!r} 这个后台任务。", style="red", markup=False)
+            return "handled"
+
+        if action == "cancel":
+            if manager.cancel(task_id):
+                ctx.console.print(
+                    f"{task_id} 会在下一次发请求之前停下（正在跑的命令不会被硬杀）。",
+                    markup=False,
+                )
+            else:
+                ctx.console.print(
+                    f"{task_id} 已经结束了，没得取消。", style="dim", markup=False
+                )
+            return "handled"
+
+        snapshot = record.snapshot()
+        status = _TASK_STATUS.get(snapshot.status, snapshot.status)
+        ctx.console.print(
+            f"{snapshot.id}：{status}（{snapshot.agent_type}，"
+            f"用时 {format_duration(snapshot.elapsed())}）",
+            markup=False,
+        )
+        ctx.console.print(f"  {snapshot.description}", style="dim", markup=False)
+        if snapshot.lines:
+            ctx.console.print("过程：", markup=False)
+            for line in snapshot.lines[-40:]:
+                ctx.console.print(f"  {line}", style="dim", markup=False)
+        if snapshot.final is not None:
+            ctx.console.print("结论：", markup=False)
+            # 这里只给人看。模型那边走的是通知 + read_tool_result，不用这份截断。
+            ctx.console.print(truncate_text(snapshot.final, 2000), markup=False)
+        elif snapshot.error:
+            ctx.console.print(f"没跑成：{snapshot.error}", style="red", markup=False)
+        return "handled"
+
+    return Command(
+        name="tasks",
+        run=run,
+        summary="看后台子 agent 在跑什么、要多久；或者取消一个",
+        usage="[show|cancel <id>]",
+    )
+
+
 def make_compact() -> Command:
     """现在就把前面的对话压成一段摘要，不管它多长。
 
@@ -320,7 +434,9 @@ def make_grants() -> Command:
     """
 
     def run(ctx: CommandContext, arg: str) -> CommandOutcome:
-        entries = sorted(ctx.grants.entries)
+        # 用 snapshot 而不是直接遍历 entries：后台线程可能在往里面加，遍历时改集合会抛
+        # RuntimeError（见 permissions.Grants）。
+        entries = ctx.grants.snapshot()
         if arg == "clear":
             if not entries:
                 ctx.console.print("本来就是空的。", style="dim", markup=False)

@@ -9,12 +9,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from rich.console import Console
 
 from mini_code_agent.permissions import Grants
 from mini_code_agent.sessions import Session
+
+if TYPE_CHECKING:
+    # 只在标注里用。命令层只调任务表的几个公开方法，不需要它的实现。
+    from mini_code_agent.core.tasks import TaskManager
 
 # 一条命令跑完只有两种结果：办完了接着读下一行，或者该退出循环了。
 CommandOutcome = Literal["handled", "stop"]
@@ -120,6 +124,10 @@ class CommandContext:
     # 这里不塞 provider 是有意的——Provider 协议（providers/base.py）只声明了 complete 一个
     # 方法，为了 commands/ 方便就去扩它，等于让所有假 provider 跟着多背字段。
     compact: Callable[[], str | None]
+
+    # 后台子 agent 的任务表（见 core/tasks.py）。`/tasks` 看状态/取消、`/status` 报个数。
+    # 默认 None：测试和一次性路径没有它，命令要能对着空表说话。
+    tasks: TaskManager | None = None
 
 
 @dataclass

@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from mini_code_agent.console import console
 from mini_code_agent.permissions import EDIT_TOOLS, Grants, PermissionRequest, decide_permission
-from mini_code_agent.prompts import Answer, NullPrompter, Prompter
+from mini_code_agent.prompts import Answer, BackgroundPrompter, NullPrompter, Prompter
 from mini_code_agent.providers.base import (
     ModelResponse,
     Provider,
@@ -68,6 +70,33 @@ class AgentResult:
     # 请求（见下面循环尾巴），它少了整段工具 schema，而那一大段占了前缀的一多半。拿它当锚点会
     # 系统性小看半个前缀。
     anchor: ContextAnchor | None = None
+
+    # 这一轮在跑到两分钟时被交接给后台了，值是任务 id。非空时 final 一定是 None——
+    # 结论还没出来，调用方要用这个 id 去任务表里找。
+    handoff: str | None = None
+
+
+# 取消时写进 AgentResult.error 的那句。任务表拿它区分"用户取消"和"真出错"。
+CANCELLED_ERROR = "已取消"
+
+# 往哪儿打一行。第一个参数是文本、第二个是 style——和 runagent 里原来那些
+# `console.print(..., style=..., markup=False)` 一一对应。
+Emit = Callable[[str, str], None]
+
+# 后台那一半的工作函数：收（往哪儿打、怎么取消），返回它自己那段的 AgentResult。
+BackWork = Callable[[Emit, threading.Event], "AgentResult"]
+
+# runagent 交接时调用它：把一个工作函数交给后台，拿回任务 id。
+Handoff = Callable[[BackWork], str]
+
+
+class _Cancelled(Exception):
+    """协作式取消。只在内部用——它在 drive 里被接住，转成 CANCELLED_ERROR。"""
+
+
+def _console_emit(text: str, style: str) -> None:
+    """默认的输出方式：直接打到终端。和改动之前逐字节一致。"""
+    console.print(text, style=style, markup=False)
 
 
 def _usage_note(response: ModelResponse) -> str:
@@ -192,6 +221,11 @@ def runagent(
     allow_fork: bool = False,
     fork_depth: int = 0,
     tool_schemas: list[dict[str, Any]] | None = None,
+    background_after: float | None = None,
+    handoff: Handoff | None = None,
+    emit: Emit | None = None,
+    notices: Callable[[], str | None] | None = None,
+    allow_background: bool = False,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -222,6 +256,15 @@ def runagent(
 
     tool_schemas 只有 fork 传：把父 agent 已经算好的那份 schema **原样**发下去，多一个少一个
     都会让缓存前缀对不上。不传就照旧现算。
+
+    **后台模式**（`run_in_background` / 两分钟自动转）：
+
+    - `background_after` 是"跑够多少秒就交接"，`handoff` 是交接时把剩下的活交给谁。
+      两个都给了，`drive` 会在**两发请求之间**检查一次——正在跑的工具/命令不会被半路甩掉。
+      交接点上 messages 是完整的，不会留下悬空的 tool_use。
+    - `emit` 是输出路由（默认直接打终端）。后台那一半拿到的是一个缓冲写入口。
+    - `notices` 在每一发之前问一次"有没有后台任务完成了"；有就纯追加一条 user 消息。
+    - `allow_background` 交给 `ToolContext`，`agent` 工具据此决定认不认 `run_in_background`。
     """
     registry = registry if registry is not None else default_tools()
     # 新拼一份，别就地改调用方手里那份。**得在 ctx 之前**：fork 工具要用它（见 ForkContext）。
@@ -244,137 +287,240 @@ def runagent(
         spill_dir=spill_dir,
         permission_mode=permission_mode,
         fork=fork_ctx,
+        allow_background=allow_background,
     )
     tools = tool_schemas if tool_schemas is not None else registry.schemas(ctx)
     if fork_ctx is not None:
         # fork 拿它原样发出去；见上面 tool_schemas 那段。
         fork_ctx.tools = tools
-    trace: list[str] = []
-    final: str | None = None
     # prompter 不放进 ctx：问用户不是工具的能力，确认是这一层在调工具之前发的。
     prompter = prompter if prompter is not None else NullPrompter()
     grants = grants if grants is not None else Grants()
-    # 这一轮里"带工具的那最后一发"有多大——见 ContextAnchor 的说明。
-    anchor: ContextAnchor | None = None
+    output: Emit = emit if emit is not None else _console_emit
+    # 两分钟从**这一轮开始**算，不是从交接那一刻。排队、压缩都不在里头——runagent 一进
+    # 来就是干活的起点。
+    started = time.monotonic()
 
-    def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
-        """发一发，顺手把这一发的用量打出来。
+    def drive(
+        msgs: list[dict[str, Any]],
+        steps_left: int,
+        *,
+        emit: Emit,
+        prompter: Prompter,
+        cancel: threading.Event | None,
+        allow_handoff: bool,
+        notices: Callable[[], str | None] | None,
+    ) -> AgentResult:
+        """真正跑循环。前台和后台那一半走的是同一个函数，区别只在参数。
 
-        为什么要看这个：打的后端是**自动**前缀缓存——请求的**开头**和上一次一样，那一部分就
-        按便宜价算，请求里不用传任何东西。所以这一行是"缓存到底省到钱没有"的唯一观测手段。
-
-        而且要看的是**同一轮里多次请求之间**的变化：正常情况下后一发就是前一发再往后接一截，
-        命中应该只增不减；哪一步要是掉下来了，就说明有人动了前面——那是要查的（这一行就是为
-        看这件事打的）。
-
-        **发出去的就是 `messages` 本身**，中间没有任何裁剪。这不是随手写的：这个端点的缓存
-        以**整个请求**为单位匹配，只追加就几乎全命中，中间改一处就几乎全不中（实测 18,560 →
-        384，见 known-issues 的 D5）。所以"只追加"是省钱的**前提**，而这一行代码正是那个前提
-        的落点——别在这儿加变换。
+        `allow_handoff` 为 False 时不再二次交接——后台的不能再把自己转手出去。
+        `notices` 只有主 agent 传：子 agent 不该吞掉主 agent 的后台通知。
         """
-        nonlocal anchor
+        trace: list[str] = []
+        final: str | None = None
+        anchor: ContextAnchor | None = None
 
-        response = provider.complete(sent, **kwargs)
-        used = (response.input_tokens, response.output_tokens, response.cache_read_input_tokens)
-        # 全是 0 就不吭声——那是假 provider（测试里那些），不是"这一发真的没花钱"。
-        if not any(used):
+        def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
+            """发一发，顺手把这一发的用量打出来。
+
+            为什么要看这个：打的后端是**自动**前缀缓存——请求的**开头**和上一次一样，那一部分就
+            按便宜价算，请求里不用传任何东西。所以这一行是"缓存到底省到钱没有"的唯一观测手段。
+
+            而且要看的是**同一轮里多次请求之间**的变化：正常情况下后一发就是前一发再往后接一截，
+            命中应该只增不减；哪一步要是掉下来了，就说明有人动了前面——那是要查的（这一行就是为
+            看这件事打的）。
+
+            **发出去的就是 `msgs` 本身**，中间没有任何裁剪。这不是随手写的：这个端点的缓存
+            以**整个请求**为单位匹配，只追加就几乎全命中，中间改一处就几乎全不中（实测 18,560 →
+            384，见 known-issues 的 D5）。所以"只追加"是省钱的**前提**，而这一行代码正是那个前提
+            的落点——别在这儿加变换。
+            """
+            nonlocal anchor
+
+            if cancel is not None and cancel.is_set():
+                raise _Cancelled
+
+            response = provider.complete(sent, **kwargs)
+            used = (
+                response.input_tokens,
+                response.output_tokens,
+                response.cache_read_input_tokens,
+            )
+            # 全是 0 就不吭声——那是假 provider（测试里那些），不是"这一发真的没花钱"。
+            if not any(used):
+                return response
+            if kwargs.get("tools"):
+                # 只认**带工具**的那几发（理由见 ContextAnchor）：用满步数收尾那一发不带 tools。
+                anchor = ContextAnchor(
+                    tokens=(
+                        response.input_tokens
+                        + response.cache_read_input_tokens
+                        + response.cache_creation_input_tokens
+                    ),
+                    covered=len(sent),
+                )
+            emit(f"{label}（这一发 token：{_usage_note(response)}）", "dim")
             return response
-        if kwargs.get("tools"):
-            # 只认**带工具**的那几发（理由见 ContextAnchor）：用满步数收尾那一发不带 tools。
-            anchor = ContextAnchor(
-                tokens=(
-                    response.input_tokens
-                    + response.cache_read_input_tokens
-                    + response.cache_creation_input_tokens
-                ),
-                covered=len(sent),
-            )
-        console.print(
-            f"{label}（这一发 token：{_usage_note(response)}）", style="dim", markup=False
-        )
-        return response
 
-    def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
-        """发一发；**瞬时故障再补一次**，然后才认输。
+        def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
+            """发一发；**瞬时故障再补一次**，然后才认输。
 
-        为什么要补：SDK 自己已经重试过 2 次了（退避大约 0.5 + 1 秒），它救不回来的说明麻烦比
-        那更久。所以这一层唯一的增量就是"等得更久"——3 秒比它那一串长，又短到人还愿意等。
+            为什么要补：SDK 自己已经重试过 2 次了（退避大约 0.5 + 1 秒），它救不回来的说明麻烦比
+            那更久。所以这一层唯一的增量就是"等得更久"——3 秒比它那一串长，又短到人还愿意等。
 
-        几条定下来的：
+            几条定下来的：
 
-        - **补在发请求这一层，不是整轮重跑**：工具可能已经跑过了（文件改过了、命令跑过了），
-          整轮重来会把副作用再做一遍；"再问一句"是幂等的。
-        - **只补一次**：补多了就是拿钱和时间去赌一个大概率还是不行的结果。
-        - **必须说出来**：不然提示符看着像卡死了；而且那是又一次全量计费，用户得有机会按
-          Ctrl+C 打断。
-        - **不重试的那几类一个字都不多等**：401 再试一百次还是 401，只会把"去查 .env"这句话
-          推迟几秒。
-        """
+            - **补在发请求这一层，不是整轮重跑**：工具可能已经跑过了（文件改过了、命令跑过了），
+              整轮重来会把副作用再做一遍；"再问一句"是幂等的。
+            - **只补一次**：补多了就是拿钱和时间去赌一个大概率还是不行的结果。
+            - **必须说出来**：不然提示符看着像卡死了；而且那是又一次全量计费，用户得有机会按
+              Ctrl+C 打断。
+            - **不重试的那几类一个字都不多等**：401 再试一百次还是 401，只会把"去查 .env"这句话
+              推迟几秒。
+            """
+            try:
+                return send(sent, **kwargs)
+            except TransientProviderError as exc:
+                emit(f"{label}（{exc}，等 {RETRY_PAUSE_SECONDS:g} 秒自动再试一次…）", "dim")
+                if cancel is not None:
+                    # 后台任务被取消了就别陪着睡完这三秒。
+                    if cancel.wait(RETRY_PAUSE_SECONDS):
+                        raise _Cancelled from None
+                else:
+                    time.sleep(RETRY_PAUSE_SECONDS)
+                # 补的这次再失败就往外放：外层接住，把这一轮收掉（会话不倒）。
+                return send(sent, **kwargs)
+
         try:
-            return send(sent, **kwargs)
-        except TransientProviderError as exc:
-            console.print(
-                f"{label}（{exc}，等 {RETRY_PAUSE_SECONDS:g} 秒自动再试一次…）",
-                style="dim",
-                markup=False,
-            )
-            time.sleep(RETRY_PAUSE_SECONDS)
-            # 补的这次再失败就往外放：外层接住，把这一轮收掉（会话不倒）。
-            return send(sent, **kwargs)
+            for step in range(steps_left):
+                if cancel is not None and cancel.is_set():
+                    raise _Cancelled
+                if notices is not None:
+                    notice = notices()
+                    if notice:
+                        # **纯追加**：不碰前面的任何一条，前缀缓存照旧。两个请求之间插一条
+                        # user 消息是协议允许的（连续 user 会被当成同一轮）。
+                        msgs.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"{notice}\n\n"
+                                    "（这是后台任务的完成通知；如果合适，在回答里顺带告诉用户。）"
+                                ),
+                            }
+                        )
+                if (
+                    allow_handoff
+                    and handoff is not None
+                    and background_after is not None
+                    and time.monotonic() - started >= background_after
+                ):
+                    # 交接点必须落在两发请求之间：此时 msgs 以一条完整的 tool_result 或用户任务
+                    # 结尾，后台接着往下跑不会留下悬空的 tool_use。
+                    rest = steps_left - step
+                    snapshot = list(msgs)
+                    trace_snapshot = list(trace)
 
-    try:
-        for _ in range(max_steps):
-            response = ask(messages, tools=tools, system=system)
+                    def continuation(
+                        emit_fn: Emit,
+                        cancel_event: threading.Event,
+                        _snapshot: list[dict[str, Any]] = snapshot,
+                        _rest: int = rest,
+                    ) -> AgentResult:
+                        return drive(
+                            _snapshot,
+                            _rest,
+                            emit=emit_fn,
+                            prompter=BackgroundPrompter(),
+                            cancel=cancel_event,
+                            allow_handoff=False,
+                            notices=None,
+                        )
 
-            if not response.tool_calls:
+                    task_id = handoff(continuation)
+                    return AgentResult(
+                        final=None,
+                        trace=trace_snapshot,
+                        messages=list(msgs),
+                        anchor=anchor,
+                        handoff=task_id,
+                    )
+
+                response = ask(msgs, tools=tools, system=system)
+
+                if not response.tool_calls:
+                    final = response.text
+                    if final is not None:
+                        trace.append(final)
+                        # 这一条也要进 messages：不然 result.messages 结尾是用户那侧，拿它接着聊就
+                        # 丢了模型最后说的话。
+                        msgs.append({"role": "assistant", "content": response.assistant_content})
+                    break
+
+                # 请求刚回来就发现被取消了：这条 assistant 消息**先别回填**。回填了就得给每个
+                # tool_use 配一条 tool_result，否则历史不合法——而这条响应已经没人要了。
+                if cancel is not None and cancel.is_set():
+                    raise _Cancelled
+
+                # assistant 这轮的内容要原样回填：tool_use 块藏在里面，模型靠它认领结果。
+                msgs.append({"role": "assistant", "content": response.assistant_content})
+
+                results: list[ToolResult] = []
+                for call in response.tool_calls:
+                    # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
+                    trace.append(_render_call(call))
+                    emit(f"{label}{_render_call(call)}", "cyan")
+
+                    # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
+                    result = _gate(call, prompter, allow_shell, permission_mode, grants)
+                    if result is None:
+                        result = registry.dispatch(ctx, call)
+
+                    trace.append(_render_result(result))
+                    emit(
+                        f"{label}{_render_result(result)}",
+                        "red" if result.is_error else "green",
+                    )
+                    results.append(result)
+
+                # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
+                msgs.append(
+                    {"role": "user", "content": [r.to_anthropic_block() for r in results]}
+                )
+            if final is None:
+                instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"
+                msgs.append({"role": "user", "content": instruction})
+                response = ask(msgs, system=system)
                 final = response.text
                 if final is not None:
                     trace.append(final)
-                    # 这一条也要进 messages：不然 result.messages 结尾是用户那侧，拿它接着聊就
-                    # 丢了模型最后说的话。
-                    messages.append({"role": "assistant", "content": response.assistant_content})
-                break
+                    msgs.append({"role": "assistant", "content": response.assistant_content})
+        except _Cancelled:
+            return AgentResult(
+                final=None,
+                trace=trace,
+                messages=msgs,
+                error=CANCELLED_ERROR,
+                anchor=anchor,
+            )
+        except ProviderError as exc:
+            # 请求根本发不出去（或者发出去被拒了），这一轮到此为止。
+            #
+            # **但已经发生过的事要带回去**：工具可能已经跑过了——文件改过了、命令跑过了——那些
+            # 消息必须跟着返回、跟着落盘。丢了的话下一轮模型会以为没发生过，把副作用再做一遍。
+            #
+            # 在这儿接住而不是往上抛，就是为了这个：异常路径拿不到 locals 里的 messages。
+            return AgentResult(
+                final=None, trace=trace, messages=msgs, error=str(exc), anchor=anchor
+            )
+        return AgentResult(final=final, trace=trace, messages=msgs, anchor=anchor)
 
-            # assistant 这轮的内容要原样回填：tool_use 块藏在里面，模型靠它认领结果。
-            messages.append({"role": "assistant", "content": response.assistant_content})
-
-            results: list[ToolResult] = []
-            for call in response.tool_calls:
-                # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
-                trace.append(_render_call(call))
-                console.print(f"{label}{_render_call(call)}", style="cyan", markup=False)
-
-                # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
-                result = _gate(call, prompter, allow_shell, permission_mode, grants)
-                if result is None:
-                    result = registry.dispatch(ctx, call)
-
-                trace.append(_render_result(result))
-                console.print(
-                    f"{label}{_render_result(result)}",
-                    style="red" if result.is_error else "green",
-                    markup=False,
-                )
-                results.append(result)
-
-            # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
-            messages.append({"role": "user", "content": [r.to_anthropic_block() for r in results]})
-        if final is None:
-            instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"
-            messages.append({"role": "user", "content": instruction})
-            response = ask(messages, system=system)
-            final = response.text
-            if final is not None:
-                trace.append(final)
-                messages.append({"role": "assistant", "content": response.assistant_content})
-    except ProviderError as exc:
-        # 请求根本发不出去（或者发出去被拒了），这一轮到此为止。
-        #
-        # **但已经发生过的事要带回去**：工具可能已经跑过了——文件改过了、命令跑过了——那些
-        # 消息必须跟着返回、跟着落盘。丢了的话下一轮模型会以为没发生过，把副作用再做一遍。
-        #
-        # 在这儿接住而不是往上抛，就是为了这个：异常路径拿不到 locals 里的 messages。
-        return AgentResult(
-            final=None, trace=trace, messages=messages, error=str(exc), anchor=anchor
-        )
-    return AgentResult(final=final, trace=trace, messages=messages, anchor=anchor)
+    return drive(
+        messages,
+        max_steps,
+        emit=output,
+        prompter=prompter,
+        cancel=None,
+        allow_handoff=True,
+        notices=notices,
+    )

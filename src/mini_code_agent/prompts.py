@@ -110,3 +110,32 @@ class NullPrompter:
         raise NobodyToAskError(
             f"没人可问，这个选择做不了：{question}（可选：{'、'.join(options)}）"
         )
+
+
+class BackgroundPrompter:
+    """后台子 agent 用的那一版：**不碰终端，需要当场批准的一律拒绝**。
+
+    为什么不是 `NullPrompter`：用户需要知道"这不是没人，是这时候问不了"。后台任务跑的
+    时候主循环可能在提示符上、也可能在跑别的一轮，任何读键盘的动作都会和它抢 stdin。
+    所以这里连问都不问，直接把"把改动写进结论"这条出路交给模型——主 agent 拿到结论后
+    可以自己来做，或者下一轮再问用户。
+
+    `Grants` 里本会话已经批过的文件走不到这儿（`_gate` 先查 `covers`），所以后台任务仍然
+    能改用户已经放行的那些文件。
+    """
+
+    def confirm_tool(self, request: PermissionRequest) -> Answer:
+        return Answer(False, note=self._note(request))
+
+    def confirm_edit(self, request: PermissionRequest) -> Answer:
+        return Answer(False, note=self._note(request))
+
+    def single_choice(self, question: str, options: Sequence[str]) -> str:
+        raise NobodyToAskError(f"后台任务没法问用户，这个选择做不了：{question}")
+
+    @staticmethod
+    def _note(request: PermissionRequest) -> str:
+        return (
+            f"这是后台任务，没人能当场批准 {request.tool_name}。"
+            "把要改什么、为什么写进结论，让主 agent 来做，或者等用户回来再派一次。"
+        )

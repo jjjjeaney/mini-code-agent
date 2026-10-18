@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 
 import pytest
@@ -18,8 +19,9 @@ from mini_code_agent.core.subagent import (
     _tally,
     make_agent_tool,
 )
+from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.permissions import Grants, PermissionRequest
-from mini_code_agent.prompts import Answer, NullPrompter
+from mini_code_agent.prompts import Answer, BackgroundPrompter, NullPrompter
 from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCall
 from mini_code_agent.system_prompt import _SUBAGENT_STATIC, SUBAGENT_HEADS
 from mini_code_agent.tools import Tool, ToolContext
@@ -264,19 +266,30 @@ def text_turn(text: str) -> ModelResponse:
     )
 
 
-def the_tool(provider, *, prompter=None, grants=None) -> Tool:
+def the_tool(
+    provider, *, prompter=None, grants=None, tasks=None, background_after=120.0
+) -> Tool:
     return make_agent_tool(
         provider=provider,
         prompter=prompter if prompter is not None else NullPrompter(),
         grants=grants if grants is not None else Grants(),
         model="test-model",
+        tasks=tasks,
+        background_after=background_after,
     )
 
 
 def call_the_tool(
-    tool: Tool, ctx: ToolContext, *, kind: str = "explore", prompt: str = "找到压缩那段代码"
+    tool: Tool,
+    ctx: ToolContext,
+    *,
+    kind: str = "explore",
+    prompt: str = "找到压缩那段代码",
+    **extra,
 ) -> str:
-    return tool.fn({"type": kind, "description": "找压缩逻辑", "prompt": prompt}, ctx)
+    return tool.fn(
+        {"type": kind, "description": "找压缩逻辑", "prompt": prompt, **extra}, ctx
+    )
 
 
 class TestTheAgentToolShape:
@@ -484,3 +497,89 @@ class TestTheGateInsideASubagent:
         assert "（[general-purpose] 子 agent 请求：）" in out
         # 头尾两行也在，用户看得见"派了谁、去干什么、跑完调了几次工具"
         assert "▶ [general-purpose] 找压缩逻辑" in out
+
+
+class TestBackground:
+    """`run_in_background` 和两分钟自动交接。"""
+
+    def test_the_schema_offers_run_in_background(self):
+        assert AGENT_SCHEMA["properties"]["run_in_background"]["type"] == "boolean"
+        assert "run_in_background" not in AGENT_SCHEMA["required"]
+
+    def test_it_returns_a_task_id_instead_of_waiting(self, tmp_path):
+        gate = threading.Event()
+
+        class BlockingProvider:
+            def complete(self, messages, tools=None, system=None):
+                gate.wait(2)
+                return text_turn("结论")
+
+        manager = TaskManager()
+        tool = the_tool(BlockingProvider(), tasks=manager, background_after=0.0)
+
+        out = call_the_tool(
+            tool,
+            ToolContext(cwd=tmp_path, allow_background=True),
+            run_in_background=True,
+        )
+
+        assert "已派发" in out
+        assert "不要重派" in out
+        assert manager.running() == 1
+        gate.set()
+        assert manager.wait(manager.list()[0].id, timeout=2)
+
+    def test_a_long_foreground_task_is_moved_to_the_background(self, tmp_path):
+        provider = ScriptedProvider([text_turn("结论")])
+        manager = TaskManager()
+        tool = the_tool(provider, tasks=manager, background_after=0.0)
+
+        out = call_the_tool(
+            tool, ToolContext(cwd=tmp_path, allow_background=True)
+        )
+
+        assert "转到后台" in out
+        assert manager.wait(manager.list()[0].id, timeout=2)
+        assert "结论" in manager.take_notices()
+
+    def test_without_background_support_it_runs_synchronously(self, tmp_path):
+        """一次性模式没有下一轮可以送结果——模型要了后台也只能同步跑完，并且说明一句。"""
+        provider = ScriptedProvider([text_turn("结论")])
+        tool = the_tool(provider, tasks=TaskManager(), background_after=0.0)
+
+        out = call_the_tool(
+            tool, ToolContext(cwd=tmp_path), run_in_background=True
+        )
+
+        assert "没有后台模式" in out
+        assert "结论" in out
+        assert len(provider.calls) == 1
+
+    def test_the_concurrency_limit_refuses_a_third_background_task(self, tmp_path):
+        gate = threading.Event()
+
+        class BlockingProvider:
+            def complete(self, messages, tools=None, system=None):
+                gate.wait(2)
+                return text_turn("结论")
+
+        manager = TaskManager()
+        tool = the_tool(BlockingProvider(), tasks=manager, background_after=0.0)
+        ctx = ToolContext(cwd=tmp_path, allow_background=True)
+
+        call_the_tool(tool, ctx, run_in_background=True)
+        call_the_tool(tool, ctx, run_in_background=True)
+        out = call_the_tool(tool, ctx, run_in_background=True)
+
+        assert "已经有 2 个" in out
+        gate.set()
+        for record in manager.list():
+            manager.wait(record.id, timeout=2)
+
+    def test_the_background_half_cannot_ask_for_new_approvals(self):
+        """后台不碰终端：需要当场批准的事只能写进结论，交给主 agent。"""
+        answer = BackgroundPrompter().confirm_edit(request())
+
+        assert answer.allowed is False
+        assert "后台任务" in answer.note
+        assert "结论" in answer.note

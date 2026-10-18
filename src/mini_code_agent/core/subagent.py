@@ -44,6 +44,7 @@ from mini_code_agent.tools import Tool, ToolRegistry, default_tools
 
 if TYPE_CHECKING:
     # 这几个都只出现在标注里，运行时不碰。
+    from mini_code_agent.core.tasks import TaskManager
     from mini_code_agent.permissions import Grants, PermissionRequest
     from mini_code_agent.providers.base import Provider
     from mini_code_agent.tools import ToolContext
@@ -51,6 +52,14 @@ if TYPE_CHECKING:
 # 那一行过程最多列几类工具。多了就只说个总数——它进的是**主 agent 的上下文**，
 # 而那一行只是"这个结论查得多深"的信号，不是流水账。
 _MAX_TALLY_KINDS = 5
+
+# 一次 `agent` 调用跑满这么久就自动转后台。**这是体验上的数，不是技术边界**：
+# 用户愿意为一次同步调用等多久。改它不影响正确性。
+BACKGROUND_AFTER_SECONDS = 120.0
+
+# 同时跑着几个后台任务就不再接新的了。**只在模型主动要后台时硬拦**：自动交接的那一条本来
+# 就已经在跑了，拦下来只会把它卡在前台。
+BACKGROUND_LIMIT = 2
 
 
 @dataclass(frozen=True)
@@ -116,6 +125,14 @@ AGENT_SCHEMA: dict[str, Any] = {
             "description": (
                 "交给子 agent 的完整任务描述。**它看不到你和用户的对话**，所以背景、约束、"
                 "你要它回答什么，都得写进去；别写「见上面」这种指代"
+            ),
+        },
+        "run_in_background": {
+            "type": "boolean",
+            "description": (
+                "true = 立刻返回任务 id，先去做别的，结果会在后面的请求前自动送到你手上。"
+                "只有**现在不需要这个结论、而且你还有别的活要干**时才用它。"
+                "派了就别重派同一个任务。"
             ),
         },
     },
@@ -215,7 +232,12 @@ def _describe() -> str:
         "**小事别派**：一次 `read_file`、一条 `grep` 就够的，自己来更快。\n\n"
         f"`type` 可选：\n{kinds}\n\n"
         "**plan 档下只用 `explore` 或 `plan`。** 那一档里 `general-purpose` 改文件会被直接拒，"
-        "派了大概率白烧步数。"
+        "派了大概率白烧步数。\n\n"
+        f"**跑满 {int(BACKGROUND_AFTER_SECONDS)} 秒会自动转后台**，不用你特意说。"
+        "`run_in_background=true` 则是一开始就转：立刻拿到任务 id，先去做别的。"
+        "后台任务的结果会作为一条通知自动出现在你后面的请求里；太长的话会落盘，"
+        "用 `read_tool_result` 按任务 id 取。**转后台之后它不能再请求新的权限批准**——"
+        "需要用户点头的改动，让它写进结论里。"
     )
 
 
@@ -225,6 +247,8 @@ def make_agent_tool(
     prompter: Prompter,
     grants: Grants,
     model: str | None = None,
+    tasks: TaskManager | None = None,
+    background_after: float = BACKGROUND_AFTER_SECONDS,
 ) -> Tool:
     """造出 `agent` 工具——主 agent 拿它派子 agent。
 
@@ -253,6 +277,35 @@ def make_agent_tool(
             )
 
         label = f"[{name}] "
+        wants_background = bool(kwargs.get("run_in_background", False))
+        # 一次性模式没有下一轮可以送结果，所以那边 `allow_background` 是 False——模型就算
+        # 要了后台也只同步跑完，并在结果里说明一句。
+        can_background = ctx.allow_background and tasks is not None
+        if wants_background and can_background and tasks.running() >= BACKGROUND_LIMIT:
+            return (
+                f"已经有 {BACKGROUND_LIMIT} 个后台任务在跑，先别派新的。"
+                "去做点别的、等它们的完成通知；这件事要是急，就用同步的方式跑完。"
+            )
+        # 主动要后台 = “跑够 0 秒就交接”；没主动要 = 前台跑满 `background_after` 再交接。
+        use_background = wants_background and can_background
+        after = 0.0 if use_background else (background_after if can_background else None)
+
+        start_background = None
+        if can_background:
+
+            def _start(work):
+                return tasks.start(
+                    work,
+                    label=label,
+                    agent_type=name,
+                    description=str(kwargs["description"]),
+                    cwd=ctx.cwd,
+                    spill_dir=ctx.spill_dir,
+                    tally=tally_calls,
+                )
+
+            start_background = _start
+
         # 头尾这两行由这里打：runagent 自己那些行会带同一个 label，但它不知道"派的是谁、
         # 派去干什么"。
         console.print(f"▶ {label}{kwargs['description']}", style="cyan", markup=False)
@@ -269,7 +322,24 @@ def make_agent_tool(
             grants=grants,
             spill_dir=ctx.spill_dir,
             label=label,
+            background_after=after,
+            handoff=start_background,
         )
+        if result.handoff is not None:
+            console.print(f"◀ {label}转到后台：{result.handoff}", style="dim", markup=False)
+            if use_background:
+                head = f"【后台任务 {result.handoff} 已派发】"
+            else:
+                head = (
+                    f"【已经跑了 {int(background_after)} 秒，"
+                    f"转到后台继续：{result.handoff}】"
+                )
+            return (
+                f"{head}（{name}：{kwargs['description']}）\n"
+                "它会在后台继续跑；结果会自动出现在你后面的请求里。"
+                "**不要重派同一个任务。**"
+            )
+
         note = tally_calls(result.messages)
         console.print(f"◀ {label}{note}", style="dim", markup=False)
 
@@ -289,7 +359,10 @@ def make_agent_tool(
         # 那一行过程在**最前面**，不在末尾：下面还要过一道长度闸（这个工具标了 spill），
         # 而截断和落盘预览都只留开头——放末尾的话它会被连同正文一起切掉。project_tree
         # 踩过同一个坑（见 files.py 里那句"说明放前面"）。
-        return f"[{name} 子 agent：{note}]\n\n{body}"
+        prefix = ""
+        if wants_background and not can_background:
+            prefix = "（这次运行没有后台模式，已经同步跑完。）\n\n"
+        return f"{prefix}[{name} 子 agent：{note}]\n\n{body}"
 
     return Tool(
         name="agent",

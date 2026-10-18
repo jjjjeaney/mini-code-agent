@@ -167,6 +167,11 @@ class ToolContext:
     # 追加在**最后**：现有按位置构造 ToolContext 的地方（测试里那些）不受影响。
     fork: ForkContext | None = None
 
+    # 这次运行认不认 `agent(run_in_background=true)`、以及要不要在两分钟后自动转后台。
+    # 和 `allow_shell` / `fork` 一样是**环境**，不是能力：一次性模式没有下一轮可以送结果，
+    # 所以那边是 False。
+    allow_background: bool = False
+
 
 def _always_available(_: ToolContext) -> bool:
     """默认：一直能用。绝大多数工具都是这样。"""

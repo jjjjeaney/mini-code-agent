@@ -14,6 +14,7 @@ from mini_code_agent.commands.builtin import (
     make_permission_mode,
     make_sessions,
     make_status,
+    make_tasks,
 )
 
 
@@ -81,7 +82,7 @@ def default_commands() -> Commands:
 
     顺序就是 `/help` 里的顺序，所以 `/help` 放第一条。`/permission_mode` 和 `/fork` 都是"下一轮
     怎么跑"的旋钮，排在一起；`/status` 跟在它们后面——看完旋钮顺手下一条就是"我现在在哪儿"；
-    `/sessions` 又跟在 `/status` 后面，那几条合起来是"看看眼下什么情况"。
+    `/sessions` 和 `/tasks` 又跟在 `/status` 后面，那几条合起来是"看看眼下什么情况"。
     """
     commands = Commands()
     commands.register(make_help(commands))
@@ -89,6 +90,7 @@ def default_commands() -> Commands:
     commands.register(make_fork())
     commands.register(make_status())
     commands.register(make_sessions())
+    commands.register(make_tasks())
     commands.register(make_compact())
     commands.register(make_grants())
     commands.register(make_exit())

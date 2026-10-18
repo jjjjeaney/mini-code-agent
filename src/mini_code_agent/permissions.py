@@ -26,6 +26,7 @@ decide_permission 里，它不认识 Grants。
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Literal, get_args
 
@@ -190,16 +191,31 @@ class Grants:
 
     entries: set[tuple[str, str]] = field(default_factory=set)
 
+    # 后台子 agent 也会走到这儿（`_gate` 先查 `covers`），而主线程可能在 `remember`、
+    # `/grants` 可能在遍历。单条 `in` / `add` 在 CPython 下本身是原子的，但"遍历时另一条
+    # 线程加了一条"会让 `sorted(entries)` 抛 RuntimeError——所以统一加锁，遍历走 snapshot()。
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
     def covers(self, request: PermissionRequest) -> bool:
         key = _grant_key(request)
-        return key is not None and key in self.entries
+        if key is None:
+            return False
+        with self._lock:
+            return key in self.entries
 
     def remember(self, request: PermissionRequest) -> None:
         """记下这次批准。记不了的（比如 bash）就当没说——调用方不必先判能不能记。"""
         key = _grant_key(request)
         if key is not None:
-            self.entries.add(key)
+            with self._lock:
+                self.entries.add(key)
 
     def clear(self) -> None:
         """把这一会话批过的全忘掉。之后同一个文件会重新问你——只会多问，不会少问。"""
-        self.entries.clear()
+        with self._lock:
+            self.entries.clear()
+
+    def snapshot(self) -> list[tuple[str, str]]:
+        """排好序的一份副本。**不要在外面直接遍历 entries**：后台线程可能在改它。"""
+        with self._lock:
+            return sorted(self.entries)

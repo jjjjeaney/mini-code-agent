@@ -28,7 +28,7 @@ cp .env.example .env
 uv run mca "用一句话解释什么是闭包"
 ```
 
-不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/compact`、`/grants`、`/permission_mode`、`/fork`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉工具表和提示词，也就是重建前缀缓存）。
+不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/tasks`、`/compact`、`/grants`、`/permission_mode`、`/fork`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉工具表和提示词，也就是重建前缀缓存）。
 
 ```bash
 uv run mca
@@ -39,6 +39,8 @@ uv run mca
 工具输出太长时（`bash` 的命令输出、`web_fetch` 取回的网页），完整内容落在 `.agent/tool-results/<会话 id>/` 里，上下文里只留一段预览——需要的时候模型用 `read_tool_result` 把它取回来。这样截断不再是不可逆的：长日志的**尾巴**（测试失败清单就在那儿）也留得住。按会话分目录是为了让 `--delete` 能把它们连同会话一起删掉（删之前会告诉你一共有几个）。缓存冷了之后折叠旧工具结果时，重跑拿不回来的那几类（`bash`、`web_fetch`、`web_search`）也会先按工具调用 id 存一份进来，同样用 `read_tool_result` 取。
 
 `--fork` 打开 fork 子 agent：它继承当前这份对话（同一份系统提示、同一张工具表、除最后一条工具调用之外的全部消息），所以背景不用重讲，缓存也直接命中。适合"必须带着现在这段上下文才做得对"的事——按现有方向独立试另一种做法，或者复用已经读过的文件。反过来，一段自足的任务描述就能说清的，用普通的 `agent` 子 agent 更划算。fork 是同步的；它改过的文件，主 agent 之后改之前会先被要求重读。
+
+子 agent 默认也是同步的，但**跑满两分钟会自动转到后台**：工具调用立刻返回一个任务 id，子 agent 在后台接着跑，主 agent 可以去干别的。模型也可以直接要 `run_in_background=true`，一开始就不等。结果会在主 agent 下一发请求之前以一条通知自动进上下文（太长就按任务 id 落盘，用 `read_tool_result` 取）；如果主 agent 已经闲着，完成事件会叫醒循环，让模型自己开口告诉你。后台任务**不能再请求新的权限批准**——本会话已经批过的文件照常能改，其余的会写进结论。`/tasks` 能看在跑什么、跑了多久，也能取消；进程退出时后台任务会被硬杀。
 
 ```bash
 uv run mca --list

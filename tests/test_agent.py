@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
-from mini_code_agent.core.agent import RETRY_PAUSE_SECONDS, runagent
+from mini_code_agent.core.agent import CANCELLED_ERROR, RETRY_PAUSE_SECONDS, runagent
 from mini_code_agent.folding import fold_stale
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompting import make_ask_user
@@ -1008,3 +1010,122 @@ def test_an_error_that_will_never_work_is_not_retried(monkeypatch):
     assert provider.calls == 1
     assert slept == []
     assert result.error
+
+
+class TestHandoff:
+    """跑到一半交给后台：交接点在两发请求之间，历史必须是完整的。"""
+
+    def test_it_hands_off_before_the_first_request_when_the_budget_is_zero(self, registry):
+        provider = ScriptedProvider([])
+        work: list = []
+
+        result = runagent(
+            "你好",
+            provider,
+            registry,
+            background_after=0.0,
+            handoff=lambda continuation: work.append(continuation) or "bg-1",
+        )
+
+        assert result.handoff == "bg-1"
+        assert result.final is None
+        assert provider.calls == []
+        assert result.messages == [{"role": "user", "content": "你好"}]
+        assert len(work) == 1
+
+    def test_the_continuation_starts_from_the_handoff_messages(self, registry):
+        provider = ScriptedProvider(
+            [tool_turn("t1", "add", {"a": 1, "b": 2}), text_turn("3")]
+        )
+        work: list = []
+        result = runagent(
+            "1+2",
+            provider,
+            registry,
+            background_after=0.0,
+            handoff=lambda continuation: work.append(continuation) or "bg-1",
+        )
+        assert provider.calls == []
+
+        background = work[0](lambda text, style: None, threading.Event())
+
+        assert background.final == "3"
+        # 后台的第一发就是交接时那份快照，后面只追加。
+        assert provider.calls[0]["messages"] == result.messages
+        assert background.messages[: len(result.messages)] == result.messages
+
+    def test_it_hands_off_between_steps_not_in_the_middle_of_one(self, registry, monkeypatch):
+        """预算到点后**先把这一批工具跑完**，再在下一发之前交接。
+
+        否则就会在历史里留下一条没有 tool_result 的 tool_use，后台接过去也发不出去。
+        """
+        clock = iter([0.0, 0.0, 200.0])  # 开始 / 第 0 步检查 / 第 1 步检查
+        monkeypatch.setattr("mini_code_agent.core.agent.time.monotonic", lambda: next(clock))
+        provider = ScriptedProvider(
+            [tool_turn("t1", "add", {"a": 1, "b": 2}), text_turn("3")]
+        )
+        work: list = []
+
+        result = runagent(
+            "1+2",
+            provider,
+            registry,
+            background_after=120.0,
+            handoff=lambda continuation: work.append(continuation) or "bg-1",
+        )
+
+        assert result.handoff == "bg-1"
+        assert len(provider.calls) == 1  # 前台只发了第 0 步那一发
+        assert result.messages[-1]["role"] == "user"
+        assert result.messages[-1]["content"][0]["type"] == "tool_result"
+
+        background = work[0](lambda text, style: None, threading.Event())
+
+        assert background.final == "3"
+        assert provider.calls[1]["messages"] == background.messages[: len(result.messages)]
+
+    def test_emit_routes_every_line(self, registry):
+        seen: list[tuple[str, str]] = []
+        provider = ScriptedProvider(
+            [tool_turn("t1", "add", {"a": 1, "b": 2}), text_turn("3")]
+        )
+
+        runagent("1+2", provider, registry, emit=lambda text, style: seen.append((text, style)))
+
+        assert any(text.startswith("→ add") for text, _ in seen)
+        assert any(text.startswith("← add") for text, _ in seen)
+
+    def test_notices_are_appended_before_the_next_request(self, registry):
+        """完成通知只追加，不动前面任何一条——前缀缓存靠的就是这个。"""
+        asked: list[int] = []
+
+        def notices() -> str | None:
+            asked.append(1)
+            return "【后台任务 bg-1 完成】找到三处" if len(asked) == 1 else None
+
+        provider = ScriptedProvider([text_turn("好")])
+
+        runagent("接着", provider, registry, notices=notices)
+
+        sent = provider.calls[0]["messages"]
+        assert sent[0]["content"] == "接着"
+        assert "后台任务 bg-1" in sent[1]["content"]
+        assert "顺带告诉用户" in sent[1]["content"]
+
+    def test_cancelling_the_continuation_stops_before_the_next_request(self, registry):
+        provider = ScriptedProvider([text_turn("不该被发出去")])
+        work: list = []
+        runagent(
+            "你好",
+            provider,
+            registry,
+            background_after=0.0,
+            handoff=lambda continuation: work.append(continuation) or "bg-1",
+        )
+
+        cancel = threading.Event()
+        cancel.set()
+        background = work[0](lambda text, style: None, cancel)
+
+        assert background.error == CANCELLED_ERROR
+        assert provider.calls == []

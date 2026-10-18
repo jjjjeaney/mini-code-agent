@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 
 import pytest
 import typer
 
 from mini_code_agent import cli
+from mini_code_agent.core.agent import AgentResult
 from mini_code_agent.core.fork import make_fork_tool
+from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.folding import FOLD_AFTER_SECONDS, MIN_FOLD_CHARS
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants, PermissionRequest
@@ -67,6 +71,7 @@ def run_loop(
     registry: ToolRegistry | None = None,
     grants: Grants | None = None,
     allow_fork: bool = False,
+    tasks: TaskManager | None = None,
 ) -> Session:
     """喂一串「用户输入」，把交互循环跑起来。最后一句给 /exit 收尾。"""
     answers = iter(lines)
@@ -83,6 +88,7 @@ def run_loop(
         prompter=NullPrompter(),
         grants=grants if grants is not None else Grants(),
         allow_fork=allow_fork,
+        tasks=tasks,
     )
     return session
 
@@ -879,3 +885,144 @@ def test_the_one_shot_path_persists_before_folding(monkeypatch, tmp_path):
     )
 
     assert (spill.session_dir(tmp_path, session.id) / "t0.txt").is_file()
+
+
+def test_the_loop_turns_background_mode_on(monkeypatch, tmp_path):
+    """交互模式下 `ctx.allow_background` 必须是 True——否则 `run_in_background` 永远被忽略。"""
+    seen: list[bool] = []
+
+    def probe(kwargs, ctx):
+        seen.append(ctx.allow_background)
+        return "ok"
+
+    tool = Tool(name="probe", description="", fn=probe, params={})
+    provider = ScriptedProvider([tool_turn("t1", "probe", {}), text_turn("好了")])
+
+    run_loop(
+        monkeypatch,
+        provider,
+        ["试试", "/exit"],
+        tmp_path,
+        registry=ToolRegistry([tool]),
+    )
+
+    assert seen == [True]
+
+
+class TestBackgroundReporting:
+    """后台任务结束时要让模型自己开口，而不是等用户再问一句。"""
+
+    def test_a_finished_task_wakes_the_idle_loop(self, monkeypatch, tmp_path, capsys):
+        class ReportingProvider(ScriptedProvider):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.called = threading.Event()
+
+            def complete(self, messages, tools=None, system=None):
+                self.called.set()
+                return super().complete(messages, tools, system)
+
+        provider = ReportingProvider([text_turn("后台任务跑完了：找到三处")])
+        manager = TaskManager()
+        release = threading.Event()
+
+        def work(emit, cancel):
+            release.wait(2)
+            return AgentResult(final="找到三处", trace=[], messages=[])
+
+        manager.start(
+            work,
+            label="[explore] ",
+            agent_type="explore",
+            description="找压缩逻辑",
+            cwd=tmp_path,
+            spill_dir=None,
+        )
+
+        # 读键盘用一个会阻塞的队列：主循环停在 events.get() 上，任务完成的事件才叫得醒它。
+        # `ready` 由读键盘线程在真正开始等输入时置位——那时 `_chat` 已经把 on_finish 接上了。
+        inputs: queue.Queue[str] = queue.Queue()
+        ready = threading.Event()
+
+        def prompt(*args, **kwargs) -> str:
+            ready.set()
+            return inputs.get()
+
+        monkeypatch.setattr(cli.typer, "prompt", prompt)
+        session = start(tmp_path, permission_mode="default", allow_shell=False)
+
+        def feed() -> None:
+            try:
+                assert ready.wait(3)
+                release.set()
+                # 等模型真的被叫醒去汇报，再放 /exit——否则"任务事件"和"用户这一行"谁先到没准。
+                assert provider.called.wait(3)
+            finally:
+                # 断言失败时也要放行，否则 `_chat` 会一直卡在等输入上，测试变成挂死而不是变红。
+                inputs.put("/exit")
+
+        threading.Thread(target=feed, daemon=True).start()
+
+        cli._chat(
+            provider,
+            ToolRegistry([]),
+            session,
+            [],
+            cwd=tmp_path,
+            allow_shell=False,
+            permission_mode="default",
+            prompter=NullPrompter(),
+            grants=Grants(),
+            tasks=manager,
+        )
+
+        assert "后台任务跑完了" in capsys.readouterr().out
+        assert len(provider.calls) == 1
+        # 完成通知和模型的话都要落进会话文件——下次 --resume 接上来时还看得见。
+        _, _, history = load(tmp_path, session.id)
+        assert any("后台任务" in str(message.get("content")) for message in history)
+        assert any("后台任务跑完了" in str(message.get("content")) for message in history)
+
+    def test_a_task_already_merged_into_a_turn_is_not_reported_again(
+        self, monkeypatch, tmp_path
+    ):
+        """`take_notices` 取走即标记：主 agent 那一轮已经并进去的，空闲唤醒不再说一遍。"""
+        manager = TaskManager()
+        release = threading.Event()
+
+        def work(emit, cancel):
+            release.wait(2)
+            return AgentResult(final="找到三处", trace=[], messages=[])
+
+        manager.start(
+            work,
+            label="[explore] ",
+            agent_type="explore",
+            description="找压缩逻辑",
+            cwd=tmp_path,
+            spill_dir=None,
+        )
+
+        def probe(kwargs, ctx):
+            return "ok"
+
+        class ReleasingProvider(ScriptedProvider):
+            def complete(self, messages, tools=None, system=None):
+                if not release.is_set():
+                    release.set()
+                    manager.wait(manager.list()[0].id, timeout=2)
+                return super().complete(messages, tools, system)
+
+        provider = ReleasingProvider([tool_turn("t1", "probe", {}), text_turn("好了")])
+
+        run_loop(
+            monkeypatch,
+            provider,
+            ["跑一下", "/exit"],
+            tmp_path,
+            registry=ToolRegistry([Tool(name="probe", description="", fn=probe, params={})]),
+            tasks=manager,
+        )
+
+        # 那一轮的第二发之前，`notices` 把结果并进了上下文；所以只有两发，没有额外的汇报回合。
+        assert len(provider.calls) == 2

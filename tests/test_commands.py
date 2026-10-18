@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from mini_code_agent.commands.base import split_command
 from mini_code_agent.commands.builtin import make_help
 from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
+from mini_code_agent.core.agent import CANCELLED_ERROR, AgentResult
+from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.sessions import SESSIONS_DIR, Session, start
 from mini_code_agent.summarizing import COMPACT_AT
@@ -37,6 +40,7 @@ def make_ctx(
     window: int | None = None,
     context_tokens: int | None = None,
     context_covered: int = 0,
+    tasks: TaskManager | None = None,
 ) -> CommandContext:
     """一份手边的东西。全给上默认值，测哪一块就只改哪一块。
 
@@ -59,6 +63,7 @@ def make_ctx(
         or Session(id="s1", path=Path("proj/.agent/sessions/s1.jsonl"), opened=True),
         grants=grants if grants is not None else Grants(),
         compact=compact if compact is not None else (lambda: None),
+        tasks=tasks,
     )
 
 
@@ -135,6 +140,7 @@ class TestHelp:
             "/permission_mode",
             "/status",
             "/sessions",
+            "/tasks",
             "/compact",
             "/grants",
             "/exit",
@@ -325,6 +331,120 @@ class TestStatus:
         default_commands().dispatch("/status", make_ctx())
 
         assert "摘要" not in capsys.readouterr().out
+
+    def test_it_reports_background_tasks(self, capsys, tmp_path):
+        manager, _ = a_finished_task(tmp_path)
+
+        default_commands().dispatch("/status", make_ctx(cwd=tmp_path, tasks=manager))
+
+        assert "后台任务：0 个在跑，1 个已结束" in capsys.readouterr().out
+
+    def test_it_stays_quiet_when_there_are_none(self, capsys):
+        default_commands().dispatch("/status", make_ctx(tasks=TaskManager()))
+
+        assert "后台任务：" not in capsys.readouterr().out
+
+
+def a_finished_task(tmp_path, final: str = "找到三处"):
+    manager = TaskManager()
+    task_id = manager.start(
+        lambda emit, cancel: AgentResult(final=final, trace=[], messages=[]),
+        label="[explore] ",
+        agent_type="explore",
+        description="找压缩逻辑",
+        cwd=tmp_path,
+        spill_dir=None,
+    )
+    assert manager.wait(task_id, timeout=2)
+    return manager, task_id
+
+
+class TestTasks:
+    """/tasks：看得见、停得下。后台任务是花了钱、在用户看不见的地方跑着的。"""
+
+    def test_it_says_so_when_there_is_no_table(self, capsys):
+        default_commands().dispatch("/tasks", make_ctx())
+
+        assert "没有后台任务表" in capsys.readouterr().out
+
+    def test_it_says_so_when_nothing_has_run(self, capsys):
+        default_commands().dispatch("/tasks", make_ctx(tasks=TaskManager()))
+
+        assert "还没有后台任务" in capsys.readouterr().out
+
+    def test_it_lists_a_finished_task(self, capsys, tmp_path):
+        manager, task_id = a_finished_task(tmp_path)
+
+        default_commands().dispatch("/tasks", make_ctx(cwd=tmp_path, tasks=manager))
+
+        out = capsys.readouterr().out
+        assert task_id in out
+        assert "完成" in out
+        assert "找压缩逻辑" in out
+
+    def test_show_prints_the_conclusion(self, capsys, tmp_path):
+        manager, task_id = a_finished_task(tmp_path, final="找到三处")
+
+        default_commands().dispatch(
+            f"/tasks show {task_id}", make_ctx(cwd=tmp_path, tasks=manager)
+        )
+
+        assert "找到三处" in capsys.readouterr().out
+
+    def test_cancel_asks_a_running_task_to_stop(self, capsys, tmp_path):
+        began = threading.Event()
+
+        def work(emit, cancel):
+            began.set()
+            cancel.wait(2)
+            return AgentResult(
+                final=None, trace=[], messages=[], error=CANCELLED_ERROR
+            )
+
+        manager = TaskManager()
+        task_id = manager.start(
+            work,
+            label="[explore] ",
+            agent_type="explore",
+            description="找压缩逻辑",
+            cwd=tmp_path,
+            spill_dir=None,
+        )
+        assert began.wait(2)
+
+        default_commands().dispatch(
+            f"/tasks cancel {task_id}", make_ctx(cwd=tmp_path, tasks=manager)
+        )
+
+        assert "会在下一次发请求之前停下" in capsys.readouterr().out
+        assert manager.wait(task_id, timeout=2)
+
+    def test_cancelling_a_finished_task_says_so(self, capsys, tmp_path):
+        manager, task_id = a_finished_task(tmp_path)
+
+        default_commands().dispatch(
+            f"/tasks cancel {task_id}", make_ctx(cwd=tmp_path, tasks=manager)
+        )
+
+        assert "已经结束了" in capsys.readouterr().out
+
+    def test_an_unknown_id_is_refused(self, capsys, tmp_path):
+        manager, _ = a_finished_task(tmp_path)
+
+        default_commands().dispatch(
+            "/tasks show bg-nope", make_ctx(cwd=tmp_path, tasks=manager)
+        )
+
+        assert "没有 'bg-nope' 这个后台任务" in capsys.readouterr().out
+
+    def test_an_unknown_action_is_refused(self, capsys, tmp_path):
+        manager, task_id = a_finished_task(tmp_path)
+
+        default_commands().dispatch(
+            f"/tasks kill {task_id}", make_ctx(cwd=tmp_path, tasks=manager)
+        )
+
+        assert "看不懂" in capsys.readouterr().out
 
 
 class TestCompact:
