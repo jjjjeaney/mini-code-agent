@@ -370,6 +370,7 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
             prompt="",
             cwd=tmp_path,
             shell=False,
+            fork=False,
             permission_mode="default",
             continue_=False,
             resume="",
@@ -400,6 +401,7 @@ def run_delete(tmp_path, session_id: str, *, yes: bool) -> None:
             prompt="",
             cwd=tmp_path,
             shell=False,
+            fork=False,
             permission_mode="default",
             continue_=False,
             resume="",
@@ -461,6 +463,7 @@ def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
             prompt="",
             cwd=tmp_path,
             shell=False,
+            fork=False,
             permission_mode="default",
             continue_=False,
             resume="",
@@ -543,6 +546,7 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
         prompt="你好",
         cwd=tmp_path,
         shell=False,
+        fork=False,
         permission_mode="default",
         continue_=False,
         resume="",
@@ -553,6 +557,30 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
     offered = {schema["name"] for schema in provider.tools or []}
     assert "agent" in offered
     assert "ask_user" in offered  # 另一个 harness 注入的，顺带确认这条路没被改坏
+    assert "fork" not in offered  # 没开 --fork
+    capsys.readouterr()
+
+
+def test_the_fork_tool_is_offered_only_with_the_flag(monkeypatch, tmp_path, capsys):
+    provider = FakeOneShotProvider()
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda: provider)
+
+    def offered(*, fork: bool) -> set[str]:
+        cli.main_command(
+            prompt="你好",
+            cwd=tmp_path,
+            shell=False,
+            fork=fork,
+            permission_mode="default",
+            continue_=False,
+            resume="",
+            list_=False,
+            delete_="",
+        )
+        return {schema["name"] for schema in provider.tools or []}
+
+    assert "fork" not in offered(fork=False)
+    assert "fork" in offered(fork=True)
     capsys.readouterr()
 
 
@@ -805,6 +833,7 @@ def test_the_one_shot_path_persists_before_folding(monkeypatch, tmp_path):
         prompt="接着说",
         cwd=tmp_path,
         shell=False,
+        fork=False,
         permission_mode="default",
         continue_=False,
         resume=session.id,

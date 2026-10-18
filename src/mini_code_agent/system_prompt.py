@@ -122,6 +122,28 @@ _MODE_HINTS = {
     "bypass permissions": "当前权限档位 bypass permissions：什么都不会问用户，照常干活。",
 }
 
+# fork 开着的时候才加的一段。
+#
+# **它不能进 `_STATIC`**：那份是"同一份给所有项目所有用户、一个字都不随运行变"的，而 fork 是
+# 启动时决定的开关——写进去会让没开 fork 的用户也看见一个根本不存在的工具。放在档位之后、
+# 项目上下文之前：前面那几段一次运行里不动，它也是。
+_FORK_HINT = """\
+## 什么时候用 fork
+
+有些事**必须带着现在这段对话的上下文**才做得对。这时候用 `fork`，不要用 `agent`：它拿到的是
+和你一样的系统提示、工具表和历史（只少了你最后那条工具调用），所以背景不用重讲，缓存也直接
+命中。
+
+- **上下文依赖**：要靠前面说过的背景、读过的文件、已经定下的方向才做得对。
+- **任务独立性**：想从**现在这个状态**出发，独立试另一种做法。
+- **上下文成本**：这件事需要你已经付过费的那段上下文，重讲一遍既费 token 又会失真。
+- 反过来，**一段自足的任务描述就能说清的，用 `agent`**——它从零开始，读完的东西不占你的
+  上下文。
+
+`fork` 是**同步**的；**同一批工具调用里别和别的工具并排**（它看不到同一批里其它调用的结果）；
+**不能嵌套 fork**。它改过的文件，你之后改之前要先重读。
+"""
+
 # ——— 子 agent 的那半 ———
 #
 # 它**不复用上面那份 `_STATIC`**，理由不是懒：那里写着"你是干活的、拿不准就问用户"，而子
@@ -353,7 +375,12 @@ def project_context(cwd: Path) -> list[str]:
     return parts
 
 
-def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = None) -> str:
+def build_system_prompt(
+    cwd: Path,
+    permission_mode: str,
+    model: str | None = None,
+    allow_fork: bool = False,
+) -> str:
     """拼主 agent 的 system prompt：静态那半 + 这次运行的实情 + 档位 + 项目自己的那几段。
 
     前三段在这儿拼，后面那四段（AGENTS.md、技能、记忆、git）由 `project_context` 给，
@@ -365,12 +392,18 @@ def build_system_prompt(cwd: Path, permission_mode: str, model: str | None = Non
     `model` 不给就不写那半句——**不猜**。调用方手上有真 provider 就传 `provider.model`；
     `Provider` 协议故意只声明了 complete（见 providers/base.py），所以这里也不假设它有。
 
+    `allow_fork` 是启动时的开关：开着才加 fork 那段。关着的时候输出**逐字节和以前一样**，
+    没开这个功能的人不会在提示词里看到一个不存在的工具。
+
     交互那条路**每轮重拼一次**：记忆和 `AGENTS.md` 都可能中途变（模型刚 `remember` 了一条），
     拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位同理——`/permission_mode` 能
     中途换，所以它也得每轮现读。
     """
     mode = parse_permission_mode(permission_mode)
-    parts = [_STATIC, _session_note(model), _MODE_HINTS[mode], *project_context(cwd)]
+    parts = [_STATIC, _session_note(model), _MODE_HINTS[mode]]
+    if allow_fork:
+        parts.append(_FORK_HINT)
+    parts.extend(project_context(cwd))
     return "\n\n".join(parts)
 
 

@@ -28,6 +28,37 @@ class ReadFileState:
         # 而且对非 ASCII 文件，同一份内容的字符数和磁盘上的字节数根本对不上，没法比。
         self.entries[path] = (mtime_ns, size)
 
+    def copy(self) -> ReadFileState:
+        """复制一份。
+
+        fork 用的就是它：进来时继承父 agent 读到过什么（所以父读过的文件它可以直接改），
+        跑完之后一个记录都不回流——它读过的文件不替父 agent 挣到"可以改"的资格，它改过的
+        文件则会让父 agent 下次改之前被要求重读。
+        """
+        return ReadFileState(entries=dict(self.entries))
+
+
+@dataclass
+class ForkContext:
+    """fork 工具要用的那份父 agent 现场。
+
+    **为什么单独一个类型，而不是往 `ToolContext` 上摊五个字段**：现有那条边界是"工具不碰
+    agent 的内部状态"，fork 是唯一的例外，那就把它圈在一个小对象里，别的工具够不着也用不上。
+
+    `messages` 是 `runagent` 里**活的那份列表**，工具只许读——它的最后一条正是本次要回填
+    结果的那条 assistant 消息，fork 就是把这条去掉再追加自己的任务。
+
+    `tools` 是父 agent 已经算好的 schema 快照。fork **必须原样发出去**：重算的话
+    `read_memory` / `read_skill` 那类现读盘的 `available` 判据可能已经变了（同一轮里刚
+    `remember` 过、或者刚加了一份 skill），工具表前缀一不一致，缓存就全废。
+    """
+
+    messages: list[dict[str, Any]]
+    system: str | None
+    registry: Any
+    tools: list[dict[str, Any]] | None = None
+    depth: int = 0
+
 
 class ToolWriteError(Exception):
     """改文件的工具出的错。子类区分是**哪一步**失败的。
@@ -126,6 +157,15 @@ class ToolContext:
     # `permission_mode: str = "default"` 走，没有另开一条路——生产代码里 ToolContext
     # 只有 core/agent.py 一处构造，那里永远传的是真值。
     permission_mode: str = "default"
+
+    # fork 工具要的父 agent 现场（见上面的 `ForkContext`）。
+    #
+    # **非 None 就等于"fork 可用"**：`--fork` 开着，或者我们本身就在一个 fork 里——后一种
+    # 必须让工具继续挂在表上，否则工具表前缀变了、缓存全废；能不能真的再 fork 由 `depth` 挡。
+    # 只有 core/fork.py 读它。
+    #
+    # 追加在**最后**：现有按位置构造 ToolContext 的地方（测试里那些）不受影响。
+    fork: ForkContext | None = None
 
 
 def _always_available(_: ToolContext) -> bool:

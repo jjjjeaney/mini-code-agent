@@ -108,6 +108,8 @@ class TestTheToolPool:
         """
         for name in AGENT_TYPES:
             assert "agent" not in names(AGENT_TYPES[name])
+            # fork 也是 harness 注入的，同样进不来；它另有运行时的深度护栏。
+            assert "fork" not in names(AGENT_TYPES[name])
 
     def test_no_type_can_ask_the_user(self):
         """子 agent 问不了用户：该问的事它写进总结、由主 agent 去问。

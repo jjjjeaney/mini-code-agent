@@ -18,7 +18,14 @@ from mini_code_agent.providers.base import (
     ToolCall,
     TransientProviderError,
 )
-from mini_code_agent.tools import ToolContext, ToolRegistry, ToolResult, default_tools
+from mini_code_agent.tools import (
+    ForkContext,
+    ReadFileState,
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    default_tools,
+)
 
 # 瞬时故障（连不上、超时、限流、对面 5xx）**补一次**之前等多久。
 #
@@ -181,6 +188,10 @@ def runagent(
     messages: list[dict[str, Any]] | None = None,
     spill_dir: Path | None = None,
     label: str = "",
+    read_state: ReadFileState | None = None,
+    allow_fork: bool = False,
+    fork_depth: int = 0,
+    tool_schemas: list[dict[str, Any]] | None = None,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -201,21 +212,43 @@ def runagent(
     得出哪几行是哪个子 agent 打的、钱花在谁身上。它**只进 console.print，不进 trace**：
     trace 是这一轮的流水记录（要落盘、要交回调用方），不是给人实时看的东西。默认空串，
     主 agent 那条路传的就是它，输出一个字节都不变。
+
+    read_state 是"读过哪些文件"的那份状态。**它和 messages 不一样：传进来就共用同一个对象。**
+    fork 子 agent 用的是它的一份**副本**（见 core/fork.py）——继承父 agent 读到过什么，但跑完
+    之后一条记录都不回流。
+
+    allow_fork 决定这一轮发不发 `fork` 工具；能不能真的 fork 由 `fork_depth` 挡。深了是在
+    **运行时**拒，不是把工具从表里删掉——删掉会改工具表前缀，缓存就废了。
+
+    tool_schemas 只有 fork 传：把父 agent 已经算好的那份 schema **原样**发下去，多一个少一个
+    都会让缓存前缀对不上。不传就照旧现算。
     """
     registry = registry if registry is not None else default_tools()
+    # 新拼一份，别就地改调用方手里那份。**得在 ctx 之前**：fork 工具要用它（见 ForkContext）。
+    messages = [*(messages or []), {"role": "user", "content": prompt}]
+    # fork 要的那份父 agent 现场。`--fork` 开着、或者我们本身就在一个 fork 里——后一种必须把
+    # 工具继续挂在表上（否则工具表前缀变了、缓存全废），所以这里照样建，由 depth 挡递归。
+    fork_ctx = (
+        ForkContext(messages=messages, system=system, registry=registry, depth=fork_depth)
+        if (allow_fork or fork_depth > 0)
+        else None
+    )
     # ctx 得在挑工具**之前**建：哪些工具此刻能用，是照着它判的（没开 shell 就没有 bash）。
     # 一轮之内这张表是固定的——每步重算的话，缓存前缀会被反复冲掉（工具那半占前缀一多半）。
     # 权限档位也带进来：子 agent 要继承主 agent 当前那一档（见 tools/base.py 那个字段），
     # 而被调用的工具是**每轮现读**它的，所以中途 `/permission_mode` 换档它也跟得上。
     ctx = ToolContext(
         cwd or Path.cwd(),
+        read_state=read_state if read_state is not None else ReadFileState(),
         allow_shell=allow_shell,
         spill_dir=spill_dir,
         permission_mode=permission_mode,
+        fork=fork_ctx,
     )
-    tools = registry.schemas(ctx)
-    # 新拼一份，别就地改调用方手里那份。
-    messages = [*(messages or []), {"role": "user", "content": prompt}]
+    tools = tool_schemas if tool_schemas is not None else registry.schemas(ctx)
+    if fork_ctx is not None:
+        # fork 拿它原样发出去；见上面 tool_schemas 那段。
+        fork_ctx.tools = tools
     trace: list[str] = []
     final: str | None = None
     # prompter 不放进 ctx：问用户不是工具的能力，确认是这一层在调工具之前发的。

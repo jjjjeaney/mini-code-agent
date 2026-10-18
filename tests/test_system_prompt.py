@@ -417,6 +417,25 @@ class TestTheAssemblyOrder:
 
         assert text.index(_STATIC) < text.index("这次运行：") < text.index("当前权限档位 plan")
 
+    def test_the_fork_guidance_only_appears_when_it_is_enabled(self, tmp_path):
+        """关着的时候输出和以前逐字节一样——没开这个功能的人不该在提示词里看到它。"""
+        assert "什么时候用 fork" not in build_system_prompt(tmp_path, "default")
+        assert "什么时候用 fork" in build_system_prompt(
+            tmp_path, "default", allow_fork=True
+        )
+
+    def test_the_fork_guidance_sits_between_the_mode_and_the_project(self, tmp_path):
+        """它和档位一样是启动/每轮定的，排在项目上下文前面——那几段的位置不能动。"""
+        (tmp_path / "AGENTS.md").write_text("项目自己的规矩：用 uv\n", encoding="utf-8")
+
+        text = build_system_prompt(tmp_path, "default", allow_fork=True)
+
+        assert (
+            text.index("当前权限档位 default")
+            < text.index("什么时候用 fork")
+            < text.index("项目自己的规矩")
+        )
+
     def test_the_project_sections_are_appended_verbatim(self, tmp_path):
         """`project_context` 返回什么就原样接在哪儿——分隔符、顺序、一个字都不改。
 
@@ -545,3 +564,9 @@ class TestSubagentPrompt:
         到这一步还不认识说明是代码写错了（模型给的那个在 core/subagent.py 就拦下了）。"""
         with pytest.raises(ValueError, match="没有名为"):
             build_subagent_prompt(tmp_path, "nope", "default")
+
+    def test_subagents_never_see_the_fork_guidance(self, tmp_path):
+        """fork 是主 agent 才有的选择，子 agent 的池子里连这个工具都没有。"""
+        assert "什么时候用 fork" not in build_subagent_prompt(
+            tmp_path, "general-purpose", "default"
+        )

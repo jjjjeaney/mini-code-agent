@@ -26,7 +26,7 @@
 - **权限照问，和主 agent 一样**（改文件、跑命令都先问用户）。子 agent 不是绕开闸门的一条路。
   `Grants` 也共用一份：它本来就是按 (工具, 文件路径) 记的会话级批准，用户批的是"这个文件、
   这次会话"，不是"谁去动它"。代价是主 agent 批过的文件子 agent 不再问——所以权限提示必须
-  带出**来源标记**（`_LabeledPrompter`），不然用户分不清"别再问"批给了谁。
+  带出**来源标记**（`LabeledPrompter`），不然用户分不清"别再问"批给了谁。
 """
 
 from __future__ import annotations
@@ -138,7 +138,8 @@ def _pool(agent_type: AgentType) -> ToolRegistry:
     return ToolRegistry([tool for tool in tools if tool.name != "remember"])
 
 
-def _tally(messages: list[dict[str, Any]]) -> str:
+def tally_calls(messages: list[dict[str, Any]]) -> str:
+    """把这段历史里的工具调用数成一句话（`fork` 也用它，所以是公开名）。"""
     """这一趟调了多少次工具、都是哪些，例如 `14 次工具调用（read_file×12、grep×2）`。
 
     从 messages 里的 `tool_use` 块数出来，**不给 `AgentResult` 加字段**——那份历史本来就
@@ -165,7 +166,8 @@ def _tally(messages: list[dict[str, Any]]) -> str:
     return f"{sum(counts.values())} 次工具调用（{breakdown}）"
 
 
-class _LabeledPrompter:
+class LabeledPrompter:
+    """给子 agent 的 prompter 包一层：每次请示前先说清是谁在问（`fork` 也用它）。"""
     """转发给真的 prompter，只在问之前打一行说明是哪个子 agent 在问。
 
     **为什么非包这一层不可**：`runagent` 的 `label` 只进得了它自己的 `console.print`，而
@@ -263,12 +265,12 @@ def make_agent_tool(
             cwd=ctx.cwd,
             allow_shell=ctx.allow_shell,
             permission_mode=ctx.permission_mode,
-            prompter=_LabeledPrompter(prompter, name),
+            prompter=LabeledPrompter(prompter, name),
             grants=grants,
             spill_dir=ctx.spill_dir,
             label=label,
         )
-        note = _tally(result.messages)
+        note = tally_calls(result.messages)
         console.print(f"◀ {label}{note}", style="dim", markup=False)
 
         # **三种收场分开说，而且都不抛异常。** 子 agent 没能得出结论，跟"命令跑了但退出码
@@ -299,3 +301,9 @@ def make_agent_tool(
         # （要全文用 read_tool_result 取）——那一行过程在最前面，所以预览里一定看得见。
         spill=True,
     )
+
+
+# 旧名字留着：`tests/test_subagent.py` 直接按私有名导入。改名是为了 `core/fork.py` 能复用
+# 这两个（fork 的计数和标签和子 agent 是同一套），不必把测试一起翻一遍。
+_LabeledPrompter = LabeledPrompter
+_tally = tally_calls

@@ -15,6 +15,7 @@ from mini_code_agent.commands import (
 from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
 from mini_code_agent.core.agent import runagent
+from mini_code_agent.core.fork import make_fork_tool
 from mini_code_agent.core.subagent import make_agent_tool
 from mini_code_agent.folding import PersistText, fold_if_stale
 from mini_code_agent.memory import sync_index
@@ -109,6 +110,7 @@ def _chat(
     prompter: Prompter,
     grants: Grants,
     model: str | None = None,
+    allow_fork: bool = False,
 ) -> None:
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
@@ -211,7 +213,9 @@ def _chat(
             # 折排在压缩**前面**：折不要钱、压要一次模型调用，折完可能就不用到压那一步了。
             fold_once()
             compact_once()
-            system = build_system_prompt(cwd, state.permission_mode, model)
+            system = build_system_prompt(
+                cwd, state.permission_mode, model, allow_fork=allow_fork
+            )
             result = runagent(
                 line,
                 provider,
@@ -227,6 +231,7 @@ def _chat(
                 # 这样 `--delete` 能连同这些文件一起删。session.id 在 start() 那一刻就定死
                 # 了，跑到一半不会变。
                 spill_dir=spill.session_dir(cwd, session.id),
+                allow_fork=allow_fork,
             )
             # 落盘、接下历史——两边要的是同一批东西：这一轮新增的那几条。
             # 长度得在 messages 被换掉**之前**取。
@@ -292,6 +297,11 @@ def main_command(
     cwd: Path | None = typer.Option(None, "--cwd", "-C", help="agent 的工作目录，默认当前目录"),
     shell: bool = typer.Option(
         False, "--shell", help="允许 agent 执行命令（跑在一次性 docker 容器里）"
+    ),
+    fork: bool = typer.Option(
+        False,
+        "--fork",
+        help="允许主 agent 用 fork：继承当前对话和缓存前缀的同步子 agent",
     ),
     permission_mode: str = typer.Option(
         "default",
@@ -381,6 +391,10 @@ def main_command(
     registry.register(
         make_agent_tool(provider=provider, prompter=prompter, grants=grants, model=provider.model)
     )
+    # fork 也在这儿装。**无条件注册**：开没开 `--fork` 由它的 `available` 判——关着的时候
+    # ToolContext.fork 是 None，这个工具就不会发到模型手上。这样主 agent 的工具表在两种情况下
+    # 各自稳定，不会因为注册与否在中间插一个位置出来。
+    registry.register(make_fork_tool(provider=provider, prompter=prompter, grants=grants))
     if prompt:
         # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
         console.print(f"> {prompt}", style="bold", markup=False)
@@ -406,7 +420,9 @@ def main_command(
             prompt,
             provider,
             registry,
-            system=build_system_prompt(workdir, permission_mode, provider.model),
+            system=build_system_prompt(
+                workdir, permission_mode, provider.model, allow_fork=fork
+            ),
             cwd=workdir,
             allow_shell=shell,
             permission_mode=permission_mode,
@@ -414,6 +430,7 @@ def main_command(
             grants=grants,
             messages=history,
             spill_dir=spill.session_dir(workdir, session.id),
+            allow_fork=fork,
         )
         # 长度得在 history 被换掉之前取——和 _chat 里同一处道理。
         session.append(result.messages[len(history) :])
@@ -443,6 +460,7 @@ def main_command(
         # 提示词里要写"你是哪个模型"。**从这儿传进去，不是去 provider 里取**——Provider 协议
         # 只声明了 complete，认得它不等于认得 model；手上这份是真的 AnthropicProvider。
         model=provider.model,
+        allow_fork=fork,
     )
     print("bye")
 
