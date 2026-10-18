@@ -1,6 +1,6 @@
-"""自带的三条命令：看帮助、看/换权限档位、退出。
+"""自带的命令：帮助、档位、fork 开关、状态、会话、压缩、授权、退出。
 
-一条都不跑对话：这三件事要么是"改下一轮怎么跑"，要么是"把话说清楚"。
+一条都不跑对话：它们要么是"改下一轮怎么跑"，要么是"把话说清楚"。
 """
 
 from __future__ import annotations
@@ -158,8 +158,55 @@ def make_permission_mode() -> Command:
     )
 
 
+def make_fork() -> Command:
+    """看 fork 开没开；带参数就打开或关掉。
+
+    **切换要付一次重建前缀的钱**：fork 工具在不在工具表里、提示词里有没有那段，都是请求开头的
+    一部分，而工具表渲染在 messages 前面——改它等于整套前缀重算。所以这件事得当场说清楚，
+    不能悄悄换掉。
+    """
+
+    def run(ctx: CommandContext, arg: str) -> CommandOutcome:
+        current = ctx.state.allow_fork
+        if not arg:
+            ctx.console.print(f"fork 现在是{'开' if current else '关'}着的。", markup=False)
+            ctx.console.print("  /fork on 打开、/fork off 关掉", style="dim", markup=False)
+            return "handled"
+
+        choice = arg.strip().lower()
+        if choice not in ("on", "off"):
+            # 看不懂就**不动**：静默取反比不切更糟，用户会以为切过去了。
+            ctx.console.print(
+                f"看不懂 {arg!r}——用 /fork on 或 /fork off。", style="red", markup=False
+            )
+            return "handled"
+
+        wanted = choice == "on"
+        if wanted == current:
+            ctx.console.print(
+                f"fork 已经是{'开' if current else '关'}着的了。", style="dim", markup=False
+            )
+            return "handled"
+
+        ctx.state.allow_fork = wanted
+        ctx.console.print(f"fork 换成了{'开' if wanted else '关'}（下一轮起生效）", markup=False)
+        ctx.console.print(
+            "  工具表和提示词都变了，下一轮的前缀缓存会从头算——那一发按原价。",
+            style="dim",
+            markup=False,
+        )
+        return "handled"
+
+    return Command(
+        name="fork",
+        run=run,
+        summary="看 fork 开没开，或者打开/关掉（会重建前缀缓存）",
+        usage="[on|off]",
+    )
+
+
 def make_status() -> Command:
-    """把这个循环现在的样子摊开：在哪儿跑、什么档位、历史多长、接的哪次会话。
+    """把这个循环现在的样子摊开：在哪儿跑、什么档位、fork 开没开、历史多长、接的哪次会话。
 
     报的全是**循环自己手里**的东西。**不印模型名**：那是 provider 的，而 Provider 协议
     （providers/base.py）故意只声明了 complete 这一个方法——为了一行状态去扩那个接口，等于
@@ -171,6 +218,11 @@ def make_status() -> Command:
         session = ctx.session
         mode = ctx.state.permission_mode
         shell = "开（跑在一次性容器里，跑完就删）" if ctx.allow_shell else "关（--shell 才打开）"
+        fork = (
+            "开（可以派继承当前对话的子 agent）"
+            if ctx.state.allow_fork
+            else "关（/fork on 打开）"
+        )
         used = context_size(
             ctx.state.messages,
             tokens=ctx.state.context_tokens,
@@ -185,6 +237,7 @@ def make_status() -> Command:
         ctx.console.print(f"工作目录：{ctx.cwd}", markup=False)
         ctx.console.print(f"权限档位：{mode}（{GLOSS.get(mode, '')}）", markup=False)
         ctx.console.print(f"命令执行：{shell}", markup=False)
+        ctx.console.print(f"fork：{fork}", markup=False)
         if session.opened:
             where = f"{_relative(session.path, ctx.cwd)}（落盘 {session.written} 条消息）"
         else:
@@ -199,7 +252,9 @@ def make_status() -> Command:
         )
         return "handled"
 
-    return Command(name="status", run=run, summary="看在哪儿跑、什么档位、历史多长")
+    return Command(
+        name="status", run=run, summary="看在哪儿跑、什么档位、fork 开没开、历史多长"
+    )
 
 
 def make_sessions() -> Command:

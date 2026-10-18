@@ -28,7 +28,7 @@ cp .env.example .env
 uv run mca "用一句话解释什么是闭包"
 ```
 
-不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/compact`、`/grants`、`/permission_mode`、`/exit`）。
+不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/compact`、`/grants`、`/permission_mode`、`/fork`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉工具表和提示词，也就是重建前缀缓存）。
 
 ```bash
 uv run mca

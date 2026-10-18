@@ -125,7 +125,9 @@ def _chat(
     抽成函数是为了能测——`main_command` 里写死了 `AnthropicProvider()`，塞不进假的；这里收
     一个 provider 进来，测试就能拿剧本化的假 provider 跑两轮，看第二轮有没有带上第一轮。
     """
-    state = ChatState(permission_mode=permission_mode, messages=messages)
+    state = ChatState(
+        permission_mode=permission_mode, messages=messages, allow_fork=allow_fork
+    )
     # 模型的窗口一次运行里定死，所以不进 ChatState 那个"会变的东西"的盒子（见它的类注释）。
     window = window_for(model)
     # 哪些工具的结果允许被折——一次运行里不变（见 tools/registry.py 的 foldable_names）。
@@ -214,7 +216,7 @@ def _chat(
             fold_once()
             compact_once()
             system = build_system_prompt(
-                cwd, state.permission_mode, model, allow_fork=allow_fork
+                cwd, state.permission_mode, model, allow_fork=state.allow_fork
             )
             result = runagent(
                 line,
@@ -231,7 +233,7 @@ def _chat(
                 # 这样 `--delete` 能连同这些文件一起删。session.id 在 start() 那一刻就定死
                 # 了，跑到一半不会变。
                 spill_dir=spill.session_dir(cwd, session.id),
-                allow_fork=allow_fork,
+                allow_fork=state.allow_fork,
             )
             # 落盘、接下历史——两边要的是同一批东西：这一轮新增的那几条。
             # 长度得在 messages 被换掉**之前**取。

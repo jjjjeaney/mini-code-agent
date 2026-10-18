@@ -9,6 +9,7 @@ import pytest
 import typer
 
 from mini_code_agent import cli
+from mini_code_agent.core.fork import make_fork_tool
 from mini_code_agent.folding import FOLD_AFTER_SECONDS, MIN_FOLD_CHARS
 from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants, PermissionRequest
@@ -27,10 +28,13 @@ class ScriptedProvider:
         self.responses = list(responses)
         self.calls: list[list[dict]] = []
         self.systems: list[str | None] = []
+        # 每一发收到的那张工具表。和 calls / systems 一样按下标对齐。
+        self.tools: list[list[dict] | None] = []
 
     def complete(self, messages, tools=None, system=None) -> ModelResponse:
         self.calls.append([dict(m) for m in messages])
         self.systems.append(system)
+        self.tools.append(tools)
         return self.responses.pop(0)
 
 
@@ -62,6 +66,7 @@ def run_loop(
     messages: list[dict] | None = None,
     registry: ToolRegistry | None = None,
     grants: Grants | None = None,
+    allow_fork: bool = False,
 ) -> Session:
     """喂一串「用户输入」，把交互循环跑起来。最后一句给 /exit 收尾。"""
     answers = iter(lines)
@@ -77,6 +82,7 @@ def run_loop(
         permission_mode="default",
         prompter=NullPrompter(),
         grants=grants if grants is not None else Grants(),
+        allow_fork=allow_fork,
     )
     return session
 
@@ -581,6 +587,37 @@ def test_the_fork_tool_is_offered_only_with_the_flag(monkeypatch, tmp_path, caps
 
     assert "fork" not in offered(fork=False)
     assert "fork" in offered(fork=True)
+    capsys.readouterr()
+
+
+def test_the_fork_switch_can_be_toggled_from_the_loop(monkeypatch, tmp_path, capsys):
+    """`/fork on` 之后，下一轮的工具表和提示词都要跟着变。"""
+    provider = ScriptedProvider([text_turn("好")])
+    registry = default_tools()
+    registry.register(
+        make_fork_tool(provider=provider, prompter=NullPrompter(), grants=Grants())
+    )
+
+    run_loop(
+        monkeypatch, provider, ["/fork on", "你好", "/exit"], tmp_path, registry=registry
+    )
+
+    assert "fork" in {schema["name"] for schema in provider.tools[0]}
+    assert "什么时候用 fork" in provider.systems[0]
+    capsys.readouterr()
+
+
+def test_fork_is_off_by_default_in_the_loop(monkeypatch, tmp_path, capsys):
+    provider = ScriptedProvider([text_turn("好")])
+    registry = default_tools()
+    registry.register(
+        make_fork_tool(provider=provider, prompter=NullPrompter(), grants=Grants())
+    )
+
+    run_loop(monkeypatch, provider, ["你好", "/exit"], tmp_path, registry=registry)
+
+    assert "fork" not in {schema["name"] for schema in provider.tools[0]}
+    assert "什么时候用 fork" not in provider.systems[0]
     capsys.readouterr()
 
 

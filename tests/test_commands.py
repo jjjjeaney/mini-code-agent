@@ -199,6 +199,56 @@ class TestPermissionMode:
         assert "已经是" in capsys.readouterr().out
 
 
+class TestFork:
+    def test_no_argument_reports_the_current_one(self, capsys):
+        default_commands().dispatch("/fork", make_ctx())
+
+        out = capsys.readouterr().out
+        assert "关" in out
+        assert "/fork on" in out
+
+    def test_it_turns_fork_on_and_says_the_cache_will_be_rebuilt(self, capsys):
+        """切它会换工具表和提示词，也就是重建整个前缀——代价要当场说清楚。"""
+        ctx = make_ctx()
+
+        assert default_commands().dispatch("/fork on", ctx) == "handled"
+
+        assert ctx.state.allow_fork is True
+        out = capsys.readouterr().out
+        assert "开" in out
+        assert "缓存" in out
+
+    def test_it_turns_fork_off(self, capsys):
+        ctx = make_ctx()
+        ctx.state.allow_fork = True
+
+        default_commands().dispatch("/fork off", ctx)
+
+        assert ctx.state.allow_fork is False
+        assert "关" in capsys.readouterr().out
+
+    def test_a_word_that_makes_no_sense_changes_nothing(self, capsys):
+        """看不懂就**不动**：静默取反比不切更糟，用户会以为切过去了。"""
+        ctx = make_ctx()
+
+        assert default_commands().dispatch("/fork 随便", ctx) == "handled"
+
+        assert ctx.state.allow_fork is False
+        assert "看不懂" in capsys.readouterr().out
+
+    def test_switching_to_the_state_it_is_already_in_says_so(self, capsys):
+        ctx = make_ctx()
+
+        default_commands().dispatch("/fork off", ctx)
+
+        assert "已经是" in capsys.readouterr().out
+
+    def test_it_is_listed_in_help(self, capsys):
+        default_commands().dispatch("/help", make_ctx())
+
+        assert "/fork" in capsys.readouterr().out
+
+
 class TestStatus:
     def test_it_reports_where_it_runs_and_under_what(self, capsys, tmp_path):
         default_commands().dispatch("/status", make_ctx("plan", cwd=tmp_path))
@@ -213,6 +263,15 @@ class TestStatus:
         default_commands().dispatch("/status", make_ctx(allow_shell=allow_shell))
 
         assert f"命令执行：{expected}" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("allow_fork, expected", [(True, "开"), (False, "关")])
+    def test_it_says_whether_fork_is_on(self, capsys, allow_fork, expected):
+        ctx = make_ctx()
+        ctx.state.allow_fork = allow_fork
+
+        default_commands().dispatch("/status", ctx)
+
+        assert f"fork：{expected}" in capsys.readouterr().out
 
     def test_it_reports_the_session_and_how_much_history_there_is(self, capsys):
         session = Session(

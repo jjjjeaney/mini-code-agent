@@ -8,6 +8,7 @@ from mini_code_agent.commands.base import Command, CommandContext, Outcome, spli
 from mini_code_agent.commands.builtin import (
     make_compact,
     make_exit,
+    make_fork,
     make_grants,
     make_help,
     make_permission_mode,
@@ -78,13 +79,14 @@ def default_commands() -> Commands:
     每次调用都返回新实例，跟 default_tools() 一个道理：调用方想再注册自己的命令时，
     不会污染到别人手里那份。
 
-    顺序就是 `/help` 里的顺序，所以 `/help` 放第一条。`/status` 跟在 `/permission_mode` 后面
-    ——两条都是"我现在在哪一档"那一类，看完档位顺手下一条就是它；`/sessions` 又跟在
-    `/status` 后面，那几条合起来是"看看眼下什么情况"。
+    顺序就是 `/help` 里的顺序，所以 `/help` 放第一条。`/permission_mode` 和 `/fork` 都是"下一轮
+    怎么跑"的旋钮，排在一起；`/status` 跟在它们后面——看完旋钮顺手下一条就是"我现在在哪儿"；
+    `/sessions` 又跟在 `/status` 后面，那几条合起来是"看看眼下什么情况"。
     """
     commands = Commands()
     commands.register(make_help(commands))
     commands.register(make_permission_mode())
+    commands.register(make_fork())
     commands.register(make_status())
     commands.register(make_sessions())
     commands.register(make_compact())
