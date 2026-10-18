@@ -50,6 +50,21 @@ class AnthropicProviderTest(unittest.TestCase):
         self.assertIsNone(response.tool_calls)
         self.assertIn(response.stop_reason, {"end_turn", "max_tokens", "stop_sequence"})
 
+    def test_streaming_matches_the_final_message(self):
+        """流式正文和 get_final_message() 归一化后的结果必须一致。"""
+        chunks: list[str] = []
+        response = self.provider.stream(
+            messages=[{"role": "user", "content": "只回答两个字：收到"}],
+            on_text=chunks.append,
+        )
+        print(f"\n[stream] chunks={chunks!r}")
+        print(f"[stream] text={response.text!r} stop_reason={response.stop_reason}")
+
+        self.assertTrue(chunks, "没有收到任何正文 delta")
+        self.assertEqual("".join(chunks), response.text)
+        self.assertTrue(response.text and response.text.strip())
+        self.assertEqual(response.stop_reason, "end_turn")
+
     def test_assistant_content_is_replayable(self):
         """assistant_content 要能原样回填进下一轮请求。"""
         response = self.provider.complete(

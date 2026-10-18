@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import Any
 
 from anthropic import (
@@ -21,6 +22,13 @@ from anthropic import (
 )
 from dotenv import load_dotenv
 
+try:  # SDK 的 HTTP 实现；正常安装时一定在，不在就少认一类异常
+    import httpx2
+
+    _TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (httpx2.TransportError,)
+except ImportError:  # pragma: no cover
+    _TRANSPORT_ERRORS = ()
+
 from mini_code_agent.providers.base import (
     ModelResponse,
     ProviderError,
@@ -32,10 +40,11 @@ load_dotenv()
 
 DEFAULT_MODEL = "deepseek-v4-flash"
 
-# 输出被截断时，最多把 max_tokens 抬到这里。
+# 输出被截断时，最多把 max_tokens 抬到这里；流式路径也直接从这里起步。
 # 16384 是**实测**过这个端点会收的值：4096 / 8192 / 16384 都正常返回，而 65536 起 SDK
 # 自己就拒绝发非流式请求了（"Streaming is required for operations that may take longer
-# than 10 minutes"）。所以再往上就不是换个数字的事，得改成流式——那是另一摊。
+# than 10 minutes"）。流式能绕过那条客户端限制，但 16384 以上这个端点收不收还没验证过，
+# 所以先停在这儿。
 MAX_OUTPUT_TOKENS_CEILING = 16384
 
 # SDK 会重试的状态码——照抄 `_should_retry` 里那几条（还有 ≥500，见下）。列在这儿是为了让
@@ -98,6 +107,54 @@ def _translate(exc: APIError) -> ProviderError:
         return TransientProviderError(f"模型服务端出错（{status}），这是对面的事")
 
     return ProviderError(f"模型调用失败（{type(exc).__name__}）：{exc}")
+
+
+def _stream_failure(error: ProviderError, shown: bool) -> ProviderError:
+    """把流式失败收成一个要往上层抛的异常。
+
+    **显示过正文之后，瞬时错误也不能再自动重试**：上层 `ask()` 靠异常类型决定要不要补一次，
+    补一次就是把已经打出来的字再打一遍。所以这里把 `TransientProviderError` 降级成普通
+    `ProviderError`，并让消息告诉用户该做什么。
+    """
+    if shown and isinstance(error, TransientProviderError):
+        return ProviderError("输出到一半连接断了；已经显示的内容可能不完整，再发一次。")
+    return error
+
+
+def _normalize(response: Any) -> ModelResponse:
+    """把一次模型响应归一化成项目自己的类型。
+
+    流式的 `get_final_message()` 和非流式的 `create()` 返回的结构一致，所以两条路径共用
+    这一份——终端怎么显示是一回事，进历史、给工具用的必须是同一个结果。
+    """
+    text_parts = []
+    tool_calls = []
+    assistant_content = []
+    for block in response.content:
+        assistant_content.append(_content_block_to_dict(block))
+        if block.type == "text":
+            text_parts.append(block.text)
+        if block.type == "tool_use":
+            tool_calls.append(
+                ToolCall(
+                    id=block.id,
+                    name=block.name,
+                    arguments=block.input,
+                )
+            )
+    usage = response.usage
+    return ModelResponse(
+        text="\n".join(text_parts) or None,
+        tool_calls=tool_calls or None,
+        assistant_content=assistant_content,
+        stop_reason=response.stop_reason or "end_turn",
+        # 用量原样带出去，别在这儿算、也别在这儿判断——这一层不认识"省钱"这件事。
+        # 谁想看谁看（主循环会打一行出来）。
+        input_tokens=usage.input_tokens or 0,
+        output_tokens=usage.output_tokens or 0,
+        cache_read_input_tokens=usage.cache_read_input_tokens or 0,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
+    )
 
 
 class AnthropicProvider:
@@ -167,31 +224,66 @@ class AnthropicProvider:
             # 不会漏一个出去把会话崩掉。反过来，我们自己代码里的 bug 不是 `APIError`，
             # 该带着 traceback 崩掉，不该被这段吞掉。）
             raise _translate(exc) from exc
-        text_parts=[]
-        tool_calls=[]
-        assistant_content=[]
-        for block in response.content:
-            assistant_content.append(_content_block_to_dict(block))
-            if block.type=='text':
-                text_parts.append(block.text)
-            if block.type=='tool_use':
-                tool_calls.append(
-                    ToolCall(
-                        id=block.id,
-                        name=block.name,
-                        arguments=block.input
-                    )
-                )
-        usage = response.usage
-        return ModelResponse(
-            text="\n".join(text_parts) or None,
-            tool_calls=tool_calls or None,
-            assistant_content=assistant_content,
-            stop_reason=response.stop_reason or "end_turn",
-            # 用量原样带出去，别在这儿算、也别在这儿判断——这一层不认识"省钱"这件事。
-            # 谁想看谁看（主循环会打一行出来）。
-            input_tokens=usage.input_tokens or 0,
-            output_tokens=usage.output_tokens or 0,
-            cache_read_input_tokens=usage.cache_read_input_tokens or 0,
-            cache_creation_input_tokens=usage.cache_creation_input_tokens or 0,
-        )
+        return _normalize(response)
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        system: str | None = None,
+        on_text: Callable[[str], None] | None = None,
+    ) -> ModelResponse:
+        """发一次流式请求：正文边生成边交给 `on_text`，结果仍然以完整消息为准。
+
+        **终端显示和程序使用是两回事**：`on_text` 只负责把 delta 写出去；历史回填、工具
+        调用、用量、stop_reason 全部来自 `get_final_message()`，和非流式路径共用 `_normalize`。
+
+        几条定下来的：
+
+        - `max_tokens` 一开始就要到天花板。非流式撞顶还能抬上去重发，流式不行——文字已经
+          显示在屏幕上了，重发只会重复一遍。上限不是目标，写大了不额外花钱。
+        - **必须把流读完**。只消费一部分再取 final，没显示的部分会被 SDK 静默读掉，用户
+          看到的和程序拿到的就对不上了。
+        - **截断不抛异常**。连接提前关掉时 final 的 `stop_reason` 是 `None`，得自己当失败。
+        - **显示过文字之后不再自动重试**。上层 `ask()` 靠异常类型决定要不要补一次；补一次
+          就是把已经打出来的字再打一遍。所以这种情况把瞬时错误降级成普通的 `ProviderError`。
+        """
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max(self.max_tokens, self.ceiling),
+        }
+        if tools:
+            kwargs["tools"] = tools
+        if system:
+            kwargs["system"] = system
+
+        shown = False
+        try:
+            with self.client.messages.stream(**kwargs) as live:
+                for chunk in live.text_stream:
+                    if on_text is not None:
+                        shown = True
+                        on_text(chunk)
+                try:
+                    response = live.get_final_message()
+                except AssertionError as exc:
+                    # SDK 在一个事件都没读到时断言 final snapshot 存在——这不是我们的 bug，
+                    # 是连接在返回任何内容之前就断了。
+                    raise _stream_failure(
+                        TransientProviderError("模型连接在返回任何内容前断开了"), shown
+                    ) from exc
+        except APIError as exc:
+            raise _stream_failure(_translate(exc), shown) from exc
+        except _TRANSPORT_ERRORS as exc:
+            # 流开始之后的传输错误不经过 SDK 的翻译（重试循环只包住建立连接那一步）。
+            raise _stream_failure(
+                TransientProviderError("模型连接在流式输出中途断了"), shown
+            ) from exc
+
+        if response.stop_reason is None:
+            raise _stream_failure(
+                TransientProviderError("模型的输出在结束前断开了"), shown
+            )
+
+        return _normalize(response)

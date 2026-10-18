@@ -80,6 +80,11 @@ class AgentResult:
     # 结论还没出来，调用方要用这个 id 去任务表里找。
     handoff: str | None = None
 
+    # `final` 这段文字是不是已经实时打印过了。只表示"屏幕上有了"，不表示"这一轮流式过"：
+    # 工具调用之前的叙述文字不算（final 还是 None），后台交接/出错/用满步数也一律 False。
+    # CLI 靠它决定轮末还要不要 `console.print(result.final)`。
+    final_streamed: bool = False
+
 
 # 取消时写进 AgentResult.error 的那句。任务表拿它区分"用户取消"和"真出错"。
 CANCELLED_ERROR = "已取消"
@@ -87,6 +92,10 @@ CANCELLED_ERROR = "已取消"
 # 往哪儿打一行。第一个参数是文本、第二个是 style——和 runagent 里原来那些
 # `console.print(..., style=..., markup=False)` 一一对应。
 Emit = Callable[[str, str], None]
+
+# 流式正文往哪儿写：只收一段文字，不加换行、不上色。和 Emit 分开，因为它的调用频率是
+# 每个 delta 一次（一次回复可能上百次），不能走 console.print 那种整行渲染。
+OnText = Callable[[str], None]
 
 # 后台那一半的工作函数：收（往哪儿打、怎么取消），返回它自己那段的 AgentResult。
 BackWork = Callable[[Emit, threading.Event], "AgentResult"]
@@ -300,6 +309,8 @@ def runagent(
     notices: Callable[[], str | None] | None = None,
     allow_background: bool = False,
     background_prompter: Callable[[threading.Event], Prompter] | None = None,
+    stream: bool = False,
+    on_text: OnText | None = None,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -348,6 +359,12 @@ def runagent(
     - `background_prompter` 决定后台那一半用哪份 prompter（参数是它自己的 cancel event）。
       交互会话传 `BrokerPrompter`——请求排队、由读键盘线程在持有终端时问；不传就退回一律
       拒绝的 `BackgroundPrompter`（一次性模式、测试）。
+
+    **流式输出**（`stream=True` + `on_text`）：模型正文边生成边交给 `on_text`，但循环拿到
+    的 `ModelResponse` 仍然来自完整消息——历史回填、工具调用、用量、stop_reason 一样不少。
+    只有前台主 agent 该开：后台任务和子 agent 与前台共用终端，实时打字会互相插字。后台那一
+    半交接时会强制关掉。`on_text` 为空时即使 `stream=True` 也走非流式。provider 没有
+    `stream` 方法（测试假实现、别的后端）时同样回退。
     """
     registry = registry if registry is not None else default_tools()
     # 新拼一份，别就地改调用方手里那份。**得在 ctx 之前**：fork 那份现场要用它（见 ForkContext）。
@@ -393,15 +410,22 @@ def runagent(
         cancel: threading.Event | None,
         allow_handoff: bool,
         notices: Callable[[], str | None] | None,
+        stream: bool,
+        on_text: OnText | None,
     ) -> AgentResult:
         """真正跑循环。前台和后台那一半走的是同一个函数，区别只在参数。
 
         `allow_handoff` 为 False 时不再二次交接——后台的不能再把自己转手出去。
         `notices` 只有主 agent 传：子 agent 不该吞掉主 agent 的后台通知。
+        `stream` / `on_text` 只在前台传；后台那一半固定关掉（见 continuation）。
         """
         trace: list[str] = []
         final: str | None = None
+        final_streamed = False
         anchor: ContextAnchor | None = None
+        # 最近一发请求有没有把正文实时交出去。每发重置；只在"最终回复"那个分支抄进
+        # final_streamed——中间步骤的叙述文字不算，那时 final 还没定。
+        last_shown = False
 
         def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
             """发一发，顺手把这一发的用量打出来。
@@ -418,12 +442,37 @@ def runagent(
             384，见 known-issues 的 D5）。所以"只追加"是省钱的**前提**，而这一行代码正是那个前提
             的落点——别在这儿加变换。
             """
-            nonlocal anchor
+            nonlocal anchor, last_shown
 
             if cancel is not None and cancel.is_set():
                 raise _Cancelled
 
-            response = provider.complete(sent, **kwargs)
+            last_shown = False
+            streamer = (
+                getattr(provider, "stream", None)
+                if stream and on_text is not None
+                else None
+            )
+            if streamer is None:
+                response = provider.complete(sent, **kwargs)
+            else:
+                started = False
+
+                def handle(chunk: str) -> None:
+                    nonlocal last_shown, started
+                    if not started:
+                        # 和轮末 `console.print(f"\n{final}")` 那个空行对齐。
+                        on_text("\n")
+                        started = True
+                    last_shown = True
+                    on_text(chunk)
+
+                try:
+                    response = streamer(sent, **kwargs, on_text=handle)
+                finally:
+                    # 异常路径也要收尾：否则后面的用量行、错误消息会粘在正文末尾。
+                    if started:
+                        on_text("\n")
             used = (
                 response.input_tokens,
                 response.output_tokens,
@@ -525,6 +574,10 @@ def runagent(
                             cancel=cancel_event,
                             allow_handoff=False,
                             notices=None,
+                            # 后台和前台共用终端，实时打字会互相插字；而且此时用户可能正在
+                            # 提示符上输入。后台一律不流式。
+                            stream=False,
+                            on_text=None,
                         )
 
                     task_id = handoff(continuation)
@@ -542,6 +595,7 @@ def runagent(
                     final = response.text
                     if final is not None:
                         trace.append(final)
+                        final_streamed = last_shown
                         # 这一条也要进 messages：不然 result.messages 结尾是用户那侧，拿它接着聊就
                         # 丢了模型最后说的话。
                         msgs.append({"role": "assistant", "content": response.assistant_content})
@@ -598,6 +652,7 @@ def runagent(
                 final = response.text
                 if final is not None:
                     trace.append(final)
+                    final_streamed = last_shown
                     msgs.append({"role": "assistant", "content": response.assistant_content})
         except _Cancelled:
             return AgentResult(
@@ -617,7 +672,13 @@ def runagent(
             return AgentResult(
                 final=None, trace=trace, messages=msgs, error=str(exc), anchor=anchor
             )
-        return AgentResult(final=final, trace=trace, messages=msgs, anchor=anchor)
+        return AgentResult(
+            final=final,
+            trace=trace,
+            messages=msgs,
+            anchor=anchor,
+            final_streamed=final_streamed,
+        )
 
     return drive(
         messages,
@@ -627,4 +688,6 @@ def runagent(
         cancel=None,
         allow_handoff=True,
         notices=notices,
+        stream=stream,
+        on_text=on_text,
     )

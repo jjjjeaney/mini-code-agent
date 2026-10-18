@@ -36,6 +36,12 @@ uv run mca --model deepseek-v4-pro "用一句话解释什么是闭包"
 
 `--api-key` / `--base-url` 可以临时覆盖 `.env` 里的 `DEEPSEEK_API_KEY` / `DEEPSEEK_ANTHROPIC_BASE_URL`。**密钥写在命令行上会留在 shell 历史和进程列表里**，日常还是用 `.env`；这两个参数主要给脚本或临时切换端点用。
 
+`--stream` 让**前台回合**把模型正文边生成边打到终端上，默认关闭。进历史、工具调用、用量和 `stop_reason` 仍然来自完整的最终消息，和非流式完全一致。只有前台这一发会流式：后台任务、子 agent、压缩摘要都不流式——它们和前台共用终端，实时打字会互相插字。模型的 thinking 不显示。显示过一部分之后如果连接断了，**不会自动重连重发**（那会把已经打出来的字再打一遍），屏幕上留下的是不完整的内容，错误信息会提示你再发一次。
+
+```bash
+uv run mca --stream "用一句话解释什么是闭包"
+```
+
 不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/tasks`、`/compact`、`/grants`、`/permission_mode`、`/fork`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉提示词里那段说明，也就是重建前缀缓存）。
 
 ```bash

@@ -101,6 +101,20 @@ def _persister(cwd: Path, session: Session) -> PersistText:
     return persist
 
 
+def _write_chunk(chunk: str) -> None:
+    """流式正文的一段：**不换行、不解析样式、不做 emoji 替换**，写完立刻 flush。
+
+    `emoji=False` 不是洁癖：Rich 默认会把正文里的 `:word:` 换成表情，代码和路径里出现这种
+    片段时就被静默改了。flush 是为了让每段 delta 真的马上出现在终端上——Rich 的 `print`
+    不做这件事。
+    """
+    console.print(chunk, end="", markup=False, highlight=False, emoji=False)
+    try:
+        console.file.flush()
+    except (AttributeError, OSError):
+        pass
+
+
 def _chat(
     provider: Provider,
     registry: ToolRegistry,
@@ -116,6 +130,7 @@ def _chat(
     allow_fork: bool = False,
     tasks: TaskManager | None = None,
     broker: PermissionBroker | None = None,
+    stream: bool = False,
 ) -> None:
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
@@ -238,6 +253,8 @@ def _chat(
             # 交互模式才有"下一轮"可以送后台结果；一次性模式那边不传。
             allow_background=True,
             notices=tasks.take_notices if tasks is not None else None,
+            stream=stream,
+            on_text=_write_chunk,
         )
         absorb(result)
         if result.error:
@@ -251,7 +268,10 @@ def _chat(
                 err=True,
             )
             return
-        console.print(f"\n{result.final}", markup=False)
+        # 流式已经实时打印过就不再打一遍；`final_streamed` 只认最终回复，中间步骤的叙述
+        # 文字不会把它置真（那些本来就不是 `result.final`）。
+        if not result.final_streamed:
+            console.print(f"\n{result.final}", markup=False)
 
     def report_background() -> None:
         """后台任务完成了：让模型**自己开口**告诉用户。
@@ -499,6 +519,11 @@ def main_command(
         "--fork",
         help="允许主 agent 派 fork 类型的子 agent：继承当前对话和缓存前缀",
     ),
+    stream: bool = typer.Option(
+        False,
+        "--stream",
+        help="实时打印模型正文（只影响前台回合；后台任务和子 agent 不流式）",
+    ),
     permission_mode: str = typer.Option(
         "default",
         "--permission_mode",
@@ -642,6 +667,8 @@ def main_command(
             messages=history,
             spill_dir=spill.session_dir(workdir, session.id),
             allow_fork=fork,
+            stream=stream,
+            on_text=_write_chunk,
         )
         # 长度得在 history 被换掉之前取——和 _chat 里同一处道理。
         session.append(result.messages[len(history) :])
@@ -655,7 +682,8 @@ def main_command(
                 err=True,
             )
             raise typer.Exit(code=1)
-        console.print(f"\n{result.final}", markup=False)
+        if not result.final_streamed:
+            console.print(f"\n{result.final}", markup=False)
         return
 
     _chat(
@@ -674,6 +702,7 @@ def main_command(
         allow_fork=fork,
         tasks=tasks,
         broker=broker,
+        stream=stream,
     )
     print("bye")
 
