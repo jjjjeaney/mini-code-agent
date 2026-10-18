@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - run: uv sync --frozen
+
+      - run: uv run ruff check src tests
+
+      # 真接口那组会花钱，CI 里明确排除；本地要跑的时候去掉这个参数。
+      - run: uv run pytest --ignore=tests/test_anthropic_provider.py

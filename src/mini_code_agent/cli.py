@@ -25,7 +25,7 @@ from mini_code_agent.memory import sync_index
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
-from mini_code_agent.providers.anthropic import AnthropicProvider
+from mini_code_agent.providers.anthropic import DEFAULT_MODEL, AnthropicProvider
 from mini_code_agent.providers.base import Provider
 from mini_code_agent.sessions import Session, delete, describe, load, start, summary_message
 from mini_code_agent.skills import sync_index as sync_skill_index
@@ -475,6 +475,22 @@ def _delete_session(cwd: Path, session_id: str, *, assume_yes: bool) -> None:
 def main_command(
     prompt: str = typer.Argument("", help="Prompt to send to the agent."),
     cwd: Path | None = typer.Option(None, "--cwd", "-C", help="agent 的工作目录，默认当前目录"),
+    model: str = typer.Option(
+        "",
+        "--model",
+        "-m",
+        help="模型名；不写就用 providers/anthropic.py 里的 DEFAULT_MODEL",
+    ),
+    api_key: str = typer.Option(
+        "",
+        "--api-key",
+        help="接口密钥；优先用 .env 里的 DEEPSEEK_API_KEY（命令行会留在 shell 历史里）",
+    ),
+    base_url: str = typer.Option(
+        "",
+        "--base-url",
+        help="Anthropic 兼容端点；优先用 .env 里的 DEEPSEEK_ANTHROPIC_BASE_URL",
+    ),
     shell: bool = typer.Option(
         False, "--shell", help="允许 agent 执行命令（跑在一次性 docker 容器里）"
     ),
@@ -562,7 +578,11 @@ def main_command(
         session = start(workdir, permission_mode=permission_mode, allow_shell=shell)
     # provider 建一次就够（一次运行一个 HTTP 客户端）。system prompt 不在这儿建：一次性那条
     # 分支现拼一份，交互那条每轮重拼——记忆会中途变，见 _chat。
-    provider = AnthropicProvider()
+    provider = AnthropicProvider(
+        model=model or DEFAULT_MODEL,
+        api_key=api_key or None,
+        base_url=base_url or None,
+    )
     # 后台任务表：`agent` 工具把跑长的活交给它，`/tasks` 和空闲时唤醒的汇报回合共用同一份。
     tasks = TaskManager()
     # 后台任务的授权请求表：后台线程往里放，读键盘线程在持有终端时取出来问用户。**要在

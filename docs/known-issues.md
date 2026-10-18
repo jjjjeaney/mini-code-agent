@@ -359,6 +359,17 @@ $ bash: echo 'KEY=clobbered' > /workspace/.env
 - **小窗口 + 保留 6 轮会抖**：窗口 32,768（表里 `qwen-max`）时阈值只有 26,214，最近 6 轮本身就超了的话，压缩完还是超——于是每轮压一次。有界（`_safe_cut` 在只剩 6 轮时返回 `None`），但每一次都是一笔要花钱的摘要调用。现在这个端点够不到，先记着。
 - **超窗但没有安全切点 → 直接 400**：轮数不够 6 轮时（比如第一句就粘了一整本书）没有合法的切点，压缩帮不上忙，请求照样发出去、照样被拒。这不是这次改出来的，是压缩本身的边界。
 
+### D9. `--api-key` / `--base-url` 可以覆盖环境变量 —— 取舍（2026-10-18）
+
+**现在的行为**：`--model` / `--api-key` / `--base-url` 都可以在命令行临时覆盖
+`providers/anthropic.py` 的默认模型和 `.env` 里的两个变量；没给就照旧读环境。
+
+**为什么加**：临时切端点、换模型、脚本或 CI 里传不同凭据时，不必改 `.env`。
+
+**代价**：**密钥写在命令行上会留在 shell 历史和进程列表里**（`ps` / 任务管理器看得到）。
+所以帮助文本里明写"优先用 `.env`"；日常还是走环境变量，命令行只给临时/脚本场景用。程序自己
+不会把 key 打印出来。
+
 ---
 
 ## 五、工程与测试
@@ -381,13 +392,23 @@ $ bash: echo 'KEY=clobbered' > /workspace/.env
 
 **后果**：拿测试做信号去 `git bisect` 那一段，会指到错误的提交。这一段之后没问题。
 
-### E4. 没有 CI —— 缺
+### E4. 没有 CI —— 已处理（2026-10-18）
 
-现在所有验证都是手动的。加一个最小的 CI（跑 `ruff` + `pytest`）能挡住 E2 那种"验证没跑成却以为跑了"的事。
+`.github/workflows/ci.yml`：push / pull_request 时跑 `uv sync --frozen`、`ruff check`、`pytest`
+（明确排除要花钱的真接口那组）。加 CI 能挡住 E2 那种"验证没跑成却以为跑了"的事。
 
 ### E5. 根目录的 `main.py` 和 `notebook/` 不在检查范围内 —— 取舍
 
 它们在 `.gitignore` 里（本地试验文件，不入库），也没进 ruff/pytest 的扫描范围。这是有意的，但意味着那里面的代码没有任何保护。
+
+### E6. Windows 重定向输出遇到非 UTF-8 编码会崩 —— 已修（2026-10-18）
+
+**问题**：`mca "..." > out.txt` 时 Python 的 stdout 用系统 ANSI 代码页（这台机器上是 GBK），
+而输出里有 `▶` / `→` / `✗`；Rich 的 legacy Windows 渲染器往 GBK 流里写会抛
+`UnicodeEncodeError`。交互模式下 Python 走 Unicode 控制台 API，所以只在重定向/旧控制台出现。
+
+**怎么修**：`console.py` 在启动时检查 `sys.stdout` / `sys.stderr` 的编码，不是 UTF-8 就
+`reconfigure(encoding="utf-8", errors="replace")`。控制台本身不受影响；管道/文件从此是 UTF-8。
 
 ---
 

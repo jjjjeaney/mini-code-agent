@@ -28,6 +28,14 @@ cp .env.example .env
 uv run mca "用一句话解释什么是闭包"
 ```
 
+`--model` 换模型；不写就用 `providers/anthropic.py` 里的 `DEFAULT_MODEL`（`deepseek-v4-flash`）。上下文窗口和压缩阈值会跟着模型名走。
+
+```bash
+uv run mca --model deepseek-v4-pro "用一句话解释什么是闭包"
+```
+
+`--api-key` / `--base-url` 可以临时覆盖 `.env` 里的 `DEEPSEEK_API_KEY` / `DEEPSEEK_ANTHROPIC_BASE_URL`。**密钥写在命令行上会留在 shell 历史和进程列表里**，日常还是用 `.env`；这两个参数主要给脚本或临时切换端点用。
+
 不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/tasks`、`/compact`、`/grants`、`/permission_mode`、`/fork`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉提示词里那段说明，也就是重建前缀缓存）。
 
 ```bash

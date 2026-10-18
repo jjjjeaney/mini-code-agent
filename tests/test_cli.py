@@ -19,6 +19,7 @@ from mini_code_agent.memory import Memory, write
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompting import TerminalPrompter
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
+from mini_code_agent.providers.anthropic import DEFAULT_MODEL
 from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCall
 from mini_code_agent.sessions import SESSIONS_DIR, Session, load, start
 from mini_code_agent.system_prompt import build_system_prompt
@@ -385,6 +386,9 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
         cli.main_command(
             prompt="",
             cwd=tmp_path,
+            model="",
+            api_key="",
+            base_url="",
             shell=False,
             fork=False,
             permission_mode="default",
@@ -416,6 +420,9 @@ def run_delete(tmp_path, session_id: str, *, yes: bool) -> None:
         cli.main_command(
             prompt="",
             cwd=tmp_path,
+            model="",
+            api_key="",
+            base_url="",
             shell=False,
             fork=False,
             permission_mode="default",
@@ -478,6 +485,9 @@ def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
         cli.main_command(
             prompt="",
             cwd=tmp_path,
+            model="",
+            api_key="",
+            base_url="",
             shell=False,
             fork=False,
             permission_mode="default",
@@ -556,11 +566,14 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
     跑），所以光看单测验不到"它到底装没装上"。
     """
     provider = FakeOneShotProvider()
-    monkeypatch.setattr(cli, "AnthropicProvider", lambda: provider)
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
 
     cli.main_command(
         prompt="你好",
         cwd=tmp_path,
+        model="",
+        api_key="",
+        base_url="",
         shell=False,
         fork=False,
         permission_mode="default",
@@ -580,15 +593,89 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
     capsys.readouterr()
 
 
+def test_the_model_option_reaches_the_provider(monkeypatch, tmp_path, capsys):
+    """`--model` 要真的落到 provider 上；不写就用 DEFAULT_MODEL。"""
+    seen: list[dict] = []
+
+    def factory(**kwargs):
+        seen.append(kwargs)
+        return FakeOneShotProvider()
+
+    monkeypatch.setattr(cli, "AnthropicProvider", factory)
+
+    def run(*, model: str) -> None:
+        cli.main_command(
+            prompt="你好",
+            cwd=tmp_path,
+            model=model,
+            api_key="",
+            base_url="",
+            shell=False,
+            fork=False,
+            permission_mode="default",
+            continue_=False,
+            resume="",
+            list_=False,
+            delete_="",
+        )
+
+    run(model="deepseek-v4-pro")
+    run(model="")
+    capsys.readouterr()
+
+    assert seen[0]["model"] == "deepseek-v4-pro"
+    assert seen[1]["model"] == DEFAULT_MODEL
+
+
+def test_the_endpoint_options_reach_the_provider(monkeypatch, tmp_path, capsys):
+    """`--api-key` / `--base-url` 原样交给 provider；空串表示"让 provider 去读环境变量"。"""
+    seen: list[dict] = []
+
+    def factory(**kwargs):
+        seen.append(kwargs)
+        return FakeOneShotProvider()
+
+    monkeypatch.setattr(cli, "AnthropicProvider", factory)
+
+    def run(*, api_key: str, base_url: str) -> None:
+        cli.main_command(
+            prompt="你好",
+            cwd=tmp_path,
+            model="",
+            api_key=api_key,
+            base_url=base_url,
+            shell=False,
+            fork=False,
+            permission_mode="default",
+            continue_=False,
+            resume="",
+            list_=False,
+            delete_="",
+        )
+
+    run(api_key="sk-test", base_url="https://example.test")
+    run(api_key="", base_url="")
+    capsys.readouterr()
+
+    assert seen[0]["api_key"] == "sk-test"
+    assert seen[0]["base_url"] == "https://example.test"
+    # 空串 → None：provider 自己去读 .env
+    assert seen[1]["api_key"] is None
+    assert seen[1]["base_url"] is None
+
+
 def test_fork_is_a_type_of_the_agent_tool_in_both_cases(monkeypatch, tmp_path, capsys):
     """fork 不再是独立工具：枚举里一直有它，开没开只影响系统提示里那段说明。"""
     provider = FakeOneShotProvider()
-    monkeypatch.setattr(cli, "AnthropicProvider", lambda: provider)
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
 
     def types_offered(*, fork: bool) -> set[str]:
         cli.main_command(
             prompt="你好",
             cwd=tmp_path,
+            model="",
+            api_key="",
+            base_url="",
             shell=False,
             fork=fork,
             permission_mode="default",
@@ -870,11 +957,14 @@ def test_the_one_shot_path_persists_before_folding(monkeypatch, tmp_path):
     session = start(tmp_path, permission_mode="default", allow_shell=False)
     session.append(history)
     age_the_file(session)
-    monkeypatch.setattr(cli, "AnthropicProvider", lambda: FakeOneShotProvider())
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: FakeOneShotProvider())
 
     cli.main_command(
         prompt="接着说",
         cwd=tmp_path,
+        model="",
+        api_key="",
+        base_url="",
         shell=False,
         fork=False,
         permission_mode="default",
