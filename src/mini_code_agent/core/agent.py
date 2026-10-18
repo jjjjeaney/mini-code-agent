@@ -36,6 +36,10 @@ from mini_code_agent.tools import (
 # 但也不能长到用户以为卡死了。只补一次——补几次写死在 ask() 里，要改就在那儿加一层。
 RETRY_PAUSE_SECONDS = 3.0
 
+# 一批只读工具里最多同时跑几个。这些工具是 I/O 密集的（读盘、联网），线程够用；上限主要是
+# 别让一次批量 web 请求把对面的限流打穿，也别把磁盘打满。
+PARALLEL_LIMIT = 4
+
 
 @dataclass
 class ContextAnchor:
@@ -144,6 +148,86 @@ def _render_result(result: ToolResult) -> str:
     return f"{mark} {result.name}: {_as_text(result.result)}"
 
 
+def _is_parallel(call: ToolCall, registry: ToolRegistry) -> bool:
+    """这条调用能不能和相邻的只读调用一起跑。
+
+    判据是 `Tool.read_only`：它保证"不写盘、不跑命令、不向用户输出、不改长期记忆"，而且
+    `decide_permission` 对这类工具一律 allow——所以放到 worker 线程里跑 `_gate` 也不会弹问题。
+    查不到的调用名按串行处理（`dispatch` 本来就会回一条错误结果）。
+    """
+    tool = registry.tools.get(call.name)
+    return tool is not None and tool.read_only
+
+
+def _segments(calls: list[ToolCall], registry: ToolRegistry) -> list[list[ToolCall]]:
+    """按原顺序切成若干段：连续只读的一段，每个不可并行的调用单独一段。
+
+    段与段串行，段内并行。**不能把读和写混在一段里**：模型把它们排成这个顺序，串行语义下
+    后面的读要看到前面的写；跨过写去并行会改变结果。
+    """
+    segments: list[list[ToolCall]] = []
+    run: list[ToolCall] = []
+    for call in calls:
+        if _is_parallel(call, registry):
+            run.append(call)
+            continue
+        if run:
+            segments.append(run)
+            run = []
+        segments.append([call])
+    if run:
+        segments.append(run)
+    return segments
+
+
+def _run_parallel(
+    calls: list[ToolCall],
+    run_one: Callable[[ToolCall], ToolResult],
+    limit: int,
+) -> list[ToolResult]:
+    """并发跑一段只读调用，按原下标返回结果。
+
+    每条一个 daemon 线程、用一个信号量限并发。**不用 ThreadPoolExecutor**：它的线程不是
+    daemon，Ctrl+C 之后解释器退出时会 join，慢的 web_fetch 会把进程挂住。某一条抛异常只影响
+    它自己（包成 `is_error` 的结果），同段其它调用照常跑完。
+    """
+    results: list[ToolResult | None] = [None] * len(calls)
+    semaphore = threading.Semaphore(limit)
+
+    def worker(index: int, call: ToolCall) -> None:
+        with semaphore:
+            try:
+                results[index] = run_one(call)
+            except Exception as exc:  # noqa: BLE001 - 一条坏了不能带走同段其它调用
+                results[index] = ToolResult(
+                    id=call.id,
+                    name=call.name,
+                    result=f"{type(exc).__name__}: {exc}",
+                    is_error=True,
+                )
+
+    threads = [
+        threading.Thread(target=worker, args=(index, call), daemon=True)
+        for index, call in enumerate(calls)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    return [
+        result
+        if result is not None
+        else ToolResult(
+            id=call.id,
+            name=call.name,
+            result="并行执行没有返回结果",
+            is_error=True,
+        )
+        for call, result in zip(calls, results, strict=True)
+    ]
+
+
 def _ask(prompter: Prompter, request: PermissionRequest, grants: Grants) -> Answer:
     """真的去问一次用户。本会话批过的就不问了，直接放行。
 
@@ -248,6 +332,10 @@ def runagent(
 
     tool_schemas 只有 fork 传：把父 agent 已经算好的那份 schema **原样**发下去，多一个少一个
     都会让缓存前缀对不上。不传就照旧现算。
+
+    **一批工具调用里，相邻的只读调用会并行执行**（判据是 `Tool.read_only`，见 `_segments`）；
+    不可并行的调用是段与段之间的屏障，被它隔开的读不会跨过去并行。结果顺序始终是模型给出的
+    顺序，`tool_result` 消息的拼法不变。
 
     **后台模式**（`run_in_background` / 两分钟自动转）：
 
@@ -467,23 +555,37 @@ def runagent(
                 # assistant 这轮的内容要原样回填：tool_use 块藏在里面，模型靠它认领结果。
                 msgs.append({"role": "assistant", "content": response.assistant_content})
 
-                results: list[ToolResult] = []
-                for call in response.tool_calls:
-                    # 请求和它的结果挨着记，打印出来才是一条顺得下来的流水。
-                    trace.append(_render_call(call))
-                    emit(f"{label}{_render_call(call)}", "cyan")
-
+                def run_one(call: ToolCall) -> ToolResult:
                     # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
                     result = _gate(call, prompter, allow_shell, permission_mode, grants)
                     if result is None:
                         result = registry.dispatch(ctx, call)
+                    return result
 
-                    trace.append(_render_result(result))
-                    emit(
-                        f"{label}{_render_result(result)}",
-                        "red" if result.is_error else "green",
-                    )
-                    results.append(result)
+                results: list[ToolResult] = []
+                for segment in _segments(response.tool_calls, registry):
+                    # 先把这一段的调用行按顺序打出来。并行段里这些行会全部出现在结果之前——
+                    # 这就是"它们是一起跑的"在终端上的样子。
+                    for call in segment:
+                        trace.append(_render_call(call))
+                        emit(f"{label}{_render_call(call)}", "cyan")
+
+                    if len(segment) == 1:
+                        segment_results = [run_one(segment[0])]
+                    else:
+                        segment_results = _run_parallel(
+                            segment, run_one, PARALLEL_LIMIT
+                        )
+
+                    # 结果按原顺序拼：tool_result 虽然按 id 配对，但 trace、终端和测试都依赖
+                    # 稳定顺序。
+                    for result in segment_results:
+                        trace.append(_render_result(result))
+                        emit(
+                            f"{label}{_render_result(result)}",
+                            "red" if result.is_error else "green",
+                        )
+                        results.append(result)
 
                 # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
                 msgs.append(
