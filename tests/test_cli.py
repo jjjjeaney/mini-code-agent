@@ -12,7 +12,6 @@ import typer
 
 from mini_code_agent import cli
 from mini_code_agent.core.agent import AgentResult
-from mini_code_agent.core.fork import make_fork_tool
 from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.folding import FOLD_AFTER_SECONDS, MIN_FOLD_CHARS
 from mini_code_agent.memory import Memory, write
@@ -569,15 +568,19 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
     offered = {schema["name"] for schema in provider.tools or []}
     assert "agent" in offered
     assert "ask_user" in offered  # 另一个 harness 注入的，顺带确认这条路没被改坏
-    assert "fork" not in offered  # 没开 --fork
+    assert "fork" not in offered  # fork 是 agent 的一个 type，不是单独的工具
+    # 而且这个 type 一直在枚举里——档位/开关开关的是运行时能不能用，不是发不发。
+    agent = next(schema for schema in provider.tools or [] if schema["name"] == "agent")
+    assert "fork" in agent["input_schema"]["properties"]["type"]["enum"]
     capsys.readouterr()
 
 
-def test_the_fork_tool_is_offered_only_with_the_flag(monkeypatch, tmp_path, capsys):
+def test_fork_is_a_type_of_the_agent_tool_in_both_cases(monkeypatch, tmp_path, capsys):
+    """fork 不再是独立工具：枚举里一直有它，开没开只影响系统提示里那段说明。"""
     provider = FakeOneShotProvider()
     monkeypatch.setattr(cli, "AnthropicProvider", lambda: provider)
 
-    def offered(*, fork: bool) -> set[str]:
+    def types_offered(*, fork: bool) -> set[str]:
         cli.main_command(
             prompt="你好",
             cwd=tmp_path,
@@ -589,40 +592,32 @@ def test_the_fork_tool_is_offered_only_with_the_flag(monkeypatch, tmp_path, caps
             list_=False,
             delete_="",
         )
-        return {schema["name"] for schema in provider.tools or []}
+        agent = next(schema for schema in provider.tools or [] if schema["name"] == "agent")
+        return set(agent["input_schema"]["properties"]["type"]["enum"])
 
-    assert "fork" not in offered(fork=False)
-    assert "fork" in offered(fork=True)
+    assert "fork" in types_offered(fork=False)
+    assert "fork" in types_offered(fork=True)
     capsys.readouterr()
 
 
 def test_the_fork_switch_can_be_toggled_from_the_loop(monkeypatch, tmp_path, capsys):
-    """`/fork on` 之后，下一轮的工具表和提示词都要跟着变。"""
+    """`/fork on` 之后，下一轮的提示词里多出那段说明。
+
+    工具表不变（fork 是 `agent` 的 type，枚举是静态的）——但提示词变了，前缀照样重建。
+    """
     provider = ScriptedProvider([text_turn("好")])
-    registry = default_tools()
-    registry.register(
-        make_fork_tool(provider=provider, prompter=NullPrompter(), grants=Grants())
-    )
 
-    run_loop(
-        monkeypatch, provider, ["/fork on", "你好", "/exit"], tmp_path, registry=registry
-    )
+    run_loop(monkeypatch, provider, ["/fork on", "你好", "/exit"], tmp_path)
 
-    assert "fork" in {schema["name"] for schema in provider.tools[0]}
     assert "什么时候用 fork" in provider.systems[0]
     capsys.readouterr()
 
 
 def test_fork_is_off_by_default_in_the_loop(monkeypatch, tmp_path, capsys):
     provider = ScriptedProvider([text_turn("好")])
-    registry = default_tools()
-    registry.register(
-        make_fork_tool(provider=provider, prompter=NullPrompter(), grants=Grants())
-    )
 
-    run_loop(monkeypatch, provider, ["你好", "/exit"], tmp_path, registry=registry)
+    run_loop(monkeypatch, provider, ["你好", "/exit"], tmp_path)
 
-    assert "fork" not in {schema["name"] for schema in provider.tools[0]}
     assert "什么时候用 fork" not in provider.systems[0]
     capsys.readouterr()
 

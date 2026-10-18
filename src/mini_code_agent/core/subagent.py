@@ -5,8 +5,10 @@
 而且挤占真正要做的事。子 agent 读完之后只把一段结论交回来，那 20 个文件跟着它的上下文
 一起丢掉。
 
-**三种类型，是三种工具池**（见 `AGENT_TYPES`）：`general-purpose` 能动手，`explore` 和
-`plan` 只能读。它们各自的性格写在系统提示词里（`system_prompt.SUBAGENT_HEADS`）。
+**四种类型，同一个工具**（见 `AGENT_TYPES`）：`general-purpose` 能动手，`explore` 和
+`plan` 只能读，`fork` 继承父 agent 现在这份上下文和缓存前缀。前三种是"从零开始、只拿一段
+任务描述"（`_pool` 现筛一份工具池）；`fork` 用的是父 agent 那一套 system prompt、工具表和历史
+（见 `ForkContext`），所以它不经过 `_pool`，而是单独走一条分支。
 
 **为什么在 `core/` 而不在 `tools/`**：它要调 `runagent`（递归跑一个子 agent），而 `tools/`
 里的东西不能 import `core/`——`core/agent.py` 要 import `tools/`，反过来就成环了。这跟
@@ -61,6 +63,11 @@ BACKGROUND_AFTER_SECONDS = 120.0
 # 就已经在跑了，拦下来只会把它卡在前台。
 BACKGROUND_LIMIT = 2
 
+# fork 那一支：终端上的前缀，以及一次 fork 最多几步。和别的类型一样——它是来"顺着现在这条线
+# 做一件事"的，不是来重开一摊。
+FORK_LABEL = "[fork] "
+FORK_MAX_STEPS = 8
+
 
 @dataclass(frozen=True)
 class AgentType:
@@ -72,7 +79,11 @@ class AgentType:
     `read_only` 为真时池子里只留 `tools/base.py` 里标了 `read_only` 的那些（外加联网）。
     **它和"不能改文件"是一回事**：只读工具本来就碰不了盘。
 
-    `max_steps` 默认 8，和 `runagent` 自己的默认一样。三个类型现在都是这个数——先跑一跑看
+    `fork` 为真时这一型**不走 `_pool`**：它用的是父 agent 的那套 system prompt、工具表和
+    历史（见 `ForkContext`），是 `run_subagent` 里单独的一条分支。`read_only` / `max_steps`
+    对它只用于展示，真正的步数上限是 `FORK_MAX_STEPS`。
+
+    `max_steps` 默认 8，和 `runagent` 自己的默认一样。几个类型现在都是这个数——先跑一跑看
     实际用几步，再决定要不要分开定；现在拍的数没有依据。
     """
 
@@ -80,6 +91,7 @@ class AgentType:
     summary: str
     read_only: bool
     max_steps: int = 8
+    fork: bool = False
 
 
 AGENT_TYPES: dict[str, AgentType] = {
@@ -102,6 +114,16 @@ AGENT_TYPES: dict[str, AgentType] = {
         name="plan",
         summary="读代码、设计一个**能照着做**的实施方案。只能读。",
         read_only=True,
+    ),
+    "fork": AgentType(
+        name="fork",
+        summary=(
+            "**继承你现在这份对话和缓存前缀**，从当前状态出发独立做一件事。"
+            "要靠前面聊过的背景、读过的文件才做得对时用它；需要启动时开 --fork。"
+        ),
+        read_only=False,
+        max_steps=FORK_MAX_STEPS,
+        fork=True,
     ),
 }
 
@@ -148,7 +170,12 @@ def _pool(agent_type: AgentType) -> ToolRegistry:
     进不来，不需要写进下面的排除名单。
 
     排除名单里因此只剩 `remember` 一个。理由见模块说明：长期记忆该由主 agent 来记。
+
+    `fork` 不走这儿：它的工具表是父 agent 那一份（缓存前缀必须逐字节一致）。真调到这里是
+    调用方的 bug，直接报出来，别悄悄给一份错的池子。
     """
+    if agent_type.fork:
+        raise ValueError("fork 用的是父 agent 的那张工具表，不经过 _pool")
     tools = default_tools().list()
     if agent_type.read_only:
         return ToolRegistry([tool for tool in tools if tool.read_only])
@@ -231,6 +258,11 @@ def _describe() -> str:
         "不是钱（它每一步都是另外的请求）。\n\n"
         "**小事别派**：一次 `read_file`、一条 `grep` 就够的，自己来更快。\n\n"
         f"`type` 可选：\n{kinds}\n\n"
+        "`fork` 和别的三型不一样：它继承你现在的系统提示、工具表和历史（**只少你最后那条"
+        "工具调用**），所以背景不用重讲、缓存直接命中；代价是它看不到你最后这条调用，也看不到"
+        "同一批里其它调用的结果——**别把它和别的工具并排派**。它继承你当前的权限档位"
+        "（plan 档下同样改不了文件），而且**不能嵌套 fork**；"
+        "它改过的文件，你之后改之前要先重读。\n\n"
         "**plan 档下只用 `explore` 或 `plan`。** 那一档里 `general-purpose` 改文件会被直接拒，"
         "派了大概率白烧步数。\n\n"
         f"**跑满 {int(BACKGROUND_AFTER_SECONDS)} 秒会自动转后台**，不用你特意说。"
@@ -238,6 +270,16 @@ def _describe() -> str:
         "后台任务的结果会作为一条通知自动出现在你后面的请求里；太长的话会落盘，"
         "用 `read_tool_result` 按任务 id 取。**转后台之后它不能再请求新的权限批准**——"
         "需要用户点头的改动，让它写进结论里。"
+    )
+
+
+def _fork_task_message(task: str) -> str:
+    """fork 收到的那条任务消息。**只影响新追加的尾巴**，不会动摇缓存前缀。"""
+    return (
+        "【fork 子任务】主 agent 把下面这件事交给你，在现有对话的基础上直接做完。\n"
+        "不要再派 fork；需要用户拍板的事、以及你改了哪些文件，都写进最终回复。\n"
+        "（你看不到主 agent 最后那条工具调用，也看不到同一批里其它调用的结果。）\n\n"
+        f"{task}"
     )
 
 
@@ -290,6 +332,52 @@ def make_agent_tool(
         use_background = wants_background and can_background
         after = 0.0 if use_background else (background_after if can_background else None)
 
+        # 两条分支只在这里分开，后面的后台交接、结果措辞、长度闸全部共用。
+        # `base` 是 fork 继承过来的那段父历史，计数时要把它切掉。
+        base: list[dict[str, Any]] | None = None
+        if agent_type.fork:
+            fork = ctx.fork
+            if fork is None:
+                return (
+                    "fork 不可用：这次运行没有打开它"
+                    "（启动时加 --fork，或在交互里 /fork on）。"
+                )
+            if fork.depth > 0:
+                return (
+                    "不能再次 fork：你本身就是被 fork 出来的。"
+                    "这件事请你自己在当前上下文里做完。"
+                )
+            if fork.system is None:
+                return "fork 不可用：这次运行没有 system prompt，继承不了父 agent 的前缀。"
+
+            # 最后一条是本次要回填结果的那条 assistant 消息（agent 这个 tool_use 就在里面）。
+            # 它是上一发的**响应**，本来就不在任何请求前缀里，去掉它不损失缓存。
+            base = list(fork.messages)
+            if base and base[-1].get("role") == "assistant":
+                base = base[:-1]
+
+            label = FORK_LABEL
+            system = fork.system
+            registry_for_subagent = fork.registry
+            max_steps = FORK_MAX_STEPS
+            # 副本：进来时继承父 agent 读到过什么，出去之后一条都不回流。
+            read_state = ctx.read_state.copy()
+            sub_task = _fork_task_message(task)
+            tool_schemas = fork.tools
+            fork_depth = fork.depth + 1
+            child_name = "fork"
+            allow_fork = True
+        else:
+            system = build_subagent_prompt(ctx.cwd, name, ctx.permission_mode, model)
+            registry_for_subagent = _pool(agent_type)
+            max_steps = agent_type.max_steps
+            read_state = None
+            sub_task = task
+            tool_schemas = None
+            fork_depth = 0
+            child_name = name
+            allow_fork = False
+
         start_background = None
         if can_background:
 
@@ -310,18 +398,23 @@ def make_agent_tool(
         # 派去干什么"。
         console.print(f"▶ {label}{kwargs['description']}", style="cyan", markup=False)
         result = runagent(
-            task,
+            sub_task,
             provider,
-            _pool(agent_type),
-            system=build_subagent_prompt(ctx.cwd, name, ctx.permission_mode, model),
-            max_steps=agent_type.max_steps,
+            registry_for_subagent,
+            system=system,
+            max_steps=max_steps,
             cwd=ctx.cwd,
             allow_shell=ctx.allow_shell,
             permission_mode=ctx.permission_mode,
-            prompter=LabeledPrompter(prompter, name),
+            prompter=LabeledPrompter(prompter, child_name),
             grants=grants,
             spill_dir=ctx.spill_dir,
             label=label,
+            messages=base,
+            read_state=read_state,
+            allow_fork=allow_fork,
+            fork_depth=fork_depth,
+            tool_schemas=tool_schemas,
             background_after=after,
             handoff=start_background,
         )
@@ -340,7 +433,9 @@ def make_agent_tool(
                 "**不要重派同一个任务。**"
             )
 
-        note = tally_calls(result.messages)
+        # fork 的 `result.messages` 带着父 agent 整段历史，计数从 `len(base)` 往后切；
+        # 其它类型那份从头到尾都是它自己的。
+        note = tally_calls(result.messages if base is None else result.messages[len(base) :])
         console.print(f"◀ {label}{note}", style="dim", markup=False)
 
         # **三种收场分开说，而且都不抛异常。** 子 agent 没能得出结论，跟"命令跑了但退出码
@@ -376,7 +471,6 @@ def make_agent_tool(
     )
 
 
-# 旧名字留着：`tests/test_subagent.py` 直接按私有名导入。改名是为了 `core/fork.py` 能复用
-# 这两个（fork 的计数和标签和子 agent 是同一套），不必把测试一起翻一遍。
+# 旧名字留着：`tests/test_subagent.py` 直接按私有名导入。
 _LabeledPrompter = LabeledPrompter
 _tally = tally_calls

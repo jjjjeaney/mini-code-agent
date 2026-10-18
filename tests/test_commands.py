@@ -214,7 +214,7 @@ class TestFork:
         assert "/fork on" in out
 
     def test_it_turns_fork_on_and_says_the_cache_will_be_rebuilt(self, capsys):
-        """切它会换工具表和提示词，也就是重建整个前缀——代价要当场说清楚。"""
+        """切它会换提示词里那段说明，也就是重建整个前缀——代价要当场说清楚。"""
         ctx = make_ctx()
 
         assert default_commands().dispatch("/fork on", ctx) == "handled"

@@ -163,9 +163,9 @@ def make_permission_mode() -> Command:
 def make_fork() -> Command:
     """看 fork 开没开；带参数就打开或关掉。
 
-    **切换要付一次重建前缀的钱**：fork 工具在不在工具表里、提示词里有没有那段，都是请求开头的
-    一部分，而工具表渲染在 messages 前面——改它等于整套前缀重算。所以这件事得当场说清楚，
-    不能悄悄换掉。
+    **切换要付一次重建前缀的钱**：提示词里有没有那段说明，属于请求开头的一部分。工具表本身
+    不变（fork 是 `agent` 的 type 枚举里的一项，枚举是静态的），但前缀照样从头算。所以这件事
+    得当场说清楚，不能悄悄换掉。
     """
 
     def run(ctx: CommandContext, arg: str) -> CommandOutcome:
@@ -193,7 +193,7 @@ def make_fork() -> Command:
         ctx.state.allow_fork = wanted
         ctx.console.print(f"fork 换成了{'开' if wanted else '关'}（下一轮起生效）", markup=False)
         ctx.console.print(
-            "  工具表和提示词都变了，下一轮的前缀缓存会从头算——那一发按原价。",
+            "  提示词变了，下一轮的前缀缓存会从头算——那一发按原价。",
             style="dim",
             markup=False,
         )

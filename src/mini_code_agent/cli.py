@@ -17,7 +17,6 @@ from mini_code_agent.commands import (
 from mini_code_agent.console import console
 from mini_code_agent.context_window import window_for
 from mini_code_agent.core.agent import AgentResult, runagent
-from mini_code_agent.core.fork import make_fork_tool
 from mini_code_agent.core.subagent import make_agent_tool
 from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.folding import PersistText, fold_if_stale
@@ -417,7 +416,7 @@ def main_command(
     fork: bool = typer.Option(
         False,
         "--fork",
-        help="允许主 agent 用 fork：继承当前对话和缓存前缀的同步子 agent",
+        help="允许主 agent 派 fork 类型的子 agent：继承当前对话和缓存前缀",
     ),
     permission_mode: str = typer.Option(
         "default",
@@ -515,10 +514,9 @@ def main_command(
             tasks=tasks,
         )
     )
-    # fork 也在这儿装。**无条件注册**：开没开 `--fork` 由它的 `available` 判——关着的时候
-    # ToolContext.fork 是 None，这个工具就不会发到模型手上。这样主 agent 的工具表在两种情况下
-    # 各自稳定，不会因为注册与否在中间插一个位置出来。
-    registry.register(make_fork_tool(provider=provider, prompter=prompter, grants=grants))
+    # fork 不单独注册：它是 `agent` 的 `type` 枚举里的一项。开没开 `--fork` 由
+    # `ToolContext.fork` 判——关着的时候 `agent(type="fork")` 会回一句"没打开"。枚举是静态的，
+    # 所以切换开关**不会改工具表**；变的只有系统提示里那段说明。
     if prompt:
         # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
         console.print(f"> {prompt}", style="bold", markup=False)

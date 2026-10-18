@@ -1,11 +1,20 @@
-"""fork 工具：继承父 agent 的上下文、复用缓存前缀。全部本地执行。"""
+"""fork 类型：继承父 agent 的上下文、复用缓存前缀。全部本地执行。
+
+fork 不再是单独的工具——它是 `agent` 的 `type` 枚举里的一项，和 explore / plan /
+general-purpose 同级。
+"""
 
 from __future__ import annotations
 
 import pytest
 
 from mini_code_agent.core.agent import runagent
-from mini_code_agent.core.fork import make_fork_tool
+from mini_code_agent.core.subagent import (
+    AGENT_SCHEMA,
+    AGENT_TYPES,
+    make_agent_tool,
+)
+from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.permissions import Grants
 from mini_code_agent.prompts import Answer
 from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCall
@@ -44,6 +53,15 @@ def tool_turn(call_id: str, name: str, arguments: dict) -> ModelResponse:
     )
 
 
+def fork_turn(call_id: str = "f1", *, description: str = "试试", prompt: str = "做事"):
+    """主 agent 派一个 fork：还是 `agent` 这个工具，只是 type 换成 fork。"""
+    return tool_turn(
+        call_id,
+        "agent",
+        {"type": "fork", "description": description, "prompt": prompt},
+    )
+
+
 def text_turn(text: str) -> ModelResponse:
     return ModelResponse(
         text=text,
@@ -68,11 +86,29 @@ class RecordingPrompter:
         raise AssertionError("fork 的测试里不该出现选择题")
 
 
-def the_tool(provider, prompter=None) -> Tool:
-    return make_fork_tool(
+def the_tool(
+    provider, prompter=None, *, tasks=None, background_after=120.0
+) -> Tool:
+    return make_agent_tool(
         provider=provider,
         prompter=prompter or RecordingPrompter(),
         grants=Grants(),
+        model="test-model",
+        tasks=tasks,
+        background_after=background_after,
+    )
+
+
+def call_fork(
+    tool: Tool,
+    ctx: ToolContext,
+    *,
+    description: str = "试试",
+    prompt: str = "做事",
+    **extra,
+) -> str:
+    return tool.fn(
+        {"type": "fork", "description": description, "prompt": prompt, **extra}, ctx
     )
 
 
@@ -91,36 +127,31 @@ def a_fork_context(
     )
 
 
-class TestTheToolShape:
-    def test_it_is_named_fork(self):
-        assert the_tool(ScriptedProvider([])).name == "fork"
+class TestTheType:
+    def test_fork_is_one_of_the_agent_types(self):
+        """和 explore / plan / general-purpose 同级——模型在同一个 `type` 里挑。"""
+        assert "fork" in AGENT_TYPES
+        assert "fork" in AGENT_SCHEMA["properties"]["type"]["enum"]
+        assert AGENT_TYPES["fork"].fork is True
 
-    def test_it_spills_long_conclusions(self):
-        assert the_tool(ScriptedProvider([])).spill is True
+    def test_the_other_types_are_not_forks(self):
+        others = (t for name, t in AGENT_TYPES.items() if name != "fork")
+        assert all(not agent_type.fork for agent_type in others)
 
-    def test_its_conclusion_can_never_be_folded(self):
-        """结论就是"方向"本身，折了就真没了——和 agent 一样。"""
-        assert the_tool(ScriptedProvider([])).foldable is False
-
-    def test_it_is_hidden_without_a_fork_context(self, tmp_path):
+    def test_the_conclusion_still_spills_and_never_folds(self):
         tool = the_tool(ScriptedProvider([]))
 
-        assert tool.available(ToolContext(cwd=tmp_path)) is False
-
-    def test_it_is_offered_once_a_fork_context_exists(self, tmp_path):
-        tool = the_tool(ScriptedProvider([]))
-        ctx = ToolContext(cwd=tmp_path, fork=a_fork_context([]))
-
-        assert tool.available(ctx) is True
+        assert tool.spill is True
+        assert tool.foldable is False
 
 
 class TestTheGuards:
     def test_a_nested_fork_is_refused_with_a_plain_result(self, tmp_path):
-        """递归不靠"不发"——那样会改工具表前缀、把缓存打没。靠深度在运行时拒。"""
+        """递归靠深度在运行时拒：`agent` 一直挂在表上（删掉会改前缀、把缓存打没）。"""
         provider = ScriptedProvider([])
         ctx = ToolContext(cwd=tmp_path, fork=a_fork_context([], depth=1))
 
-        result = the_tool(provider).fn({"description": "再派", "prompt": "做事"}, ctx)
+        result = call_fork(the_tool(provider), ctx)
 
         assert "不能再次 fork" in result
         assert provider.calls == []
@@ -129,20 +160,18 @@ class TestTheGuards:
         ctx = ToolContext(cwd=tmp_path, fork=a_fork_context([]))
 
         with pytest.raises(ValueError, match="非空"):
-            the_tool(ScriptedProvider([])).fn({"description": "x", "prompt": "  "}, ctx)
+            call_fork(the_tool(ScriptedProvider([])), ctx, prompt="  ")
 
     def test_a_missing_system_prompt_says_so(self, tmp_path):
         ctx = ToolContext(cwd=tmp_path, fork=a_fork_context([], system=None))
 
-        result = the_tool(ScriptedProvider([])).fn(
-            {"description": "x", "prompt": "做事"}, ctx
-        )
+        result = call_fork(the_tool(ScriptedProvider([])), ctx)
 
         assert "没有 system prompt" in result
 
     def test_no_fork_context_says_the_flag_is_off(self, tmp_path):
-        result = the_tool(ScriptedProvider([])).fn(
-            {"description": "x", "prompt": "做事"}, ToolContext(cwd=tmp_path)
+        result = call_fork(
+            the_tool(ScriptedProvider([])), ToolContext(cwd=tmp_path)
         )
 
         assert "--fork" in result
@@ -154,11 +183,7 @@ class TestTheCachePrefix:
     def test_the_fork_request_is_the_parents_last_request_plus_the_task(self, tmp_path):
         """父 agent 上一步发出去的是 `messages[:-1]`；fork 在它后面只追加一条任务消息。"""
         provider = ScriptedProvider(
-            [
-                tool_turn("f1", "fork", {"description": "试试", "prompt": "换个做法"}),
-                text_turn("fork 的结论"),
-                text_turn("好"),
-            ]
+            [fork_turn(prompt="换个做法"), text_turn("fork 的结论"), text_turn("好")]
         )
         registry = ToolRegistry([the_tool(provider)])
 
@@ -194,11 +219,7 @@ class TestTheCachePrefix:
                 return response
 
         provider = FlippingProvider(
-            [
-                tool_turn("f1", "fork", {"description": "试试", "prompt": "换个做法"}),
-                text_turn("fork 的结论"),
-                text_turn("好"),
-            ]
+            [fork_turn(prompt="换个做法"), text_turn("fork 的结论"), text_turn("好")]
         )
         registry = ToolRegistry(
             [
@@ -220,11 +241,7 @@ class TestTheCachePrefix:
 class TestWhatTheForkSees:
     def test_it_sees_the_parent_history_but_not_the_current_tool_turn(self, tmp_path):
         provider = ScriptedProvider(
-            [
-                tool_turn("f1", "fork", {"description": "试试", "prompt": "接着做"}),
-                text_turn("结论"),
-                text_turn("好"),
-            ]
+            [fork_turn(prompt="接着做"), text_turn("结论"), text_turn("好")]
         )
         history = [
             {"role": "user", "content": "背景一"},
@@ -267,8 +284,12 @@ class TestWhatTheForkSees:
                     tool_calls=[
                         ToolCall(
                             id="f1",
-                            name="fork",
-                            arguments={"description": "试试", "prompt": "做事"},
+                            name="agent",
+                            arguments={
+                                "type": "fork",
+                                "description": "试试",
+                                "prompt": "做事",
+                            },
                         ),
                         ToolCall(id="s1", name="sibling", arguments={}),
                     ],
@@ -276,8 +297,12 @@ class TestWhatTheForkSees:
                         {
                             "type": "tool_use",
                             "id": "f1",
-                            "name": "fork",
-                            "input": {"description": "试试", "prompt": "做事"},
+                            "name": "agent",
+                            "input": {
+                                "type": "fork",
+                                "description": "试试",
+                                "prompt": "做事",
+                            },
                         },
                         {"type": "tool_use", "id": "s1", "name": "sibling", "input": {}},
                     ],
@@ -303,7 +328,7 @@ class TestTheResult:
         """`result.messages` 带着父 agent 的整段历史，计数必须从 `len(base)` 往后切。"""
         provider = ScriptedProvider(
             [
-                tool_turn("f1", "fork", {"description": "试试", "prompt": "做事"}),
+                fork_turn(),
                 tool_turn("p1", "probe", {}),
                 text_turn("结论"),
                 text_turn("好"),
@@ -352,17 +377,15 @@ class TestTheResult:
             fork=a_fork_context([{"role": "user", "content": "背景"}]),
         )
 
-        result = the_tool(FailingProvider()).fn(
-            {"description": "x", "prompt": "做事"}, ctx
-        )
+        result = call_fork(the_tool(FailingProvider()), ctx)
 
         assert "没跑成" in result
         assert "连不上" in result
 
     def test_it_says_so_when_the_fork_never_concluded(self, tmp_path, monkeypatch):
-        import mini_code_agent.core.fork as fork_module
+        import mini_code_agent.core.subagent as subagent_module
 
-        monkeypatch.setattr(fork_module, "FORK_MAX_STEPS", 1)
+        monkeypatch.setattr(subagent_module, "FORK_MAX_STEPS", 1)
         provider = ScriptedProvider(
             [tool_turn("p1", "probe", {}), tool_turn("p2", "probe", {})]
         )
@@ -372,9 +395,30 @@ class TestTheResult:
             fork=a_fork_context([{"role": "user", "content": "背景"}], registry=registry),
         )
 
-        result = the_tool(provider).fn({"description": "x", "prompt": "做事"}, ctx)
+        result = call_fork(the_tool(provider), ctx)
 
         assert "没给出结论" in result
+
+
+class TestBackground:
+    def test_a_fork_can_go_background_too(self, tmp_path):
+        """它和别的类型同级：`run_in_background` 对它一样有效。"""
+        manager = TaskManager()
+        provider = ScriptedProvider([text_turn("结论")])
+        ctx = ToolContext(
+            cwd=tmp_path,
+            allow_background=True,
+            fork=a_fork_context([{"role": "user", "content": "背景"}]),
+        )
+
+        result = call_fork(
+            the_tool(provider, tasks=manager, background_after=0.0),
+            ctx,
+            run_in_background=True,
+        )
+
+        assert "已派发" in result
+        assert manager.wait(manager.list()[0].id, timeout=2)
 
 
 class TestReadState:
@@ -406,8 +450,11 @@ class TestReadState:
             fork=a_fork_context([{"role": "user", "content": "背景"}], registry=default_tools()),
         )
 
-        the_tool(provider, RecordingPrompter(allow=True)).fn(
-            {"description": "改一下", "prompt": "把 a.txt 改掉"}, ctx
+        call_fork(
+            the_tool(provider, RecordingPrompter(allow=True)),
+            ctx,
+            description="改一下",
+            prompt="把 a.txt 改掉",
         )
 
         assert path.read_text(encoding="utf-8") == "改过的\n"
@@ -424,7 +471,7 @@ class TestReadState:
             fork=a_fork_context([], registry=default_tools()),
         )
 
-        the_tool(provider).fn({"description": "看看", "prompt": "读一下 a.txt"}, ctx)
+        call_fork(the_tool(provider), ctx, description="看看", prompt="读一下 a.txt")
 
         assert ctx.read_state.entries == {}
 
@@ -446,7 +493,7 @@ class TestReadState:
             fork=a_fork_context([], registry=default_tools()),
         )
 
-        the_tool(provider).fn({"description": "改一下", "prompt": "改掉"}, ctx)
+        call_fork(the_tool(provider), ctx, description="改一下", prompt="改掉")
 
         assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "原始内容\n"
         assert "plan" in str(provider.calls[1]["messages"])
@@ -469,7 +516,7 @@ class TestReadState:
             fork=a_fork_context([], registry=default_tools()),
         )
 
-        the_tool(provider, prompter).fn({"description": "改一下", "prompt": "改掉"}, ctx)
+        call_fork(the_tool(provider, prompter), ctx, description="改一下", prompt="改掉")
 
         assert prompter.edits  # 真问过
         assert "[fork]" in capsys.readouterr().out

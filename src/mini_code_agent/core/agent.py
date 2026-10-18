@@ -248,11 +248,13 @@ def runagent(
     主 agent 那条路传的就是它，输出一个字节都不变。
 
     read_state 是"读过哪些文件"的那份状态。**它和 messages 不一样：传进来就共用同一个对象。**
-    fork 子 agent 用的是它的一份**副本**（见 core/fork.py）——继承父 agent 读到过什么，但跑完
+    fork 子 agent 用的是它的一份**副本**（见 core/subagent.py 的 fork 分支）——继承父 agent
+    读到过什么，但跑完
     之后一条记录都不回流。
 
-    allow_fork 决定这一轮发不发 `fork` 工具；能不能真的 fork 由 `fork_depth` 挡。深了是在
-    **运行时**拒，不是把工具从表里删掉——删掉会改工具表前缀，缓存就废了。
+    `allow_fork` 决定这一轮 `agent` 的 `fork` 类型能不能用（它决定 `ctx.fork` 建不建）；
+    能不能再往下 fork 由 `fork_depth` 挡——深了会在**运行时**回一句普通结果，而不是把
+    `agent` 从工具表里删掉（删掉会改前缀，缓存就废了）。
 
     tool_schemas 只有 fork 传：把父 agent 已经算好的那份 schema **原样**发下去，多一个少一个
     都会让缓存前缀对不上。不传就照旧现算。
@@ -267,7 +269,7 @@ def runagent(
     - `allow_background` 交给 `ToolContext`，`agent` 工具据此决定认不认 `run_in_background`。
     """
     registry = registry if registry is not None else default_tools()
-    # 新拼一份，别就地改调用方手里那份。**得在 ctx 之前**：fork 工具要用它（见 ForkContext）。
+    # 新拼一份，别就地改调用方手里那份。**得在 ctx 之前**：fork 那份现场要用它（见 ForkContext）。
     messages = [*(messages or []), {"role": "user", "content": prompt}]
     # fork 要的那份父 agent 现场。`--fork` 开着、或者我们本身就在一个 fork 里——后一种必须把
     # 工具继续挂在表上（否则工具表前缀变了、缓存全废），所以这里照样建，由 depth 挡递归。

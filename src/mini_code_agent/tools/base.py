@@ -40,7 +40,7 @@ class ReadFileState:
 
 @dataclass
 class ForkContext:
-    """fork 工具要用的那份父 agent 现场。
+    """fork 那一型要用的那份父 agent 现场。
 
     **为什么单独一个类型，而不是往 `ToolContext` 上摊五个字段**：现有那条边界是"工具不碰
     agent 的内部状态"，fork 是唯一的例外，那就把它圈在一个小对象里，别的工具够不着也用不上。
@@ -158,11 +158,11 @@ class ToolContext:
     # 只有 core/agent.py 一处构造，那里永远传的是真值。
     permission_mode: str = "default"
 
-    # fork 工具要的父 agent 现场（见上面的 `ForkContext`）。
+    # fork 那一型要的父 agent 现场（见上面的 `ForkContext`）。
     #
     # **非 None 就等于"fork 可用"**：`--fork` 开着，或者我们本身就在一个 fork 里——后一种
     # 必须让工具继续挂在表上，否则工具表前缀变了、缓存全废；能不能真的再 fork 由 `depth` 挡。
-    # 只有 core/fork.py 读它。
+    # 只有 core/subagent.py 的 fork 分支读它。
     #
     # 追加在**最后**：现有按位置构造 ToolContext 的地方（测试里那些）不受影响。
     fork: ForkContext | None = None

@@ -63,7 +63,7 @@ class TestAgentTypes:
         对不上的后果是**跑到一半才炸**：`build_subagent_prompt` 认不出那个名字会抛
         ValueError，而那时子 agent 已经派出去了、钱已经花了。所以在这儿钉死。
         """
-        assert set(AGENT_TYPES) == set(SUBAGENT_HEADS)
+        assert {name for name, t in AGENT_TYPES.items() if not t.fork} == set(SUBAGENT_HEADS)
 
     def test_the_key_is_the_name(self):
         """同一个名字写了两次（字典键和 `name` 字段）。冗余就会漂，所以钉一条。"""
@@ -108,10 +108,15 @@ class TestTheToolPool:
         另外 `registry.register()` 进去的，两者根本不相干。也就是说这条护栏靠"新增工具
         一律进 `default_tools()`"这个隐含约定撑着——所以它值得一条测试。
         """
-        for name in AGENT_TYPES:
-            assert "agent" not in names(AGENT_TYPES[name])
-            # fork 也是 harness 注入的，同样进不来；它另有运行时的深度护栏。
-            assert "fork" not in names(AGENT_TYPES[name])
+        for agent_type in AGENT_TYPES.values():
+            if agent_type.fork:
+                # fork 用的是父 agent 的工具表，不经过 _pool——它另有运行时的深度护栏。
+                with pytest.raises(ValueError, match="父 agent"):
+                    _pool(agent_type)
+                continue
+            assert "agent" not in names(agent_type)
+            # 以前那个独立的 fork 工具也不该借尸还魂。
+            assert "fork" not in names(agent_type)
 
     def test_no_type_can_ask_the_user(self):
         """子 agent 问不了用户：该问的事它写进总结、由主 agent 去问。
@@ -119,13 +124,17 @@ class TestTheToolPool:
         顺带这也是 `NobodyToAskError` 在子 agent 里触发不了的原因——那个只从
         `single_choice` 抛，而 `single_choice` 只有 `ask_user` 会调。
         """
-        for name in AGENT_TYPES:
-            assert "ask_user" not in names(AGENT_TYPES[name])
+        for agent_type in AGENT_TYPES.values():
+            if agent_type.fork:
+                continue  # 用的是父 agent 的工具表，不在这条断言的范围里
+            assert "ask_user" not in names(agent_type)
 
     def test_no_type_can_write_long_term_memory(self):
         """`remember` 是"以后每次会话都生效"的东西——该由知道整段对话的主 agent 来记。"""
-        for name in AGENT_TYPES:
-            assert "remember" not in names(AGENT_TYPES[name])
+        for agent_type in AGENT_TYPES.values():
+            if agent_type.fork:
+                continue
+            assert "remember" not in names(agent_type)
 
     def test_each_call_builds_a_fresh_registry(self):
         """池子是按类型现建的，不是共用一份——共用的话一个类型筛过，另一个类型就跟着变。"""
