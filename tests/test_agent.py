@@ -869,6 +869,65 @@ def test_the_usage_line_is_printed_for_every_request(capsys):
     assert "输入 1,000（原价 100 + 缓存命中 900）· 输出 250" in out
 
 
+def test_deferring_the_final_usage_keeps_it_out_of_runagents_output(capsys):
+    """调用方要先把答案打出来，再打这一行；所以 runagent 只把它放进结果里。"""
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                text="好",
+                assistant_content=[{"type": "text", "text": "好"}],
+                stop_reason="end_turn",
+                input_tokens=100,
+                output_tokens=250,
+                cache_read_input_tokens=900,
+            )
+        ]
+    )
+
+    result = runagent("问一句", provider, ToolRegistry([]), defer_final_usage=True)
+
+    assert "这一发 token" not in capsys.readouterr().out
+    assert result.final_usage is not None
+    assert "输入 1,000（原价 100 + 缓存命中 900）· 输出 250" in result.final_usage
+
+
+def test_tool_step_usage_still_prints_when_the_final_is_deferred(registry, capsys):
+    """工具步骤还没有答案，用量紧跟着那一发、在工具行之前——那条不能一起延后。"""
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="toolu_1", name="add", arguments={"a": 1, "b": 2})],
+                assistant_content=[
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "add",
+                        "input": {"a": 1, "b": 2},
+                    }
+                ],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=2,
+            ),
+            ModelResponse(
+                text="3",
+                assistant_content=[{"type": "text", "text": "3"}],
+                stop_reason="end_turn",
+                input_tokens=20,
+                output_tokens=1,
+            ),
+        ]
+    )
+
+    result = runagent("1+2", provider, registry, defer_final_usage=True)
+
+    out = capsys.readouterr().out
+    assert out.count("这一发 token") == 1
+    assert out.index("这一发 token") < out.index("→ add")
+    assert result.final_usage is not None
+    assert "输入 20" in result.final_usage
+
+
 def test_the_cache_write_shows_up_when_there_is_one(capsys):
     """cache_creation 是往缓存里新写的那部分。这个后端是自动前缀缓存，常态是 0——
     真写了就得看得见，那是要按更贵的价算的一笔。"""

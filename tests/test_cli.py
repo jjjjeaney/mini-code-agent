@@ -109,6 +109,16 @@ def test_the_loop_carries_the_conversation(monkeypatch, tmp_path):
     assert provider.calls[1][0]["content"] == "第一句"
 
 
+def test_the_answer_comes_before_the_usage_line(monkeypatch, tmp_path, capsys):
+    """流式和非流式统一：先把答案打出来，再打最终那一发的用量。"""
+    provider = ScriptedProvider([text_turn("答案", input_tokens=10)])
+
+    run_loop(monkeypatch, provider, ["你好", "/exit"], tmp_path)
+
+    out = capsys.readouterr().out
+    assert out.index("答案") < out.index("这一发 token")
+
+
 def test_the_system_prompt_goes_out_on_every_turn(monkeypatch, tmp_path):
     provider = ScriptedProvider([text_turn("嗯"), text_turn("嗯")])
 

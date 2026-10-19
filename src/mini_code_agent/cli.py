@@ -150,6 +150,15 @@ class _StreamWriter:
             pass
 
 
+def _print_usage(result: AgentResult) -> None:
+    """最终回答那一发的用量行——**在答案之后打**，流式和非流式顺序一致。
+
+    工具中间步骤的用量行不在这里：那些由 `send()` 立即输出，紧跟着的是工具调用行。
+    """
+    if result.final_usage:
+        console.print(result.final_usage, style="dim", markup=False)
+
+
 def _chat(
     provider: Provider,
     registry: ToolRegistry,
@@ -295,23 +304,28 @@ def _chat(
             on_text=writer,
             on_thinking=writer.thinking if show_thinking else None,
             wait_hint=writer,
+            # 最终答案先打出来，用量行再跟上——和非流式保持同一个顺序。
+            defer_final_usage=True,
         )
         absorb(result)
         if result.error:
             # 这一轮没能把请求发出去（网络、限流、配置……）。**会话不结束**——用户再发一次
             # 就行；上面那句已经把这一轮**已经发生过的**工具调用落盘了，不会白丢。
             typer.echo(f"这一轮没跑成：{result.error}", err=True)
+            _print_usage(result)
             return
         if result.final is None:
             typer.echo(
                 f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
                 err=True,
             )
+            _print_usage(result)
             return
         # 流式已经实时打印过就不再打一遍；`final_streamed` 只认最终回复，中间步骤的叙述
         # 文字不会把它置真（那些本来就不是 `result.final`）。
         if not result.final_streamed:
             console.print(f"\n{result.final}", markup=False)
+        _print_usage(result)
 
     def report_background() -> None:
         """后台任务完成了：让模型**自己开口**告诉用户。
@@ -351,13 +365,16 @@ def _chat(
             spill_dir=spill.session_dir(cwd, session.id),
             allow_fork=state.allow_fork,
             allow_background=False,
+            defer_final_usage=True,
         )
         absorb(result)
         if result.error:
             typer.echo(f"后台任务的汇报没发出去：{result.error}", err=True)
+            _print_usage(result)
             return
         if result.final is not None:
             console.print(f"\n{result.final}", markup=False)
+        _print_usage(result)
 
     ctx = CommandContext(
         console=console,
@@ -719,21 +736,25 @@ def main_command(
             on_text=writer,
             on_thinking=writer.thinking if show_thinking else None,
             wait_hint=writer,
+            defer_final_usage=True,
         )
         # 长度得在 history 被换掉之前取——和 _chat 里同一处道理。
         session.append(result.messages[len(history) :])
         if result.error:
             # 一次性模式没有"下一轮"，所以报错就退出——但退出码要是 1，别让脚本以为跑成了。
             typer.echo(f"这一轮没跑成：{result.error}", err=True)
+            _print_usage(result)
             raise typer.Exit(code=1)
         if result.final is None:
             typer.echo(
                 f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
                 err=True,
             )
+            _print_usage(result)
             raise typer.Exit(code=1)
         if not result.final_streamed:
             console.print(f"\n{result.final}", markup=False)
+        _print_usage(result)
         return
 
     _chat(

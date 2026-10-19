@@ -269,9 +269,10 @@ def test_a_transport_error_after_text_is_not_retried():
 class StreamingProvider:
     model = "fake"
 
-    def __init__(self, chunks=("你", "好"), thinking=()):
+    def __init__(self, chunks=("你", "好"), thinking=(), input_tokens=0):
         self.chunks = chunks
         self.thinking = thinking
+        self.input_tokens = input_tokens
         self.stream_calls: list[dict] = []
         self.complete_calls: list[dict] = []
 
@@ -288,6 +289,7 @@ class StreamingProvider:
             text=text,
             assistant_content=[{"type": "text", "text": text}],
             stop_reason="end_turn",
+            input_tokens=self.input_tokens,
         )
 
     def complete(self, messages, tools=None, system=None):
@@ -488,6 +490,29 @@ def test_the_cli_does_not_print_a_streamed_answer_twice(monkeypatch, tmp_path, c
 
     out = capsys.readouterr().out
     assert out.count("你好") == 1
+
+
+def test_a_streamed_answer_also_prints_usage_after_it(monkeypatch, tmp_path, capsys):
+    provider = StreamingProvider(chunks=("答", "案"), input_tokens=10)
+    answers = iter(["你好", "/exit"])
+    monkeypatch.setattr(cli.typer, "prompt", lambda *args, **kwargs: next(answers))
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+
+    cli._chat(
+        provider,
+        ToolRegistry([]),
+        session,
+        [],
+        cwd=tmp_path,
+        allow_shell=False,
+        permission_mode="default",
+        prompter=NullPrompter(),
+        grants=Grants(),
+        stream=True,
+    )
+
+    out = capsys.readouterr().out
+    assert out.index("答案") < out.index("这一发 token")
 
 
 def test_the_cli_can_show_thinking(monkeypatch, tmp_path, capsys):

@@ -85,6 +85,11 @@ class AgentResult:
     # CLI 靠它决定轮末还要不要 `console.print(result.final)`。
     final_streamed: bool = False
 
+    # 最终回答那一发的用量行。只有 `defer_final_usage=True` 时才会填——调用方要在**打印完
+    # 答案之后**再把它打出来，这样流式和非流式都是一个顺序：答案在前、用量在后。工具调用
+    # 中间步骤的用量仍然由 `send()` 立刻打印（那时还没有答案，紧跟着的是工具行）。
+    final_usage: str | None = None
+
 
 # 取消时写进 AgentResult.error 的那句。任务表拿它区分"用户取消"和"真出错"。
 CANCELLED_ERROR = "已取消"
@@ -303,7 +308,7 @@ def runagent(
     provider: Provider,
     registry: ToolRegistry | None = None,
     system: str | None = None,
-    max_steps: int = 8,
+    max_steps: int = 20,
     cwd: Path | None = None,
     allow_shell: bool = False,
     permission_mode: str = "default",
@@ -326,6 +331,7 @@ def runagent(
     on_text: OnText | None = None,
     on_thinking: OnText | None = None,
     wait_hint: WaitHint | None = None,
+    defer_final_usage: bool = False,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -383,6 +389,10 @@ def runagent(
     只有前台主 agent 该开流式：后台任务和子 agent 与前台共用终端，实时打字会互相插字。后台
     那一半交接时会强制关掉。`on_text` 为空时即使 `stream=True` 也走非流式。provider 没有
     `stream` 方法（测试假实现、别的后端）时同样回退。
+
+    `defer_final_usage=True` 时，最终回答那一发的用量行不在这里打，而是放进
+    `AgentResult.final_usage`，由调用方在打印完答案之后输出——这样流式和非流式都是
+    "答案在前、用量在后"。工具中间步骤的用量不受影响，仍然紧跟着那一发打印。
     """
     registry = registry if registry is not None else default_tools()
     # 新拼一份，别就地改调用方手里那份。**得在 ctx 之前**：fork 那份现场要用它（见 ForkContext）。
@@ -432,6 +442,7 @@ def runagent(
         on_text: OnText | None,
         on_thinking: OnText | None,
         wait_hint: WaitHint | None,
+        defer_final_usage: bool,
     ) -> AgentResult:
         """真正跑循环。前台和后台那一半走的是同一个函数，区别只在参数。
 
@@ -447,6 +458,8 @@ def runagent(
         # 最近一发请求有没有把**最终回答的正文**实时交出去。每发重置；thinking 不算——
         # 显示过推理过程不代表最终回答已经在屏幕上。
         last_text_shown = False
+        # 最终回答那一发的用量行；`defer_final_usage` 为真时交给调用方在答案之后打印。
+        pending_usage: str | None = None
 
         def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
             """发一发，顺手把这一发的用量打出来。
@@ -463,12 +476,13 @@ def runagent(
             384，见 known-issues 的 D5）。所以"只追加"是省钱的**前提**，而这一行代码正是那个前提
             的落点——别在这儿加变换。
             """
-            nonlocal anchor, last_text_shown
+            nonlocal anchor, last_text_shown, pending_usage
 
             if cancel is not None and cancel.is_set():
                 raise _Cancelled
 
             last_text_shown = False
+            pending_usage = None
             streamer = (
                 getattr(provider, "stream", None)
                 if stream and on_text is not None
@@ -536,7 +550,12 @@ def runagent(
                     ),
                     covered=len(sent),
                 )
-            emit(f"{label}（这一发 token：{_usage_note(response)}）", "dim")
+            usage = f"{label}（这一发 token：{_usage_note(response)}）"
+            if defer_final_usage and not response.tool_calls:
+                # 最终回答：先让调用方把答案打出来，再把这一行交出去。
+                pending_usage = usage
+            else:
+                emit(usage, "dim")
             return response
 
         def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
@@ -625,6 +644,9 @@ def runagent(
                             on_text=None,
                             on_thinking=None,
                             wait_hint=None,
+                            # 后台输出进的是缓冲区，没有"调用方打印答案"这一步——用量行
+                            # 必须现在就写进去，否则会丢。
+                            defer_final_usage=False,
                         )
 
                     task_id = handoff(continuation)
@@ -725,6 +747,7 @@ def runagent(
             messages=msgs,
             anchor=anchor,
             final_streamed=final_streamed,
+            final_usage=pending_usage,
         )
 
     return drive(
@@ -739,4 +762,5 @@ def runagent(
         on_text=on_text,
         on_thinking=on_thinking,
         wait_hint=wait_hint,
+        defer_final_usage=defer_final_usage,
     )
