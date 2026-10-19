@@ -21,3 +21,21 @@ jobs:
 
       # 真接口那组会花钱，CI 里明确排除；本地要跑的时候去掉这个参数。
       - run: uv run pytest --ignore=tests/test_anthropic_provider.py
+
+  windows:
+    # 同样的检查在 Windows 上再跑一遍：编码、路径、管道这些坑只在那边出现，
+    # Linux 上的绿灯说明不了那边没问题。
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - run: uv sync --frozen
+
+      - run: uv run ruff check src tests
+
+      - run: uv run pytest --ignore=tests/test_anthropic_provider.py

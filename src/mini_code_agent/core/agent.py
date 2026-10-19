@@ -29,6 +29,7 @@ from mini_code_agent.tools import (
     ToolResult,
     default_tools,
 )
+from mini_code_agent.usage import UsageMeter, UsageTotals
 
 # 瞬时故障（连不上、超时、限流、对面 5xx）**补一次**之前等多久。
 #
@@ -90,6 +91,11 @@ class AgentResult:
     # 中间步骤的用量仍然由 `send()` 立刻打印（那时还没有答案，紧跟着的是工具行）。
     final_usage: str | None = None
 
+    # 这一轮**所有请求**（含同步子 agent）的用量总和，已经格式化好。只有最终回答存在、
+    # 而且请求数大于 1 时才填——只有一发时 `final_usage` 本身就是总和，再打一遍是噪音。
+    # CLI 在 `final_usage` 之后打印它。
+    turn_usage: str | None = None
+
 
 # 取消时写进 AgentResult.error 的那句。任务表拿它区分"用户取消"和"真出错"。
 CANCELLED_ERROR = "已取消"
@@ -131,7 +137,7 @@ def _console_emit(text: str, style: str) -> None:
     console.print(text, style=style, markup=False)
 
 
-def _usage_note(response: ModelResponse) -> str:
+def _usage_note(response: ModelResponse | UsageTotals) -> str:
     """把这一发的用量写成一行。
 
     输入那三个数**不重叠**（见 ModelResponse 的注释）：input_tokens 是没走缓存的，cache_read
@@ -332,6 +338,7 @@ def runagent(
     on_thinking: OnText | None = None,
     wait_hint: WaitHint | None = None,
     defer_final_usage: bool = False,
+    usage: UsageMeter | None = None,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -393,6 +400,9 @@ def runagent(
     `defer_final_usage=True` 时，最终回答那一发的用量行不在这里打，而是放进
     `AgentResult.final_usage`，由调用方在打印完答案之后输出——这样流式和非流式都是
     "答案在前、用量在后"。工具中间步骤的用量不受影响，仍然紧跟着那一发打印。
+
+    `usage` 是这一轮任务的记账器；不传就新建一个。子 agent 通过 `ToolContext.usage` 拿到
+    同一个对象，所以 `AgentResult.turn_usage`（"本次任务共 N 发"）能算上它们。
     """
     registry = registry if registry is not None else default_tools()
     # 新拼一份，别就地改调用方手里那份。**得在 ctx 之前**：fork 那份现场要用它（见 ForkContext）。
@@ -416,6 +426,7 @@ def runagent(
         permission_mode=permission_mode,
         fork=fork_ctx,
         allow_background=allow_background,
+        usage=usage,
     )
     tools = tool_schemas if tool_schemas is not None else registry.schemas(ctx)
     if fork_ctx is not None:
@@ -424,6 +435,7 @@ def runagent(
     # prompter 不放进 ctx：问用户不是工具的能力，确认是这一层在调工具之前发的。
     prompter = prompter if prompter is not None else NullPrompter()
     grants = grants if grants is not None else Grants()
+    usage = usage if usage is not None else UsageMeter()
     output: Emit = emit if emit is not None else _console_emit
     # 两分钟从**这一轮开始**算，不是从交接那一刻。排队、压缩都不在里头——runagent 一进
     # 来就是干活的起点。
@@ -443,13 +455,14 @@ def runagent(
         on_thinking: OnText | None,
         wait_hint: WaitHint | None,
         defer_final_usage: bool,
+        usage: UsageMeter,
     ) -> AgentResult:
         """真正跑循环。前台和后台那一半走的是同一个函数，区别只在参数。
 
         `allow_handoff` 为 False 时不再二次交接——后台的不能再把自己转手出去。
         `notices` 只有主 agent 传：子 agent 不该吞掉主 agent 的后台通知。
         `stream` / `on_text` / `on_thinking` / `wait_hint` 只在前台传；后台那一半固定关掉
-        （见 continuation）。
+        （见 continuation）。`usage` 前后台共用同一个对象——后台续跑的请求也算进这一轮。
         """
         trace: list[str] = []
         final: str | None = None
@@ -532,6 +545,7 @@ def runagent(
                         on_text("\n")
                     if wait_hint is not None:
                         wait_hint.end()
+            usage.record(response)
             used = (
                 response.input_tokens,
                 response.output_tokens,
@@ -550,12 +564,12 @@ def runagent(
                     ),
                     covered=len(sent),
                 )
-            usage = f"{label}（这一发 token：{_usage_note(response)}）"
+            usage_line = f"{label}（这一发 token：{_usage_note(response)}）"
             if defer_final_usage and not response.tool_calls:
                 # 最终回答：先让调用方把答案打出来，再把这一行交出去。
-                pending_usage = usage
+                pending_usage = usage_line
             else:
-                emit(usage, "dim")
+                emit(usage_line, "dim")
             return response
 
         def ask(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
@@ -647,6 +661,8 @@ def runagent(
                             # 后台输出进的是缓冲区，没有"调用方打印答案"这一步——用量行
                             # 必须现在就写进去，否则会丢。
                             defer_final_usage=False,
+                            # 后台续跑的请求也算进这一轮（子 agent 的 meter 是同一个）。
+                            usage=usage,
                         )
 
                     task_id = handoff(continuation)
@@ -741,6 +757,12 @@ def runagent(
             return AgentResult(
                 final=None, trace=trace, messages=msgs, error=str(exc), anchor=anchor
             )
+        totals = usage.snapshot()
+        turn_usage = (
+            f"{label}（本次任务共 {totals.requests} 发：{_usage_note(totals)}）"
+            if final is not None and totals.requests > 1
+            else None
+        )
         return AgentResult(
             final=final,
             trace=trace,
@@ -748,6 +770,7 @@ def runagent(
             anchor=anchor,
             final_streamed=final_streamed,
             final_usage=pending_usage,
+            turn_usage=turn_usage,
         )
 
     return drive(
@@ -763,4 +786,5 @@ def runagent(
         on_thinking=on_thinking,
         wait_hint=wait_hint,
         defer_final_usage=defer_final_usage,
+        usage=usage,
     )

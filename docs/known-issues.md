@@ -392,10 +392,12 @@ $ bash: echo 'KEY=clobbered' > /workspace/.env
 
 **后果**：拿测试做信号去 `git bisect` 那一段，会指到错误的提交。这一段之后没问题。
 
-### E4. 没有 CI —— 已处理（2026-10-18）
+### E4. 没有 CI —— 已处理（2026-10-18，2026-10-19 加 Windows）
 
-`.github/workflows/ci.yml`：push / pull_request 时跑 `uv sync --frozen`、`ruff check`、`pytest`
-（明确排除要花钱的真接口那组）。加 CI 能挡住 E2 那种"验证没跑成却以为跑了"的事。
+`.github/workflows/ci.yml`：push / pull_request 时在 **Ubuntu 和 Windows 两台机器上**各跑一遍
+`uv sync --frozen`、`ruff check`、`pytest`（明确排除要花钱的真接口那组）。加 CI 能挡住 E2
+那种"验证没跑成却以为跑了"的事；加 Windows 那台是因为编码、路径、管道这些坑只在那边出现
+（E6 就是例子），Linux 上的绿灯说明不了 Windows 没问题。
 
 ### E5. 根目录的 `main.py` 和 `notebook/` 不在检查范围内 —— 取舍
 
@@ -938,3 +940,16 @@ cancel` 让它在下一步之前停下（正在跑的命令不会被硬杀，见
 **为什么不在 `runagent` 里统一延后**：子 agent 和后台任务的最终答案不是 `runagent` 打印的
 （子 agent 的结论作为工具结果回给主 agent，后台输出进缓冲区），强行延后会让那一行没人打印。
 默认 `defer_final_usage=False` 保留原来的时机，只有知道"答案会由我打印"的调用方才打开。
+
+### K9. 轮末用量合计的范围 —— 设计（2026-10-19）
+
+**怎么记**：`runagent` 每轮新建一个 `UsageMeter`（usage.py），`send()` 每发真请求记一笔；
+子 agent 通过 `ToolContext.usage` 拿到同一个对象，所以同一轮里同步跑完的子 agent 也算进
+合计。轮末 `AgentResult.turn_usage` 带着格式化好的"本次任务共 N 发"。
+
+**什么时候打**：只有最终回答存在、而且 `N > 1` 时才打。只发了一发时，那一发的用量就是
+总和，再打一行是噪音。
+
+**不算进来的**：交接给后台之后才产生的请求。主 agent 在交接点就返回了（那时还没有 final，
+所以那一轮本来也不打合计）；后台任务自己的合并没有人打印，只有它每发的用量行留在任务缓冲
+里。**只算 token**，和逐发那行一样，不换算金额。

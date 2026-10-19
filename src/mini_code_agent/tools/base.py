@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mini_code_agent.usage import UsageMeter
+
 
 @dataclass
 class ReadFileState:
@@ -171,6 +173,12 @@ class ToolContext:
     # 和 `allow_shell` / `fork` 一样是**环境**，不是能力：一次性模式没有下一轮可以送结果，
     # 所以那边是 False。
     allow_background: bool = False
+
+    # 这一轮任务的 token 记账（见 usage.py）。**只有 `agent` 工具读它**：子 agent 要和
+    # 主 agent 记进同一本账，结尾的"本次任务共 N 发"才算得全。普通工具不碰。
+    #
+    # 追加在最后，按位置构造 ToolContext 的测试不受影响。
+    usage: UsageMeter | None = None
 
 
 def _always_available(_: ToolContext) -> bool:

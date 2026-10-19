@@ -119,6 +119,36 @@ def test_the_answer_comes_before_the_usage_line(monkeypatch, tmp_path, capsys):
     assert out.index("答案") < out.index("这一发 token")
 
 
+def test_a_tool_turn_ends_with_its_total(monkeypatch, tmp_path, capsys):
+    """一轮里有多发时，最后再打一行"本次任务共 N 发"的总和。"""
+
+    def echo(kwargs, ctx):
+        return "ok"
+
+    registry = ToolRegistry([Tool(name="echo", description="", fn=echo)])
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="t1", name="echo", arguments={})],
+                assistant_content=[
+                    {"type": "tool_use", "id": "t1", "name": "echo", "input": {}}
+                ],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=2,
+            ),
+            text_turn("答案", input_tokens=20),
+        ]
+    )
+
+    run_loop(monkeypatch, provider, ["你好", "/exit"], tmp_path, registry=registry)
+
+    out = capsys.readouterr().out
+    assert "本次任务共 2 发" in out
+    # 答案之后是先这一发、再总和；工具那一步的用量行还在更前面。
+    assert out.index("答案") < out.rindex("这一发 token") < out.index("本次任务共 2 发")
+
+
 def test_the_system_prompt_goes_out_on_every_turn(monkeypatch, tmp_path):
     provider = ScriptedProvider([text_turn("嗯"), text_turn("嗯")])
 

@@ -25,6 +25,7 @@ from mini_code_agent.prompts import Answer, BackgroundPrompter, NullPrompter
 from mini_code_agent.providers.base import ModelResponse, ProviderError, ToolCall
 from mini_code_agent.system_prompt import _SUBAGENT_STATIC, SUBAGENT_HEADS
 from mini_code_agent.tools import Tool, ToolContext
+from mini_code_agent.usage import UsageMeter
 
 
 def names(agent_type: AgentType) -> set[str]:
@@ -352,6 +353,28 @@ class TestRunningASubagent:
         assert "没有名为" in text
         assert "explore" in text  # 把可选的列出来，它才知道该改成什么
         assert provider.calls == []  # 一发都没发出去
+
+    def test_its_requests_go_into_the_parents_turn_meter(self, tmp_path):
+        """子 agent 花的是另一串请求，但记的是主 agent 这一轮的账。"""
+        meter = UsageMeter()
+        provider = ScriptedProvider(
+            [
+                ModelResponse(
+                    text="结论",
+                    assistant_content=[{"type": "text", "text": "结论"}],
+                    stop_reason="end_turn",
+                    input_tokens=10,
+                    output_tokens=2,
+                )
+            ]
+        )
+
+        call_the_tool(the_tool(provider), ToolContext(cwd=tmp_path, usage=meter))
+
+        totals = meter.snapshot()
+        assert totals.requests == 1
+        assert totals.input_tokens == 10
+        assert totals.output_tokens == 2
 
     def test_an_empty_prompt_is_refused(self, tmp_path):
         with pytest.raises(ValueError, match="非空"):

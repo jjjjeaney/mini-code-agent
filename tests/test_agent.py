@@ -928,6 +928,61 @@ def test_tool_step_usage_still_prints_when_the_final_is_deferred(registry, capsy
     assert "输入 20" in result.final_usage
 
 
+def test_a_multi_request_turn_reports_its_total(registry):
+    """一轮里发了两次（工具 + 最终回答），结尾要把两发加起来。"""
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="toolu_1", name="add", arguments={"a": 1, "b": 2})],
+                assistant_content=[
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "add",
+                        "input": {"a": 1, "b": 2},
+                    }
+                ],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=2,
+            ),
+            ModelResponse(
+                text="3",
+                assistant_content=[{"type": "text", "text": "3"}],
+                stop_reason="end_turn",
+                input_tokens=20,
+                output_tokens=1,
+                cache_read_input_tokens=5,
+            ),
+        ]
+    )
+
+    result = runagent("1+2", provider, registry)
+
+    assert result.turn_usage is not None
+    assert "本次任务共 2 发" in result.turn_usage
+    assert "输入 35（原价 30 + 缓存命中 5）· 输出 3" in result.turn_usage
+
+
+def test_a_single_request_turn_does_not_repeat_the_total():
+    """只有一发时，这一发的用量就是总和，再打一行是噪音。"""
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                text="好",
+                assistant_content=[{"type": "text", "text": "好"}],
+                stop_reason="end_turn",
+                input_tokens=10,
+                output_tokens=2,
+            )
+        ]
+    )
+
+    result = runagent("问一句", provider, ToolRegistry([]))
+
+    assert result.turn_usage is None
+
+
 def test_the_cache_write_shows_up_when_there_is_one(capsys):
     """cache_creation 是往缓存里新写的那部分。这个后端是自动前缀缓存，常态是 0——
     真写了就得看得见，那是要按更贵的价算的一笔。"""

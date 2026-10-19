@@ -151,12 +151,15 @@ class _StreamWriter:
 
 
 def _print_usage(result: AgentResult) -> None:
-    """最终回答那一发的用量行——**在答案之后打**，流式和非流式顺序一致。
+    """最终回答之后的用量：先这一发，再这一轮所有请求的合计。
 
-    工具中间步骤的用量行不在这里：那些由 `send()` 立即输出，紧跟着的是工具调用行。
+    工具中间步骤的用量行不在这里：那些由 `send()` 立即输出，紧跟着的是工具调用行。合计
+    只有多发一轮才打——只有一发时它和上面那行完全一样。
     """
     if result.final_usage:
         console.print(result.final_usage, style="dim", markup=False)
+    if result.turn_usage:
+        console.print(result.turn_usage, style="dim", markup=False)
 
 
 def _chat(
