@@ -14,6 +14,7 @@ from mini_code_agent.core.subagent import (
     AGENT_SCHEMA,
     AGENT_TYPES,
     AgentType,
+    _fork_task_message,
     _LabeledPrompter,
     _pool,
     _tally,
@@ -339,6 +340,15 @@ class TestTheAgentToolShape:
         标它，折叠那边按 `Tool.foldable` 筛，自然落在外面（见 folding.py）。
         """
         assert the_tool(ScriptedProvider([])).foldable is False
+
+
+class TestTheForkTaskMessage:
+    def test_it_states_the_result_format(self):
+        """fork 继承父 agent 的 system prompt，没法在里面加格式——只能写进追加的任务消息。"""
+        text = _fork_task_message("做点什么")
+
+        for section in ("【做了什么】", "【改了哪些文件】", "【验证结果】", "【遗留问题】"):
+            assert section in text
 
 
 class TestRunningASubagent:

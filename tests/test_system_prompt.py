@@ -522,6 +522,24 @@ class TestSubagentPrompt:
         for name, head in SUBAGENT_HEADS.items():
             assert head in build_subagent_prompt(tmp_path, name, "default")
 
+    def test_each_type_states_its_result_format(self, tmp_path):
+        """主 agent 只拿到最后那段文本，所以格式得固定下来；它不该猜结论在哪。"""
+        expected = {
+            "general-purpose": (
+                "【做了什么】",
+                "【改了哪些文件】",
+                "【验证结果】",
+                "【遗留问题】",
+            ),
+            "explore": ("【结论】", "【证据】", "【没找到什么】"),
+            "plan": ("【方案】", "【关键现状】", "【验证方式】", "【风险与取舍】"),
+        }
+
+        for name, sections in expected.items():
+            text = build_subagent_prompt(tmp_path, name, "default")
+            for section in sections:
+                assert section in text
+
     def test_the_sections_keep_the_main_agents_order(self, repo):
         """静态头 -> 类型那段 -> 这次运行的实情 -> 档位 -> 项目那几段。
 
