@@ -397,6 +397,7 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
             list_=True,
             delete_="",
             stream=False,
+            show_thinking=False,
         )
 
     out = capsys.readouterr().out
@@ -433,6 +434,7 @@ def run_delete(tmp_path, session_id: str, *, yes: bool) -> None:
             delete_=session_id,
             yes=yes,
             stream=False,
+            show_thinking=False,
         )
 
 
@@ -499,6 +501,7 @@ def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
             delete_="20200101-000000",
             yes=True,
             stream=False,
+            show_thinking=False,
         )
 
 
@@ -585,6 +588,7 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
         list_=False,
         delete_="",
         stream=False,
+        show_thinking=False,
     )
 
     offered = {schema["name"] for schema in provider.tools or []}
@@ -622,6 +626,7 @@ def test_the_model_option_reaches_the_provider(monkeypatch, tmp_path, capsys):
             list_=False,
             delete_="",
             stream=False,
+            show_thinking=False,
         )
 
     run(model="deepseek-v4-pro")
@@ -657,6 +662,7 @@ def test_the_endpoint_options_reach_the_provider(monkeypatch, tmp_path, capsys):
             list_=False,
             delete_="",
             stream=False,
+            show_thinking=False,
         )
 
     run(api_key="sk-test", base_url="https://example.test")
@@ -690,6 +696,7 @@ def test_fork_is_a_type_of_the_agent_tool_in_both_cases(monkeypatch, tmp_path, c
             list_=False,
             delete_="",
             stream=False,
+            show_thinking=False,
         )
         agent = next(schema for schema in provider.tools or [] if schema["name"] == "agent")
         return set(agent["input_schema"]["properties"]["type"]["enum"])
@@ -980,6 +987,7 @@ def test_the_one_shot_path_persists_before_folding(monkeypatch, tmp_path):
         list_=False,
         delete_="",
         stream=False,
+        show_thinking=False,
     )
 
     assert (spill.session_dir(tmp_path, session.id) / "t0.txt").is_file()

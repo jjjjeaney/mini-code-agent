@@ -101,18 +101,53 @@ def _persister(cwd: Path, session: Session) -> PersistText:
     return persist
 
 
-def _write_chunk(chunk: str) -> None:
-    """流式正文的一段：**不换行、不解析样式、不做 emoji 替换**，写完立刻 flush。
+class _StreamWriter:
+    """流式输出的终端写入器：正文、thinking，以及"等第一个 token"的提示。
 
-    `emoji=False` 不是洁癖：Rich 默认会把正文里的 `:word:` 换成表情，代码和路径里出现这种
-    片段时就被静默改了。flush 是为了让每段 delta 真的马上出现在终端上——Rich 的 `print`
-    不做这件事。
+    `begin()` / `end()` 实现 agent 的 `WaitHint`；`__call__` 是正文；`thinking` 是推理。
+    等待提示只在真终端上显示，并且用 `\\r` 擦掉——重定向到文件时不能留下控制字符。
     """
-    console.print(chunk, end="", markup=False, highlight=False, emoji=False)
-    try:
-        console.file.flush()
-    except (AttributeError, OSError):
-        pass
+
+    _HINT = "（等待模型输出…）"
+
+    def __init__(self) -> None:
+        self._waiting = False
+
+    def begin(self) -> None:
+        if not console.is_terminal:
+            return
+        self._waiting = True
+        console.print(self._HINT, end="\r", style="dim", markup=False, emoji=False)
+        self._flush()
+
+    def end(self) -> None:
+        self._clear()
+
+    def __call__(self, chunk: str) -> None:
+        self._clear()
+        console.print(chunk, end="", markup=False, highlight=False, emoji=False)
+        self._flush()
+
+    def thinking(self, chunk: str) -> None:
+        self._clear()
+        console.print(
+            chunk, end="", style="dim", markup=False, highlight=False, emoji=False
+        )
+        self._flush()
+
+    def _clear(self) -> None:
+        if not self._waiting:
+            return
+        self._waiting = False
+        # 40 个空格足够盖住那行提示（提示本身约 16 列）。
+        console.print("\r" + " " * 40 + "\r", end="", markup=False, emoji=False)
+        self._flush()
+
+    def _flush(self) -> None:
+        try:
+            console.file.flush()
+        except (AttributeError, OSError):
+            pass
 
 
 def _chat(
@@ -131,6 +166,7 @@ def _chat(
     tasks: TaskManager | None = None,
     broker: PermissionBroker | None = None,
     stream: bool = False,
+    show_thinking: bool = False,
 ) -> None:
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
@@ -159,6 +195,8 @@ def _chat(
     # 其中哪些"重跑拿不回来"、折之前得先落一份（见 fold_persist_names）。
     fold_persist = registry.fold_persist_names()
     persist = _persister(cwd, session)
+    # 流式输出共用一个写入器：等待提示的状态（有没有显示、要不要擦）跨多次 runagent 调用。
+    writer = _StreamWriter()
 
     def size_now() -> int:
         """这段历史现在有多大（token）——有锚点就用锚点，没有就按字符粗估。"""
@@ -254,7 +292,9 @@ def _chat(
             allow_background=True,
             notices=tasks.take_notices if tasks is not None else None,
             stream=stream,
-            on_text=_write_chunk,
+            on_text=writer,
+            on_thinking=writer.thinking if show_thinking else None,
+            wait_hint=writer,
         )
         absorb(result)
         if result.error:
@@ -524,6 +564,11 @@ def main_command(
         "--stream",
         help="实时打印模型正文（只影响前台回合；后台任务和子 agent 不流式）",
     ),
+    show_thinking: bool = typer.Option(
+        False,
+        "--show-thinking",
+        help="把模型的推理过程也用 dim 显示出来（隐含打开 --stream）",
+    ),
     permission_mode: str = typer.Option(
         "default",
         "--permission_mode",
@@ -543,6 +588,8 @@ def main_command(
 ) -> None:
     """把指令交给 agent，把最终回复打印到标准输出。"""
     prompt = prompt.strip()
+    # 推理只有流式拿得到；单独开这个开关就是"要看过程"，隐含打开流式。
+    stream = stream or show_thinking
     if list_:
         # 只看不做的活儿，排在所有检查和构造之前：它连 provider 都不需要，所以没有 API key
         # 也跑得起来，一个打错的档位也不该把一次列目录拦下。
@@ -652,6 +699,7 @@ def main_command(
             size=context_size(history, tokens=None),
             window=window_for(provider.model),
         )
+        writer = _StreamWriter()
         result = runagent(
             prompt,
             provider,
@@ -668,7 +716,9 @@ def main_command(
             spill_dir=spill.session_dir(workdir, session.id),
             allow_fork=fork,
             stream=stream,
-            on_text=_write_chunk,
+            on_text=writer,
+            on_thinking=writer.thinking if show_thinking else None,
+            wait_hint=writer,
         )
         # 长度得在 history 被换掉之前取——和 _chat 里同一处道理。
         session.append(result.messages[len(history) :])
@@ -703,6 +753,7 @@ def main_command(
         tasks=tasks,
         broker=broker,
         stream=stream,
+        show_thinking=show_thinking,
     )
     print("bye")
 

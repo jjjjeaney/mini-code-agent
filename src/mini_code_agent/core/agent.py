@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from mini_code_agent.console import console
 from mini_code_agent.interaction import ask_permission
@@ -96,6 +96,19 @@ Emit = Callable[[str, str], None]
 # 流式正文往哪儿写：只收一段文字，不加换行、不上色。和 Emit 分开，因为它的调用频率是
 # 每个 delta 一次（一次回复可能上百次），不能走 console.print 那种整行渲染。
 OnText = Callable[[str], None]
+
+
+class WaitHint(Protocol):
+    """流式请求开始/结束时各叫一次。"等第一个 token"长什么样由调用方决定。
+
+    放在 agent 层是因为只有它知道"请求刚发出去、还没有任何输出"这个窗口；CLI 那边实现成
+    一行会被擦掉的提示，测试里可以是一个只记调用的假对象。
+    """
+
+    def begin(self) -> None: ...
+
+    def end(self) -> None: ...
+
 
 # 后台那一半的工作函数：收（往哪儿打、怎么取消），返回它自己那段的 AgentResult。
 BackWork = Callable[[Emit, threading.Event], "AgentResult"]
@@ -311,6 +324,8 @@ def runagent(
     background_prompter: Callable[[threading.Event], Prompter] | None = None,
     stream: bool = False,
     on_text: OnText | None = None,
+    on_thinking: OnText | None = None,
+    wait_hint: WaitHint | None = None,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -362,8 +377,11 @@ def runagent(
 
     **流式输出**（`stream=True` + `on_text`）：模型正文边生成边交给 `on_text`，但循环拿到
     的 `ModelResponse` 仍然来自完整消息——历史回填、工具调用、用量、stop_reason 一样不少。
-    只有前台主 agent 该开：后台任务和子 agent 与前台共用终端，实时打字会互相插字。后台那一
-    半交接时会强制关掉。`on_text` 为空时即使 `stream=True` 也走非流式。provider 没有
+    `on_thinking` 可选：传了就把推理过程也实时交出去，和正文之间自动隔一个换行。
+    `wait_hint` 可选：请求发出到第一个 token 之间调 `begin()`，请求结束（成功、失败、
+    thinking/正文已开始）后调 `end()`，给"等待提示"一个准确的窗口。
+    只有前台主 agent 该开流式：后台任务和子 agent 与前台共用终端，实时打字会互相插字。后台
+    那一半交接时会强制关掉。`on_text` 为空时即使 `stream=True` 也走非流式。provider 没有
     `stream` 方法（测试假实现、别的后端）时同样回退。
     """
     registry = registry if registry is not None else default_tools()
@@ -412,20 +430,23 @@ def runagent(
         notices: Callable[[], str | None] | None,
         stream: bool,
         on_text: OnText | None,
+        on_thinking: OnText | None,
+        wait_hint: WaitHint | None,
     ) -> AgentResult:
         """真正跑循环。前台和后台那一半走的是同一个函数，区别只在参数。
 
         `allow_handoff` 为 False 时不再二次交接——后台的不能再把自己转手出去。
         `notices` 只有主 agent 传：子 agent 不该吞掉主 agent 的后台通知。
-        `stream` / `on_text` 只在前台传；后台那一半固定关掉（见 continuation）。
+        `stream` / `on_text` / `on_thinking` / `wait_hint` 只在前台传；后台那一半固定关掉
+        （见 continuation）。
         """
         trace: list[str] = []
         final: str | None = None
         final_streamed = False
         anchor: ContextAnchor | None = None
-        # 最近一发请求有没有把正文实时交出去。每发重置；只在"最终回复"那个分支抄进
-        # final_streamed——中间步骤的叙述文字不算，那时 final 还没定。
-        last_shown = False
+        # 最近一发请求有没有把**最终回答的正文**实时交出去。每发重置；thinking 不算——
+        # 显示过推理过程不代表最终回答已经在屏幕上。
+        last_text_shown = False
 
         def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
             """发一发，顺手把这一发的用量打出来。
@@ -442,12 +463,12 @@ def runagent(
             384，见 known-issues 的 D5）。所以"只追加"是省钱的**前提**，而这一行代码正是那个前提
             的落点——别在这儿加变换。
             """
-            nonlocal anchor, last_shown
+            nonlocal anchor, last_text_shown
 
             if cancel is not None and cancel.is_set():
                 raise _Cancelled
 
-            last_shown = False
+            last_text_shown = False
             streamer = (
                 getattr(provider, "stream", None)
                 if stream and on_text is not None
@@ -457,22 +478,46 @@ def runagent(
                 response = provider.complete(sent, **kwargs)
             else:
                 started = False
+                last_kind: str | None = None
 
-                def handle(chunk: str) -> None:
-                    nonlocal last_shown, started
+                def start(kind: str) -> None:
+                    nonlocal started, last_kind
                     if not started:
                         # 和轮末 `console.print(f"\n{final}")` 那个空行对齐。
                         on_text("\n")
                         started = True
-                    last_shown = True
+                    elif last_kind != kind:
+                        # thinking 和正文之间隔一行，否则 dim 的推理会和回答粘在一起。
+                        on_text("\n")
+                    last_kind = kind
+
+                def handle_text(chunk: str) -> None:
+                    nonlocal last_text_shown
+                    start("text")
+                    last_text_shown = True
                     on_text(chunk)
 
+                def handle_thinking(chunk: str) -> None:
+                    start("thinking")
+                    on_thinking(chunk)
+
                 try:
-                    response = streamer(sent, **kwargs, on_text=handle)
+                    if wait_hint is not None:
+                        wait_hint.begin()
+                    response = streamer(
+                        sent,
+                        **kwargs,
+                        on_text=handle_text,
+                        on_thinking=(
+                            handle_thinking if on_thinking is not None else None
+                        ),
+                    )
                 finally:
                     # 异常路径也要收尾：否则后面的用量行、错误消息会粘在正文末尾。
                     if started:
                         on_text("\n")
+                    if wait_hint is not None:
+                        wait_hint.end()
             used = (
                 response.input_tokens,
                 response.output_tokens,
@@ -578,6 +623,8 @@ def runagent(
                             # 提示符上输入。后台一律不流式。
                             stream=False,
                             on_text=None,
+                            on_thinking=None,
+                            wait_hint=None,
                         )
 
                     task_id = handoff(continuation)
@@ -595,7 +642,7 @@ def runagent(
                     final = response.text
                     if final is not None:
                         trace.append(final)
-                        final_streamed = last_shown
+                        final_streamed = last_text_shown
                         # 这一条也要进 messages：不然 result.messages 结尾是用户那侧，拿它接着聊就
                         # 丢了模型最后说的话。
                         msgs.append({"role": "assistant", "content": response.assistant_content})
@@ -652,7 +699,7 @@ def runagent(
                 final = response.text
                 if final is not None:
                     trace.append(final)
-                    final_streamed = last_shown
+                    final_streamed = last_text_shown
                     msgs.append({"role": "assistant", "content": response.assistant_content})
         except _Cancelled:
             return AgentResult(
@@ -690,4 +737,6 @@ def runagent(
         notices=notices,
         stream=stream,
         on_text=on_text,
+        on_thinking=on_thinking,
+        wait_hint=wait_hint,
     )

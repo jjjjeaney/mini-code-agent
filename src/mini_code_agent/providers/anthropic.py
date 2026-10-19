@@ -232,11 +232,16 @@ class AnthropicProvider:
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
         on_text: Callable[[str], None] | None = None,
+        on_thinking: Callable[[str], None] | None = None,
     ) -> ModelResponse:
         """发一次流式请求：正文边生成边交给 `on_text`，结果仍然以完整消息为准。
 
         **终端显示和程序使用是两回事**：`on_text` 只负责把 delta 写出去；历史回填、工具
         调用、用量、stop_reason 全部来自 `get_final_message()`，和非流式路径共用 `_normalize`。
+
+        `on_thinking` 收的是模型的推理过程（`thinking_delta`），和正文分开：默认不显示，
+        调用方想显示就传进来。两者都算"已经显示过"——显示过一部分后连 thinking 也不能
+        重发，否则屏幕上会重复一遍。
 
         几条定下来的：
 
@@ -261,10 +266,21 @@ class AnthropicProvider:
         shown = False
         try:
             with self.client.messages.stream(**kwargs) as live:
-                for chunk in live.text_stream:
-                    if on_text is not None:
-                        shown = True
-                        on_text(chunk)
+                # 遍历原始事件而不是 `text_stream`：后者只吐正文，thinking 拿不到。派生事件
+                # （text / thinking / input_json）也在这条迭代里，但它们的 type 不是
+                # content_block_delta，下面会跳过。
+                for event in live:
+                    if event.type != "content_block_delta":
+                        continue
+                    delta = event.delta
+                    if delta.type == "thinking_delta":
+                        if on_thinking is not None:
+                            shown = True
+                            on_thinking(delta.thinking)
+                    elif delta.type == "text_delta":
+                        if on_text is not None:
+                            shown = True
+                            on_text(delta.text)
                 try:
                     response = live.get_final_message()
                 except AssertionError as exc:

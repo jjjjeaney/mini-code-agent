@@ -52,20 +52,30 @@ def _tool(call_id="t1", name="read_file", arguments=None) -> SimpleNamespace:
 
 
 class FakeStream:
-    """够 provider 用的最小流：text_stream + get_final_message。"""
+    """够 provider 用的最小流：逐条给出 content_block_delta，最后给完整消息。
+
+    `chunks` 里的元素可以是字符串（正文）或 `("thinking", "…")` 这样的二元组。
+    """
 
     def __init__(self, chunks, final, *, fail_after=None, error=None):
         self._chunks = list(chunks)
         self._final = final
         self._fail_after = fail_after
         self._error = error
-        self.text_stream = self._generate()
+        self._iterator = self._generate()
+
+    def __iter__(self):
+        return self._iterator
 
     def _generate(self):
         for index, chunk in enumerate(self._chunks):
             if self._error is not None and index == self._fail_after:
                 raise self._error
-            yield chunk
+            kind, text = chunk if isinstance(chunk, tuple) else ("text", chunk)
+            yield SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(type=f"{kind}_delta", **{kind: text}),
+            )
         if (
             self._error is not None
             and self._fail_after is not None
@@ -139,6 +149,22 @@ def test_thinking_and_tool_blocks_are_kept_but_not_printed():
         "tool_use",
     ]
     assert response.tool_calls[0].name == "read_file"
+
+
+def test_thinking_deltas_go_to_their_own_callback():
+    final = _final([_thinking("想一下"), _text("好的")])
+    provider = provider_with(
+        FakeMessages(FakeStream([("thinking", "想一下"), "好的"], final))
+    )
+    thinking: list[str] = []
+    text: list[str] = []
+
+    response = provider.stream([], on_text=text.append, on_thinking=thinking.append)
+
+    assert thinking == ["想一下"]
+    assert text == ["好的"]
+    assert response.text == "好的"
+    assert response.assistant_content[0]["thinking"] == "想一下"
 
 
 def test_a_tool_only_response_prints_nothing():
@@ -243,13 +269,17 @@ def test_a_transport_error_after_text_is_not_retried():
 class StreamingProvider:
     model = "fake"
 
-    def __init__(self, chunks=("你", "好")):
+    def __init__(self, chunks=("你", "好"), thinking=()):
         self.chunks = chunks
+        self.thinking = thinking
         self.stream_calls: list[dict] = []
         self.complete_calls: list[dict] = []
 
-    def stream(self, messages, tools=None, system=None, on_text=None):
+    def stream(self, messages, tools=None, system=None, on_text=None, on_thinking=None):
         self.stream_calls.append({"tools": tools, "system": system})
+        if on_thinking is not None:
+            for chunk in self.thinking:
+                on_thinking(chunk)
         if on_text is not None:
             for chunk in self.chunks:
                 on_text(chunk)
@@ -294,6 +324,92 @@ def test_the_agent_streams_the_foreground_turn():
     assert seen == ["\n", "你", "好", "\n"]
     assert result.final == "你好"
     assert result.final_streamed is True
+
+
+def test_thinking_is_shown_before_the_answer():
+    provider = StreamingProvider(chunks=("好",), thinking=("想",))
+    text: list[str] = []
+    thinking: list[str] = []
+
+    result = runagent(
+        "hi",
+        provider,
+        ToolRegistry([]),
+        stream=True,
+        on_text=text.append,
+        on_thinking=thinking.append,
+    )
+
+    assert thinking == ["想"]
+    # 开头一个换行、thinking→正文切换一个换行、正文、结尾一个换行。
+    assert text == ["\n", "\n", "好", "\n"]
+    assert result.final == "好"
+    assert result.final_streamed is True
+
+
+class RecordingHint:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def begin(self):
+        self.calls.append("begin")
+
+    def end(self):
+        self.calls.append("end")
+
+
+def test_the_wait_hint_brackets_a_streamed_request():
+    hint = RecordingHint()
+
+    runagent(
+        "hi",
+        StreamingProvider(),
+        ToolRegistry([]),
+        stream=True,
+        on_text=lambda chunk: None,
+        wait_hint=hint,
+    )
+
+    assert hint.calls == ["begin", "end"]
+
+
+def test_the_wait_hint_is_cleared_when_the_request_fails():
+    class FailingProvider:
+        model = "fake"
+
+        def stream(self, messages, tools=None, system=None, on_text=None, on_thinking=None):
+            raise ProviderError("断了")
+
+        def complete(self, messages, tools=None, system=None):
+            raise AssertionError("不该走到这里")
+
+    hint = RecordingHint()
+    result = runagent(
+        "hi",
+        FailingProvider(),
+        ToolRegistry([]),
+        stream=True,
+        on_text=lambda chunk: None,
+        wait_hint=hint,
+    )
+
+    assert result.error == "断了"
+    assert hint.calls == ["begin", "end"]
+
+
+def test_a_provider_without_stream_does_not_show_the_wait_hint():
+    hint = RecordingHint()
+
+    runagent(
+        "hi",
+        PlainProvider(),
+        ToolRegistry([]),
+        stream=True,
+        on_text=lambda chunk: None,
+        wait_hint=hint,
+    )
+
+    assert hint.calls == []
 
 
 def test_a_provider_without_stream_falls_back_to_complete():
@@ -372,3 +488,50 @@ def test_the_cli_does_not_print_a_streamed_answer_twice(monkeypatch, tmp_path, c
 
     out = capsys.readouterr().out
     assert out.count("你好") == 1
+
+
+def test_the_cli_can_show_thinking(monkeypatch, tmp_path, capsys):
+    provider = StreamingProvider(chunks=("好",), thinking=("想",))
+    answers = iter(["你好", "/exit"])
+    monkeypatch.setattr(cli.typer, "prompt", lambda *args, **kwargs: next(answers))
+    session = start(tmp_path, permission_mode="default", allow_shell=False)
+
+    cli._chat(
+        provider,
+        ToolRegistry([]),
+        session,
+        [],
+        cwd=tmp_path,
+        allow_shell=False,
+        permission_mode="default",
+        prompter=NullPrompter(),
+        grants=Grants(),
+        stream=True,
+        show_thinking=True,
+    )
+
+    out = capsys.readouterr().out
+    assert out.count("想") == 1
+    assert out.count("好") == 1
+    assert out.index("想") < out.index("好")
+
+
+def test_the_wait_hint_is_printed_and_erased_on_a_terminal(monkeypatch, capsys):
+    monkeypatch.setattr(type(cli.console), "is_terminal", property(lambda self: True))
+    writer = cli._StreamWriter()
+
+    writer.begin()
+    writer.end()
+
+    out = capsys.readouterr().out
+    assert "等待模型输出" in out
+    assert "\r" in out
+
+
+def test_the_wait_hint_is_silent_when_output_is_not_a_terminal(capsys):
+    writer = cli._StreamWriter()
+
+    writer.begin()
+    writer.end()
+
+    assert capsys.readouterr().out == ""
