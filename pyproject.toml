@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.11.0",
-    "ipykernel>=7.4.0",
     "python-dotenv>=1.2.4",
     "tavily>=1.1.0",
     "typer>=0.27.3",
@@ -17,6 +16,7 @@ mca = "mini_code_agent.cli:app"
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.4.0",
     "pytest>=8.0",
     "ruff>=0.6",
 ]

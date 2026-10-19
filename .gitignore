@@ -26,6 +26,9 @@ htmlcov/
 .idea/
 .vscode/
 
+# Claude Code 的本地配置（每台机器自己的权限/路径）
+.claude/settings.local.json
+
 # 本地试验文件，不入库
 /main.py
 /test.py
