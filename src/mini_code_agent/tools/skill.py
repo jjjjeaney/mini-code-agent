@@ -85,12 +85,15 @@ def read_skill_file(kwargs: dict[str, Any], ctx: ToolContext) -> str:
     skill = read(ctx.cwd, kwargs["name"])  # 顺带确认这份 skill 真的存在
     raw = str(kwargs["path"])
 
-    target = resolve_inside(skill.directory, raw)
+    # **先查符号链接，再解析。** 反过来做的话，指向外面的链接会先在 `resolve_inside` 那一步
+    # 被展开、报成"超出沙箱"——那也是一句拒绝，但和文件工具的口径不一致，而且模型看到的是
+    # "越界"而不是"这里有个链接、别顺着它读"。这条要排在围栏前面。
     link = find_symlink(raw, skill.directory)
     if link is not None:
         raise ValueError(
             f"{raw!r} 的路径上有符号链接（{link}）。不顺着链接读——那样读到的可能是另一个文件。"
         )
+    target = resolve_inside(skill.directory, raw)
     if target.is_dir():
         raise IsADirectoryError(f"{raw!r} 是个目录。附件只能逐个文件读。")
     if not target.is_file():
