@@ -7,11 +7,12 @@
 - `plan`：不给改文件——计划模式，先让模型把打算怎么做讲清楚，再切出去执行
 - `bypass permissions`：什么都不问
 
-**bypass permissions 是唯一一档把用户从回路里拿掉的**，所以它必须显式开（命令行给），不该
-有快捷键在会话里循环切进来。开了之后模型跑命令不再经过用户，而命令能改项目里任何文件、
-也能把 `.env` 读进上下文（见 known-issues A1 / A2）。它放行的只是"要不要问"这一层——工具
-自己的闸门（围栏、符号链接、敏感路径、读-before-写、改前备份）照样管用：权限不是授权，
-批准过的事也不该能写出围栏。
+**bypass permissions 是唯一一档把用户从回路里拿掉的**，所以启动时显式给最好；会话里唯一
+能进去的路是模型调用 `set_permission_mode`、并在用户确认过写明风险的提示之后生效——
+`/permission_mode` 命令仍然拒绝这一档。开了之后模型跑命令不再经过用户，而命令能改项目里
+任何文件、也能把 `.env` 读进上下文（见 known-issues A1 / A2）。它放行的只是"要不要问"这一层
+——工具自己的闸门（围栏、符号链接、敏感路径、读-before-写、改前备份）照样管用：权限不是
+授权，批准过的事也不该能写出围栏。
 
 bash 跟不跟档位走，看档位：`default` 和 `accept edits` 下它一律要问（一条命令会干什么，
 用户事先看不出来），`bypass permissions` 下不问，`plan` 下仍然要问——那一格还没定，见
@@ -35,6 +36,16 @@ from typing import Literal, get_args
 PermissionMode = Literal["accept edits", "bypass permissions", "default", "plan"]
 
 PERMISSION_MODES: tuple[PermissionMode, ...] = get_args(PermissionMode)
+
+# 档位从紧到松的顺序。**只用来判"这次切换要不要征求同意"**（见 permission_tool）：
+# `decide_permission` 的判定表不是一个简单全序（bash 在 plan/default/accept 下都问），
+# 别拿这个顺序去重写那张表。
+PERMISSION_RANK: dict[PermissionMode, int] = {
+    "plan": 0,
+    "default": 1,
+    "accept edits": 2,
+    "bypass permissions": 3,
+}
 
 # 命令行上省事的短写法。**整词匹配**（归一化之后），不做前缀——`bypass` 是这一档的约定
 # 短名，`bypas` 不是。键也留着归一化之后的样子（没有空格、小写）。
@@ -85,6 +96,19 @@ def parse_permission_mode(value: str) -> PermissionMode:
     options = "、".join(f"{mode!r}" for mode in PERMISSION_MODES)
     shorts = "、".join(f"{name!r}" for name in SHORT_FORMS)
     raise ValueError(f"{value!r} 不是权限模式。可选：{options}（短写法：{shorts}）")
+
+
+def permission_rank(mode: str) -> int:
+    """档位的松紧序号：plan 最紧，bypass 最松。"""
+    return PERMISSION_RANK[parse_permission_mode(mode)]
+
+
+def is_looser(current: str, target: str) -> bool:
+    """从 current 换到 target 是不是一次放宽（需要用户当次同意）。
+
+    同档返回 False；写法和 `parse_permission_mode` 一样宽松。
+    """
+    return permission_rank(target) > permission_rank(current)
 
 
 def decide_permission(

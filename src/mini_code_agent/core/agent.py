@@ -272,12 +272,14 @@ def _ask(prompter: Prompter, request: PermissionRequest, grants: Grants) -> Answ
 
 def _gate(
     call: ToolCall,
+    ctx: ToolContext,
     prompter: Prompter,
-    allow_shell: bool,
-    permission_mode: str,
     grants: Grants,
 ) -> ToolResult | None:
     """权限闸门：放行返回 None，不放行则返回要回给模型的那条结果。
+
+    档位和 `allow_shell` **每次现读 `ctx`**，不从 `runagent` 的参数里抓一份：模型可以在
+    回合中途调用 `set_permission_mode` 改它，同一轮后面的调用必须按新档位判。
 
     只有判定说"ask"的时候才轮到这里问用户（先查本会话批过没有）。**Grants 只能把 ask
     变成 allow，翻不了 deny**——在 default 下批过的东西，切到 plan 照样不给改。
@@ -286,7 +288,7 @@ def _gate(
     协商变成崩溃。也不让它原样重试——那只会再被拒一次。
     """
     request = PermissionRequest(tool_name=call.name, tool_args=call.arguments)
-    decision = decide_permission(request, allow_shell, permission_mode)
+    decision = decide_permission(request, ctx.allow_shell, ctx.permission_mode)
 
     blocked: str | None = None
     if decision.decision == "deny":
@@ -345,7 +347,9 @@ def runagent(
     专门用来打印给人看。
     不传 registry 就用 default_tools() 装好的那套内置工具。
 
-    permission_mode 是权限档位（四档见 permissions.py），决定什么要问用户；
+    permission_mode 是权限档位（四档见 permissions.py），决定什么要问用户。它只是**起始值**：
+    模型可以在回合中途调用 `set_permission_mode` 改 `ctx.permission_mode`，同一轮后面的调用
+    立即按新档位判定；系统提示和工具表本轮不会重建（下一轮才更新）。
     prompter 是"问用户"的方式，不传就用一律拒绝的那个——非交互的跑法不该挂在提示符上。
     grants 记的是本会话已经批过的调用，**要在多轮之间共用一份**（所以建在 CLI 那一层，
     不在这儿新建）——不传就是空的，等于每轮都重新问。
@@ -413,8 +417,9 @@ def runagent(
     )
     # ctx 得在挑工具**之前**建：哪些工具此刻能用，是照着它判的（没开 shell 就没有 bash）。
     # 一轮之内这张表是固定的——每步重算的话，缓存前缀会被反复冲掉（工具那半占前缀一多半）。
-    # 权限档位也带进来：子 agent 要继承主 agent 当前那一档（见 tools/base.py 那个字段），
-    # 而被调用的工具是**每轮现读**它的，所以中途 `/permission_mode` 换档它也跟得上。
+    # 权限档位也带进来：子 agent 要继承主 agent 当前那一档（见 tools/base.py 那个字段）。
+    # `_gate` 每次现读它；`set_permission_mode` 能在回合中途直接改，所以同一轮后面的调用
+    # 立即按新档位判。
     ctx = ToolContext(
         cwd or Path.cwd(),
         read_state=read_state if read_state is not None else ReadFileState(),
@@ -667,7 +672,7 @@ def runagent(
 
                 def run_one(call: ToolCall) -> ToolResult:
                     # 闸门搁在派发之前：判了不放行，就不该碰到那个工具。
-                    result = _gate(call, prompter, allow_shell, permission_mode, grants)
+                    result = _gate(call, ctx, prompter, grants)
                     if result is None:
                         result = registry.dispatch(ctx, call)
                     return result

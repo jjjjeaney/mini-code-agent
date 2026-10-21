@@ -202,6 +202,30 @@ def test_the_mode_can_be_written_the_way_the_user_typed_it(tmp_path):
     assert "plan" in build_system_prompt(tmp_path, "Plan")
 
 
+def test_the_mode_switch_guidance_is_in_the_main_prompt(tmp_path):
+    text = build_system_prompt(tmp_path, "default")
+
+    assert "set_permission_mode" in text
+    assert "放宽" in text
+
+
+def test_the_mode_switch_guidance_sits_after_the_mode_line(tmp_path):
+    text = build_system_prompt(tmp_path, "default", allow_fork=True)
+
+    assert (
+        text.index("当前权限档位 default")
+        < text.index("set_permission_mode")
+        < text.index("什么时候用 fork")
+    )
+
+
+def test_the_subagent_prompt_never_offers_mode_switching(tmp_path):
+    """子 agent 的工具池里没有这个工具，提示词里也就不该提它。"""
+    text = build_subagent_prompt(tmp_path, "general-purpose", "default")
+
+    assert "set_permission_mode" not in text
+
+
 def test_a_bad_mode_raises(tmp_path):
     with pytest.raises(ValueError, match="不是权限模式"):
         build_system_prompt(tmp_path, "yolo")

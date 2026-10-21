@@ -131,6 +131,13 @@ class TestTheToolPool:
                 continue  # 用的是父 agent 的工具表，不在这条断言的范围里
             assert "ask_user" not in names(agent_type)
 
+    def test_no_type_can_switch_the_permission_mode(self):
+        """切档是主 agent 的事。池子从 `default_tools()` 重建，这个工具本来就不在里面。"""
+        for agent_type in AGENT_TYPES.values():
+            if agent_type.fork:
+                continue
+            assert "set_permission_mode" not in names(agent_type)
+
     def test_no_type_can_write_long_term_memory(self):
         """`remember` 是"以后每次会话都生效"的东西——该由知道整段对话的主 agent 来记。"""
         for agent_type in AGENT_TYPES.values():

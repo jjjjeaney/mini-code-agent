@@ -8,6 +8,7 @@ import pytest
 
 from mini_code_agent.core.agent import CANCELLED_ERROR, RETRY_PAUSE_SECONDS, runagent
 from mini_code_agent.folding import fold_stale
+from mini_code_agent.permission_tool import make_set_permission_mode
 from mini_code_agent.permissions import Grants, PermissionRequest
 from mini_code_agent.prompting import make_ask_user
 from mini_code_agent.prompts import Answer, NullPrompter
@@ -335,12 +336,18 @@ class RecordingPrompter:
     """记下问了什么、按剧本回答。四个方法都得有——harness 按工具类别挑一个调。"""
 
     def __init__(
-        self, allowed: bool = True, remember: bool = False, note: str = ""
+        self,
+        allowed: bool = True,
+        remember: bool = False,
+        note: str = "",
+        choice: str | None = None,
     ) -> None:
         self.allowed = allowed
         self.remember = remember
         self.note = note
+        self.choice = choice
         self.tools: list[PermissionRequest] = []
+        self.questions: list[tuple[str, tuple[str, ...]]] = []
 
     def confirm_tool(self, request: PermissionRequest) -> Answer:
         self.tools.append(request)
@@ -353,8 +360,9 @@ class RecordingPrompter:
     def _answer(self) -> Answer:
         return Answer(self.allowed, remember=self.remember, note=self.note)
 
-    def single_choice(self, question: str, options: list[str]) -> str:
-        return options[0]
+    def single_choice(self, question: str, options) -> str:
+        self.questions.append((question, tuple(options)))
+        return self.choice if self.choice is not None else options[0]
 
 
 def gated_registry(name: str, log: list[str]) -> ToolRegistry:
@@ -1269,3 +1277,73 @@ class TestHandoff:
 
         assert seen == [cancel]
         assert background.final == "好"
+
+
+def test_a_mode_switch_changes_the_gate_in_the_same_turn():
+    """切到 plan 之后，同一轮后面那次编辑必须当场被拒——不能等下一轮。"""
+    log: list[str] = []
+    prompter = RecordingPrompter()
+    registry = ToolRegistry(
+        [
+            make_set_permission_mode(prompter),
+            Tool(
+                name="edit_file",
+                description="",
+                fn=lambda kwargs, ctx: log.append(ctx.permission_mode) or "改好了",
+                params={},
+            ),
+        ]
+    )
+    provider = ScriptedProvider(
+        [
+            tool_turn("t1", "set_permission_mode", {"mode": "plan"}),
+            tool_turn("t2", "edit_file", {"path": "a.txt"}),
+            text_turn("好了"),
+        ]
+    )
+
+    result = runagent(
+        "先给个方案", provider, registry, permission_mode="default", prompter=prompter
+    )
+
+    assert log == []  # 编辑工具根本没跑
+    assert prompter.tools == []  # plan 是 deny，不是 ask
+    blocked = next(
+        block
+        for message in result.messages
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if block.get("tool_use_id") == "t2"
+    )
+    assert blocked["is_error"] is True
+    assert "plan" in blocked["content"]
+
+
+def test_a_consented_loosening_applies_to_the_rest_of_the_turn():
+    """从 plan 放宽到 default：用户同意后，同一轮后面的编辑按 default 走。"""
+    seen: list[str] = []
+    prompter = RecordingPrompter(choice="同意")
+    registry = ToolRegistry(
+        [
+            make_set_permission_mode(prompter),
+            Tool(
+                name="edit_file",
+                description="",
+                fn=lambda kwargs, ctx: seen.append(ctx.permission_mode) or "改好了",
+                params={},
+            ),
+        ]
+    )
+    provider = ScriptedProvider(
+        [
+            tool_turn("t1", "set_permission_mode", {"mode": "default"}),
+            tool_turn("t2", "edit_file", {"path": "a.txt"}),
+            text_turn("好了"),
+        ]
+    )
+
+    runagent("开始做", provider, registry, permission_mode="plan", prompter=prompter)
+
+    assert prompter.questions and "plan" in prompter.questions[0][0]
+    assert seen == ["default"]
+    assert any(request.tool_name == "edit_file" for request in prompter.tools)

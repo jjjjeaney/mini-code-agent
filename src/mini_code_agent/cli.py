@@ -22,6 +22,7 @@ from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.folding import PersistText, fold_if_stale
 from mini_code_agent.interaction import PermissionBroker, ask_permission
 from mini_code_agent.memory import sync_index
+from mini_code_agent.permission_tool import make_set_permission_mode
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
@@ -191,6 +192,10 @@ def _chat(
     state = ChatState(
         permission_mode=permission_mode, messages=messages, allow_fork=allow_fork
     )
+    # 切档工具拿的是这个**活对象**：`/permission_mode` 和工具自己都会改它，存副本就过期。
+    # 先查重：测试里同一个 registry 可能被多次 `_chat` 复用。
+    if "set_permission_mode" not in {tool.name for tool in registry.list()}:
+        registry.register(make_set_permission_mode(prompter, state=state))
     # 模型的窗口一次运行里定死，所以不进 ChatState 那个"会变的东西"的盒子（见它的类注释）。
     window = window_for(model)
     # 哪些工具的结果允许被折——一次运行里不变（见 tools/registry.py 的 foldable_names）。
@@ -701,6 +706,9 @@ def main_command(
             window=window_for(provider.model),
         )
         writer = _StreamWriter()
+        # 一次性模式没有下一轮，工具只改本回合的 ctx；登记它是为了让提示词里的说明
+        # 指向一个真存在的工具。
+        registry.register(make_set_permission_mode(prompter))
         result = runagent(
             prompt,
             provider,

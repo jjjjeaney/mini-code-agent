@@ -31,10 +31,9 @@ GLOSS: dict[str, str] = {
     "bypass permissions": "什么都不问——问这一层整个关掉了",
 }
 
-# 会话里能切的那几档。**bypass permissions 不在里面**，理由见 known-issues F4：它是唯一
-# 一档把用户整个从回路里拿掉的，只能启动时显式开（`--permission_mode bypass`），开的时候
-# 命令行还会打一行红字。在会话里敲一句话就把它打开，和"必须显式开、而且要看见那行提示"
-# 差得太远。
+# 会话里能直接切的几档。**bypass permissions 不在里面**，理由见 known-issues F4：它是唯一
+# 一档把用户整个从回路里拿掉的，命令行启动仍是最直接的入口；模型可以调用
+# `set_permission_mode` 请求它，但那条路会弹一句写明风险的确认，用户同意才生效。
 # 按 PERMISSION_MODES 推出来，以后加第五档不必记得回来改这儿。
 SWITCHABLE: tuple[str, ...] = tuple(m for m in PERMISSION_MODES if m != "bypass permissions")
 
@@ -137,8 +136,9 @@ def make_permission_mode() -> Command:
 
         if mode == "bypass permissions":
             ctx.console.print(
-                "bypass permissions 不能在会话里切：它是唯一一档把用户从回路里整个拿掉的，"
-                "只能启动时用 --permission_mode bypass 开（见 known-issues F4）。",
+                "bypass permissions 不能直接用 /permission_mode 切：它只能启动时用 "
+                "--permission_mode bypass 开，或者由模型调用 set_permission_mode、"
+                "在你确认过写明风险的提示之后才会生效（见 known-issues F4）。",
                 style="red",
                 markup=False,
             )

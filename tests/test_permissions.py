@@ -7,10 +7,13 @@ import pytest
 from mini_code_agent.permissions import (
     EDIT_TOOLS,
     PERMISSION_MODES,
+    PERMISSION_RANK,
     PermissionRequest,
     decide_permission,
+    is_looser,
     is_rules_file,
     parse_permission_mode,
+    permission_rank,
 )
 
 # decide_permission 的第二个参数是 allow_shell。位置参数直接写 True / False 看不出是什么，
@@ -235,3 +238,36 @@ class TestTheRememberRule:
     def test_reading_a_memory_is_not_gated(self):
         """读记忆是普通的读，跟读文件一样不该问。"""
         assert decide_permission(request("read_memory"), SHELL_ON, "default").decision == "allow"
+
+
+class TestModeRanking:
+    """松紧顺序只用于"这次切档要不要用户同意"；判定表另有逻辑，不拿它重写。"""
+
+    def test_the_order_runs_from_plan_to_bypass(self):
+        ranks = [permission_rank(mode) for mode in PERMISSION_MODES]
+        assert permission_rank("plan") < permission_rank("default")
+        assert permission_rank("default") < permission_rank("accept edits")
+        assert permission_rank("accept edits") < permission_rank("bypass permissions")
+        assert sorted(ranks) == list(range(len(PERMISSION_MODES)))
+
+    def test_every_mode_has_a_rank(self):
+        assert set(PERMISSION_RANK) == set(PERMISSION_MODES)
+
+    @pytest.mark.parametrize("current", PERMISSION_MODES)
+    @pytest.mark.parametrize("target", PERMISSION_MODES)
+    def test_is_looser_matches_the_rank(self, current, target):
+        assert is_looser(current, target) == (
+            PERMISSION_RANK[target] > PERMISSION_RANK[current]
+        )
+
+    def test_same_mode_is_not_looser(self):
+        for mode in PERMISSION_MODES:
+            assert is_looser(mode, mode) is False
+
+    def test_the_spellings_the_user_can_type_are_accepted(self):
+        assert is_looser("Plan", "Accept_Edits") is True
+        assert is_looser("accept", "bypass") is True
+
+    def test_a_bad_mode_raises(self):
+        with pytest.raises(ValueError, match="不是权限模式"):
+            is_looser("yolo", "plan")

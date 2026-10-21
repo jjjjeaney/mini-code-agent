@@ -122,6 +122,25 @@ _MODE_HINTS = {
     "bypass permissions": "当前权限档位 bypass permissions：什么都不会问用户，照常干活。",
 }
 
+# 主 agent 每次都带的一段：什么时候该切档。子 agent 没有这个工具，`build_subagent_prompt`
+# 不加它。切换立即生效，但提示词和工具表本轮不重建——所以切到 plan 之后要当场停手。
+_MODE_SWITCH_HINT = """\
+## 什么时候切换权限档位
+
+你可以调用 `set_permission_mode` 改这次会话的权限档位。切换**立即生效**——同一轮后面的
+工具调用马上按新档位判定；但系统提示里的档位说明和工具表要下一轮才更新。切到 `plan`
+之后，本轮不要再请求改文件的工具，那些调用会被直接拒绝。
+
+- **要方案、先只读调查再动手**：切到 `plan`。把现状和打算怎么做讲清楚，不要改文件。
+- **用户要求更严格的确认**（比如"每次跑命令或改文件之前都要经过我的同意"）：切到
+  `default`。如果已经在 `plan`，plan 比 default 更严，不要为了这句话切出去。
+- **放宽档位必须用户当场同意**：default → accept edits、其它档 → bypass permissions、
+  plan → default / accept edits 都算放宽。工具会问用户，他不同意就保持原档。
+  `bypass permissions` 只有在用户明确要求时才考虑，工具会把风险写清楚再问一次；
+  不要主动推荐它。
+- 不要为了"待会儿可能用得上"提前切档，按眼前这件事需要的那一档来。
+"""
+
 # fork 开着的时候才加的一段。
 #
 # **它不能进 `_STATIC`**：那份是"同一份给所有项目所有用户、一个字都不随运行变"的，而 fork 是
@@ -404,7 +423,11 @@ def build_system_prompt(
     和子 agent 那份共用——**它的顺序理由写在那儿**。
 
     前三段的顺序也是按"变得多勤"排的：静态那半永远不变；这次运行的实情一天一变（平台、
-    模型一次运行里不动）；档位会在会话里换（`/permission_mode`），但一次运行里通常不动。
+    模型一次运行里不动）；档位会在会话里换（`/permission_mode` 或模型自己调
+    `set_permission_mode`），但一次运行里通常不动。
+
+    **切档说明假设调用方注册了 `permission_tool.make_set_permission_mode`**——CLI 的两条路
+    都会注册；直接调 `runagent` 的嵌入方要么自己注册，要么接受模型看到一句用不上的说明。
 
     `model` 不给就不写那半句——**不猜**。调用方手上有真 provider 就传 `provider.model`；
     `Provider` 协议故意只声明了 complete（见 providers/base.py），所以这里也不假设它有。
@@ -417,7 +440,7 @@ def build_system_prompt(
     中途换，所以它也得每轮现读。
     """
     mode = parse_permission_mode(permission_mode)
-    parts = [_STATIC, _session_note(model), _MODE_HINTS[mode]]
+    parts = [_STATIC, _session_note(model), _MODE_HINTS[mode], _MODE_SWITCH_HINT]
     if allow_fork:
         parts.append(_FORK_HINT)
     parts.extend(project_context(cwd))

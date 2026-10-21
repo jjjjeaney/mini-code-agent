@@ -151,8 +151,8 @@ class ToolContext:
     #
     # 谁要用：**子 agent**。它必须继承主 agent 当前的档位，不然 plan 档下派一个
     # general-purpose 子 agent 就能改文件，那是 plan 档的一个洞。而档位会被
-    # `/permission_mode` 中途改掉，所以不能靠"建工具那一刻"的值——只能每轮现读，
-    # 这就是它必须走 ctx 而不是闭包捕获的原因。
+    # `/permission_mode` 和 `set_permission_mode` 中途改掉，所以不能靠"建工具那一刻"的值
+    # ——只能现读，这就是它必须走 ctx 而不是闭包捕获的原因。`_gate` 每次判调用前都读它。
     #
     # 默认取 "default" 落在**会问**的那一侧（decide_permission 对写文件给的是 ask，
     # 不是放行），漏传的后果是多问一句而不是少问一句。而且这个默认跟着 runagent 自己的

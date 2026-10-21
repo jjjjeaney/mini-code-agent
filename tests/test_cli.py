@@ -229,6 +229,21 @@ def test_switching_the_mode_lands_on_the_next_turn(monkeypatch, tmp_path):
     assert provider.systems == [build_system_prompt(tmp_path, "plan")]
 
 
+def test_a_tool_mode_switch_lands_on_the_next_turn(monkeypatch, tmp_path):
+    """模型自己切档时改的是同一个 ChatState，下一轮的系统提示跟着换。"""
+    provider = ScriptedProvider(
+        [
+            tool_turn("t1", "set_permission_mode", {"mode": "plan"}),
+            text_turn("方案如下"),
+            text_turn("接着说"),
+        ]
+    )
+
+    run_loop(monkeypatch, provider, ["先给我方案", "继续说", "/exit"], tmp_path)
+
+    assert "当前权限档位 plan" in provider.systems[-1]
+
+
 def test_status_reports_the_live_loop(monkeypatch, tmp_path, capsys):
     """`/status` 拿到的是循环里那份会话和历史，不是一份副本。"""
     provider = ScriptedProvider([text_turn("嗯")])
@@ -603,10 +618,12 @@ class FakeOneShotProvider:
     def __init__(self) -> None:
         self.model = "fake"
         self.tools: list[dict] | None = None
+        self.system: str | None = None
         self.stream_calls = 0
 
     def complete(self, messages, tools=None, system=None) -> ModelResponse:
         self.tools = tools
+        self.system = system
         return ModelResponse(
             text="好",
             assistant_content=[{"type": "text", "text": "好"}],
@@ -649,6 +666,8 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
     offered = {schema["name"] for schema in provider.tools or []}
     assert "agent" in offered
     assert "ask_user" in offered  # 另一个 harness 注入的，顺带确认这条路没被改坏
+    assert "set_permission_mode" in offered  # 模型自己切档用的
+    assert "set_permission_mode" in (provider.system or "")
     assert "fork" not in offered  # fork 是 agent 的一个 type，不是单独的工具
     # 而且这个 type 一直在枚举里——档位/开关开关的是运行时能不能用，不是发不发。
     agent = next(schema for schema in provider.tools or [] if schema["name"] == "agent")
