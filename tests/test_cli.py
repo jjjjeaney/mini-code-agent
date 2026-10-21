@@ -241,6 +241,8 @@ def test_a_tool_mode_switch_lands_on_the_next_turn(monkeypatch, tmp_path):
 
     run_loop(monkeypatch, provider, ["先给我方案", "继续说", "/exit"], tmp_path)
 
+    # 切档之后的第一发（同一轮）就已经按 plan 拼了；下一轮继续是 plan。
+    assert "当前权限档位 plan" in provider.systems[1]
     assert "当前权限档位 plan" in provider.systems[-1]
 
 

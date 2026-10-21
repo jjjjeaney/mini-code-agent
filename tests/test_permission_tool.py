@@ -61,7 +61,7 @@ class TestStricterSwitches:
         assert ctx.permission_mode == "plan"
         assert state.permission_mode == "plan"
         assert "立即" in result
-        assert "下一轮" in result
+        assert "下一次请求" in result
         assert "拒绝" in result
 
     def test_switching_from_bypass_to_default_needs_no_approval(self, tmp_path):

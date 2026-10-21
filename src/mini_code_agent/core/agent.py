@@ -316,6 +316,7 @@ def runagent(
     provider: Provider,
     registry: ToolRegistry | None = None,
     system: str | None = None,
+    refresh_system: Callable[[str], str] | None = None,
     max_steps: int = 20,
     cwd: Path | None = None,
     allow_shell: bool = False,
@@ -349,7 +350,12 @@ def runagent(
 
     permission_mode 是权限档位（四档见 permissions.py），决定什么要问用户。它只是**起始值**：
     模型可以在回合中途调用 `set_permission_mode` 改 `ctx.permission_mode`，同一轮后面的调用
-    立即按新档位判定；系统提示和工具表本轮不会重建（下一轮才更新）。
+    立即按新档位判定。
+
+    `refresh_system` 可选：收当前档位、返回一份新 system。模型切档之后，**下一次请求前**用它
+    重拼，让提示词里的档位说明立刻跟上；档位没变就不调用。它会重读 AGENTS.md、记忆和 git，
+    所以只该在切档时触发。不给就一直用传进来的 `system`——子 agent 和 fork 的提示词是快照，
+    必须原样发（见 known-issues H8）。
     prompter 是"问用户"的方式，不传就用一律拒绝的那个——非交互的跑法不该挂在提示符上。
     grants 记的是本会话已经批过的调用，**要在多轮之间共用一份**（所以建在 CLI 那一层，
     不在这儿新建）——不传就是空的，等于每轮都重新问。
@@ -472,6 +478,10 @@ def runagent(
         last_text_shown = False
         # 最终回答那一发的用量行；`defer_final_usage` 为真时交给调用方在答案之后打印。
         pending_usage: str | None = None
+        # 这一轮当前用的 system，以及它是按哪一档拼的。切档后下一次请求前重拼；没有
+        # `refresh_system` 时永远是传进来的那一份（子 agent / fork 的快照）。
+        current_system = system
+        system_mode = permission_mode
 
         def send(sent: list[dict[str, Any]], **kwargs: Any) -> ModelResponse:
             """发一发，顺手把这一发的用量打出来。
@@ -488,10 +498,18 @@ def runagent(
             384，见 known-issues 的 D5）。所以"只追加"是省钱的**前提**，而这一行代码正是那个前提
             的落点——别在这儿加变换。
             """
-            nonlocal anchor, last_text_shown, pending_usage
+            nonlocal anchor, last_text_shown, pending_usage, current_system, system_mode
 
             if cancel is not None and cancel.is_set():
                 raise _Cancelled
+
+            # 模型可能在上一步切了档：发出去之前把 system 换成新档位拼的那份。只比较档位，
+            # 没变就不重拼——重拼会重读 AGENTS.md / 记忆 / git，而且前缀必然重新计费。
+            if refresh_system is not None and ctx.permission_mode != system_mode:
+                current_system = refresh_system(ctx.permission_mode)
+                system_mode = ctx.permission_mode
+            if current_system is not None:
+                kwargs["system"] = current_system
 
             last_text_shown = False
             pending_usage = None
@@ -650,7 +668,7 @@ def runagent(
                         handoff=task_id,
                     )
 
-                response = ask(msgs, tools=tools, system=system)
+                response = ask(msgs, tools=tools)
 
                 if not response.tool_calls:
                     final = response.text
@@ -709,7 +727,7 @@ def runagent(
             if final is None:
                 instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"
                 msgs.append({"role": "user", "content": instruction})
-                response = ask(msgs, system=system)
+                response = ask(msgs)
                 final = response.text
                 if final is not None:
                     trace.append(final)

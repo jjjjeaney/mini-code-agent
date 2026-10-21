@@ -50,7 +50,7 @@ uv run mca
 
 权限档位有四档：`default`（改文件和跑命令都问）、`accept edits`（改文件不问，命令仍问）、`plan`（只读：改文件直接拒，命令仍问）、`bypass permissions`（什么都不问）。启动时用 `--permission_mode`，会话里用 `/permission_mode <档位>`；两者都从下一轮生效。
 
-模型自己也能用 `set_permission_mode` 切档：要方案、只做只读调查时切到 `plan`，你要求“每次改文件或跑命令都先问我”时切到 `default`——往更严格的方向切不询问。往更宽松的方向切（离开 `plan`、切到 `accept edits` 或 `bypass permissions`）会停下来问一次，你不同意就保持原档。`bypass permissions` 只有模型请求、并且你确认过写明风险的提示后才生效；`/permission_mode bypass` 仍然拒绝，启动参数仍是最直接的入口。切换对本回合后续调用立即生效，系统提示和工具表下一轮才更新。普通子 agent 的工具池里没有这个工具；fork 会继承父 agent 的工具表，所以它也能请求切档。
+模型自己也能用 `set_permission_mode` 切档：要方案、只做只读调查时切到 `plan`，你要求“每次改文件或跑命令都先问我”时切到 `default`——往更严格的方向切不询问。往更宽松的方向切（离开 `plan`、切到 `accept edits` 或 `bypass permissions`）会停下来问一次，你不同意就保持原档。`bypass permissions` 只有模型请求、并且你确认过写明风险的提示后才生效；`/permission_mode bypass` 仍然拒绝，启动参数仍是最直接的入口。切换对本回合后续调用立即生效，下一次请求前系统提示也会按新档位重拼（缓存前缀因此重算一次）。普通子 agent 的工具池里没有这个工具；fork 会继承父 agent 的工具表，所以它也能请求切档。
 
 会话按目录存在 `.agent/sessions/` 里。`--list` 列出有过哪些（连同各自的 id），`--resume <id>` 接上某一次；`--continue` 接最近一次**说过话**的。
 

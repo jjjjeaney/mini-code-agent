@@ -285,6 +285,9 @@ def _chat(
             provider,
             registry,
             system=system,
+            refresh_system=lambda mode: build_system_prompt(
+                cwd, mode, model, allow_fork=state.allow_fork
+            ),
             cwd=cwd,
             allow_shell=allow_shell,
             permission_mode=state.permission_mode,
@@ -355,6 +358,9 @@ def _chat(
             provider,
             registry,
             system=system,
+            refresh_system=lambda mode: build_system_prompt(
+                cwd, mode, model, allow_fork=state.allow_fork
+            ),
             max_steps=1,
             cwd=cwd,
             allow_shell=allow_shell,
@@ -715,6 +721,9 @@ def main_command(
             registry,
             system=build_system_prompt(
                 workdir, permission_mode, provider.model, allow_fork=fork
+            ),
+            refresh_system=lambda mode: build_system_prompt(
+                workdir, mode, provider.model, allow_fork=fork
             ),
             cwd=workdir,
             allow_shell=shell,

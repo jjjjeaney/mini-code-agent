@@ -1319,6 +1319,47 @@ def test_a_mode_switch_changes_the_gate_in_the_same_turn():
     assert "plan" in blocked["content"]
 
 
+def test_the_system_prompt_is_rebuilt_before_the_next_request_after_a_switch():
+    """切档后那一发请求的 system 必须已经是新档位，不能等下一轮。"""
+    prompter = RecordingPrompter()
+    registry = ToolRegistry([make_set_permission_mode(prompter)])
+    provider = ScriptedProvider(
+        [
+            tool_turn("t1", "set_permission_mode", {"mode": "plan"}),
+            text_turn("方案如下"),
+        ]
+    )
+
+    runagent(
+        "先给方案",
+        provider,
+        registry,
+        system="当前权限档位 default",
+        refresh_system=lambda mode: f"当前权限档位 {mode}",
+        permission_mode="default",
+        prompter=prompter,
+    )
+
+    assert provider.calls[0]["system"] == "当前权限档位 default"
+    assert provider.calls[1]["system"] == "当前权限档位 plan"
+
+
+def test_the_system_prompt_is_not_rebuilt_when_the_mode_did_not_change():
+    calls: list[str] = []
+    provider = ScriptedProvider([text_turn("好")])
+
+    runagent(
+        "hi",
+        provider,
+        ToolRegistry([]),
+        system="原样",
+        refresh_system=lambda mode: calls.append(mode) or "重拼过",
+    )
+
+    assert calls == []
+    assert provider.calls[0]["system"] == "原样"
+
+
 def test_a_consented_loosening_applies_to_the_rest_of_the_turn():
     """从 plan 放宽到 default：用户同意后，同一轮后面的编辑按 default 走。"""
     seen: list[str] = []
