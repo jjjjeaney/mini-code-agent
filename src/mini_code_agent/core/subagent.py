@@ -325,8 +325,8 @@ def make_agent_tool(
 
         label = f"[{name}] "
         wants_background = bool(kwargs.get("run_in_background", False))
-        # 一次性模式没有下一轮可以送结果，所以那边 `allow_background` 是 False——模型就算
-        # 要了后台也只同步跑完，并在结果里说明一句。
+        # 没有下一轮可以送结果的回合（比如后台任务的汇报）`allow_background` 是 False——
+        # 模型就算要了后台也只同步跑完，并在结果里说明一句。
         can_background = ctx.allow_background and tasks is not None
         if wants_background and can_background and tasks.running() >= BACKGROUND_LIMIT:
             return (
@@ -400,7 +400,7 @@ def make_agent_tool(
             start_background = _start
 
         # 后台那一半的权限问题：有 broker 就入队、等读键盘线程在持有终端时来问；没有
-        # （一次性模式、测试没注入）就退回一律拒绝的 BackgroundPrompter。
+        # （没有 broker 的调用方、测试没注入）就退回一律拒绝的 BackgroundPrompter。
         background_prompter = None
         if broker is not None:
 

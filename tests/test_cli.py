@@ -456,7 +456,6 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
 
     with pytest.raises(typer.Exit):
         cli.main_command(
-            prompt="",
             cwd=tmp_path,
             model="",
             api_key="",
@@ -490,7 +489,6 @@ def run_delete(tmp_path, session_id: str, *, yes: bool) -> None:
     """跑一次 `mca --delete <id>`。两条路都以 typer.Exit 收场——删了，或者用户没同意。"""
     with pytest.raises(typer.Exit):
         cli.main_command(
-            prompt="",
             cwd=tmp_path,
             model="",
             api_key="",
@@ -555,7 +553,6 @@ def test_the_yes_flag_skips_the_question(tmp_path, monkeypatch):
 def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
     with pytest.raises(typer.BadParameter, match="没有"):
         cli.main_command(
-            prompt="",
             cwd=tmp_path,
             model="",
             api_key="",
@@ -614,30 +611,43 @@ def test_delete_takes_the_spilled_files_with_it(tmp_path, capsys, monkeypatch):
     assert not directory.exists()
 
 
-class FakeOneShotProvider:
-    """一次性那条路上顶掉真 provider：不发请求，只记下模型见到了什么。"""
+class FakeProvider(ScriptedProvider):
+    """`main_command` 会从 provider 上读 `.model` 拼系统提示；测试给一个假名字。"""
 
-    def __init__(self) -> None:
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        super().__init__(responses)
         self.model = "fake"
-        self.tools: list[dict] | None = None
-        self.system: str | None = None
-        self.stream_calls = 0
 
-    def complete(self, messages, tools=None, system=None) -> ModelResponse:
-        self.tools = tools
-        self.system = system
-        return ModelResponse(
-            text="好",
-            assistant_content=[{"type": "text", "text": "好"}],
-            stop_reason="end_turn",
-        )
 
-    def stream(self, messages, tools=None, system=None, on_text=None) -> ModelResponse:
-        self.stream_calls += 1
-        response = self.complete(messages, tools=tools, system=system)
-        if on_text is not None and response.text:
-            on_text(response.text)
-        return response
+def run_main(
+    monkeypatch,
+    provider: FakeProvider,
+    lines: list[str],
+    tmp_path,
+    *,
+    fork: bool = False,
+) -> None:
+    """让 `main_command` 真的进入交互循环，喂一串输入。
+
+    一次性模式删掉后，CLI 层只剩这一条路；验证 provider / registry / 系统提示的装配，
+    就得从这里走。
+    """
+    answers = iter(lines)
+    monkeypatch.setattr(cli.typer, "prompt", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
+    cli.main_command(
+        cwd=tmp_path,
+        model="",
+        api_key="",
+        base_url="",
+        shell=False,
+        fork=fork,
+        permission_mode="default",
+        continue_=False,
+        resume="",
+        list_=False,
+        delete_="",
+    )
 
 
 def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
@@ -647,32 +657,18 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
     这条走的是 `main_command` 那条真路：注册点排在 provider 后面（那个工具要 provider 才能
     跑），所以光看单测验不到"它到底装没装上"。
     """
-    provider = FakeOneShotProvider()
-    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
+    provider = FakeProvider([text_turn("好")])
 
-    cli.main_command(
-        prompt="你好",
-        cwd=tmp_path,
-        model="",
-        api_key="",
-        base_url="",
-        shell=False,
-        fork=False,
-        permission_mode="default",
-        continue_=False,
-        resume="",
-        list_=False,
-        delete_="",
-    )
+    run_main(monkeypatch, provider, ["你好", "/exit"], tmp_path)
 
-    offered = {schema["name"] for schema in provider.tools or []}
+    offered = {schema["name"] for schema in provider.tools[0] or []}
     assert "agent" in offered
     assert "ask_user" in offered  # 另一个 harness 注入的，顺带确认这条路没被改坏
     assert "set_permission_mode" in offered  # 模型自己切档用的
-    assert "set_permission_mode" in (provider.system or "")
+    assert "set_permission_mode" in (provider.systems[0] or "")
     assert "fork" not in offered  # fork 是 agent 的一个 type，不是单独的工具
     # 而且这个 type 一直在枚举里——档位/开关开关的是运行时能不能用，不是发不发。
-    agent = next(schema for schema in provider.tools or [] if schema["name"] == "agent")
+    agent = next(schema for schema in provider.tools[0] or [] if schema["name"] == "agent")
     assert "fork" in agent["input_schema"]["properties"]["type"]["enum"]
     capsys.readouterr()
 
@@ -683,13 +679,13 @@ def test_the_model_option_reaches_the_provider(monkeypatch, tmp_path, capsys):
 
     def factory(**kwargs):
         seen.append(kwargs)
-        return FakeOneShotProvider()
+        return FakeProvider([])
 
     monkeypatch.setattr(cli, "AnthropicProvider", factory)
+    monkeypatch.setattr(cli, "_chat", lambda *args, **kwargs: None)
 
     def run(*, model: str) -> None:
         cli.main_command(
-            prompt="你好",
             cwd=tmp_path,
             model=model,
             api_key="",
@@ -717,13 +713,13 @@ def test_the_endpoint_options_reach_the_provider(monkeypatch, tmp_path, capsys):
 
     def factory(**kwargs):
         seen.append(kwargs)
-        return FakeOneShotProvider()
+        return FakeProvider([])
 
     monkeypatch.setattr(cli, "AnthropicProvider", factory)
+    monkeypatch.setattr(cli, "_chat", lambda *args, **kwargs: None)
 
     def run(*, api_key: str, base_url: str) -> None:
         cli.main_command(
-            prompt="你好",
             cwd=tmp_path,
             model="",
             api_key=api_key,
@@ -750,25 +746,11 @@ def test_the_endpoint_options_reach_the_provider(monkeypatch, tmp_path, capsys):
 
 def test_fork_is_a_type_of_the_agent_tool_in_both_cases(monkeypatch, tmp_path, capsys):
     """fork 不再是独立工具：枚举里一直有它，开没开只影响系统提示里那段说明。"""
-    provider = FakeOneShotProvider()
-    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
+    provider = FakeProvider([text_turn("好"), text_turn("好")])
 
     def types_offered(*, fork: bool) -> set[str]:
-        cli.main_command(
-            prompt="你好",
-            cwd=tmp_path,
-            model="",
-            api_key="",
-            base_url="",
-            shell=False,
-            fork=fork,
-            permission_mode="default",
-            continue_=False,
-            resume="",
-            list_=False,
-            delete_="",
-        )
-        agent = next(schema for schema in provider.tools or [] if schema["name"] == "agent")
+        run_main(monkeypatch, provider, ["你好", "/exit"], tmp_path, fork=fork)
+        agent = next(schema for schema in provider.tools[-1] or [] if schema["name"] == "agent")
         return set(agent["input_schema"]["properties"]["type"]["enum"])
 
     assert "fork" in types_offered(fork=False)
@@ -1036,31 +1018,6 @@ def test_folding_a_bash_history_still_appends_only_new_messages(monkeypatch, tmp
     assert "已清除" not in str(stored)
 
 
-def test_the_one_shot_path_persists_before_folding(monkeypatch, tmp_path):
-    history = a_bash_history()
-    session = start(tmp_path, permission_mode="default", allow_shell=False)
-    session.append(history)
-    age_the_file(session)
-    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: FakeOneShotProvider())
-
-    cli.main_command(
-        prompt="接着说",
-        cwd=tmp_path,
-        model="",
-        api_key="",
-        base_url="",
-        shell=False,
-        fork=False,
-        permission_mode="default",
-        continue_=False,
-        resume=session.id,
-        list_=False,
-        delete_="",
-    )
-
-    assert (spill.session_dir(tmp_path, session.id) / "t0.txt").is_file()
-
-
 def test_the_loop_turns_background_mode_on(monkeypatch, tmp_path):
     """交互模式下 `ctx.allow_background` 必须是 True——否则 `run_in_background` 永远被忽略。"""
     seen: list[bool] = []
@@ -1214,7 +1171,7 @@ class TestBackgroundApprovals:
     def test_a_pending_request_is_denied_when_the_prompter_cannot_ask(
         self, monkeypatch, tmp_path, capsys
     ):
-        """`NullPrompter` 是测试/一次性模式的缺省：它不问，直接拒绝，也不消耗脚本行。"""
+        """`NullPrompter` 是测试和没有 prompter 的调用的缺省：它不问，直接拒绝，也不消耗脚本行。"""
         broker = PermissionBroker()
         item = broker.defer(a_write_request(), "[general-purpose] ")
         provider = ScriptedProvider([text_turn("好")])

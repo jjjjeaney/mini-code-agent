@@ -127,7 +127,7 @@ class CommandContext:
     compact: Callable[[], str | None]
 
     # 后台子 agent 的任务表（见 core/tasks.py）。`/tasks` 看状态/取消、`/status` 报个数。
-    # 默认 None：测试和一次性路径没有它，命令要能对着空表说话。
+    # 默认 None：测试没有它，命令要能对着空表说话。
     tasks: TaskManager | None = None
 
     # 后台任务的授权请求表（见 interaction.py）。只用来报"有几个在等批准"；真正问用户的是

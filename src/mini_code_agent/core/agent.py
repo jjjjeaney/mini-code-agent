@@ -394,7 +394,7 @@ def runagent(
     - `allow_background` 交给 `ToolContext`，`agent` 工具据此决定认不认 `run_in_background`。
     - `background_prompter` 决定后台那一半用哪份 prompter（参数是它自己的 cancel event）。
       交互会话传 `BrokerPrompter`——请求排队、由读键盘线程在持有终端时问；不传就退回一律
-      拒绝的 `BackgroundPrompter`（一次性模式、测试）。
+      拒绝的 `BackgroundPrompter`（没有 broker 的调用方、测试）。
 
     **流式输出**：传了 `on_text` 就流式——模型正文边生成边交给它，但循环拿到的
     `ModelResponse` 仍然来自完整消息，历史回填、工具调用、用量、stop_reason 一样不少。

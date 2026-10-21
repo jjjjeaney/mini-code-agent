@@ -25,28 +25,26 @@ cp .env.example .env
 ## 使用
 
 ```bash
-uv run mca "用一句话解释什么是闭包"
+uv run mca
 ```
 
-`--model` 换模型；不写就用 `providers/anthropic.py` 里的 `DEFAULT_MODEL`（`deepseek-v4-flash`）。上下文窗口和压缩阈值会跟着模型名走。
+启动即进入交互模式，能连着聊：每条 prompt 接着上一条。`--model` 换模型；不写就用 `providers/anthropic.py` 里的 `DEFAULT_MODEL`（`deepseek-v4-flash`）。上下文窗口和压缩阈值会跟着模型名走。
 
 ```bash
-uv run mca --model deepseek-v4-pro "用一句话解释什么是闭包"
+uv run mca --model deepseek-v4-pro
 ```
+
+旧版 `mca "<prompt>"` 的一次性用法已移除；脚本里可以把 prompt 通过 stdin 喂进去（`printf '问题\n/exit\n' | uv run mca`），但要干净的机器输出请直接调用 `runagent`——交互模式的 stdout 会混有 `> ` 提示和退出时的 `bye`。
 
 `--api-key` / `--base-url` 可以临时覆盖 `.env` 里的 `DEEPSEEK_API_KEY` / `DEEPSEEK_ANTHROPIC_BASE_URL`。**密钥写在命令行上会留在 shell 历史和进程列表里**，日常还是用 `.env`；这两个参数主要给脚本或临时切换端点用。
 
-前台回合（交互、一次性，以及后台任务完成后的汇报回合）**总是流式**：模型正文边生成边打到终端上，没有关闭的开关。进历史、工具调用、用量和 `stop_reason` 仍然来自完整的最终消息。后台续跑、子 agent、压缩摘要不走流式——它们和前台共用终端，实时打字会互相插字。显示过一部分之后如果连接断了，**不会自动重连重发**（那会把已经打出来的字再打一遍），屏幕上留下的是不完整的内容，错误信息会提示你再发一次。
+前台回合（交互，以及后台任务完成后的汇报回合）**总是流式**：模型正文边生成边打到终端上，没有关闭的开关。进历史、工具调用、用量和 `stop_reason` 仍然来自完整的最终消息。后台续跑、子 agent、压缩摘要不走流式——它们和前台共用终端，实时打字会互相插字。显示过一部分之后如果连接断了，**不会自动重连重发**（那会把已经打出来的字再打一遍），屏幕上留下的是不完整的内容，错误信息会提示你再发一次。
 
 等待第一个正文 token 时，真终端上会显示一行「（等待模型输出…）」，输出一开始就擦掉；重定向到文件时这行不会出现。模型的推理过程不显示——thinking 块仍然随 `assistant_content` 落盘，续接对话时要用。
 
 每一轮结束时，最终答案之后会打用量：先是这一发的 token 用量；这一轮发了两发以上时，再跟一行「本次任务共 N 发」的合计（含同步跑完的子 agent）。只有一发时不重复打合计——那一发本身就是总和。只算 token，不换算金额。
 
-不带 prompt 就进交互模式，能连着聊：每条 prompt 接着上一条。以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/tasks`、`/compact`、`/grants`、`/permission_mode`、`/fork`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉提示词里那段说明，也就是重建前缀缓存）。
-
-```bash
-uv run mca
-```
+会话里以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/tasks`、`/compact`、`/grants`、`/permission_mode`、`/fork`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉提示词里那段说明，也就是重建前缀缓存）。
 
 权限档位有四档：`default`（改文件和跑命令都问）、`accept edits`（改文件不问，命令仍问）、`plan`（只读：改文件直接拒，命令仍问）、`bypass permissions`（什么都不问）。启动时用 `--permission_mode`，会话里用 `/permission_mode <档位>`；两者都从下一轮生效。
 

@@ -599,7 +599,7 @@ class TestBackground:
         assert "结论" in manager.take_notices()
 
     def test_without_background_support_it_runs_synchronously(self, tmp_path):
-        """一次性模式没有下一轮可以送结果——模型要了后台也只能同步跑完，并且说明一句。"""
+        """没有下一轮可以送结果的回合——模型要了后台也只能同步跑完，并且说明一句。"""
         provider = ScriptedProvider([text_turn("结论")])
         tool = the_tool(provider, tasks=TaskManager(), background_after=0.0)
 
@@ -633,7 +633,7 @@ class TestBackground:
             manager.wait(record.id, timeout=2)
 
     def test_without_a_broker_the_background_half_cannot_ask(self):
-        """没有 broker（一次性模式、测试）时退回兜底：需要当场批准的事写进结论。"""
+        """没有 broker（主要是测试）时退回兜底：需要当场批准的事写进结论。"""
         answer = BackgroundPrompter().confirm_edit(request())
 
         assert answer.allowed is False

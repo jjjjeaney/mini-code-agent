@@ -170,8 +170,8 @@ class ToolContext:
     fork: ForkContext | None = None
 
     # 这次运行认不认 `agent(run_in_background=true)`、以及要不要在两分钟后自动转后台。
-    # 和 `allow_shell` / `fork` 一样是**环境**，不是能力：一次性模式没有下一轮可以送结果，
-    # 所以那边是 False。
+    # 和 `allow_shell` / `fork` 一样是**环境**，不是能力：没有下一轮可以送结果的回合
+    # （比如后台任务完成后的汇报）是 False。
     allow_background: bool = False
 
     # 这一轮任务的 token 记账（见 usage.py）。**只有 `agent` 工具读它**：子 agent 要和

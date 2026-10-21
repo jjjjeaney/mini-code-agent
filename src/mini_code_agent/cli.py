@@ -299,7 +299,7 @@ def _chat(
             # 了，跑到一半不会变。
             spill_dir=spill.session_dir(cwd, session.id),
             allow_fork=state.allow_fork,
-            # 交互模式才有"下一轮"可以送后台结果；一次性模式那边不传。
+            # 交互模式有"下一轮"可以送后台结果。
             allow_background=True,
             notices=tasks.take_notices if tasks is not None else None,
             on_text=writer,
@@ -557,7 +557,6 @@ def _delete_session(cwd: Path, session_id: str, *, assume_yes: bool) -> None:
 
 @app.command()
 def main_command(
-    prompt: str = typer.Argument("", help="Prompt to send to the agent."),
     cwd: Path | None = typer.Option(None, "--cwd", "-C", help="agent 的工作目录，默认当前目录"),
     model: str = typer.Option(
         "",
@@ -600,8 +599,7 @@ def main_command(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="配合 --delete：不再问那一次"),
 ) -> None:
-    """把指令交给 agent，把最终回复打印到标准输出。"""
-    prompt = prompt.strip()
+    """进入交互会话：读入每一条指令，交给 agent。"""
     if list_:
         # 只看不做的活儿，排在所有检查和构造之前：它连 provider 都不需要，所以没有 API key
         # 也跑得起来，一个打错的档位也不该把一次列目录拦下。
@@ -660,8 +658,8 @@ def main_command(
         )
     else:
         session = start(workdir, permission_mode=permission_mode, allow_shell=shell)
-    # provider 建一次就够（一次运行一个 HTTP 客户端）。system prompt 不在这儿建：一次性那条
-    # 分支现拼一份，交互那条每轮重拼——记忆会中途变，见 _chat。
+    # provider 建一次就够（一次运行一个 HTTP 客户端）。system prompt 不在这儿建：每轮重拼
+    # ——记忆会中途变，见 _chat。
     provider = AnthropicProvider(
         model=model or DEFAULT_MODEL,
         api_key=api_key or None,
@@ -675,8 +673,7 @@ def main_command(
     # 子 agent 那个工具在这儿装进去（`agent`），和上面的 `ask_user` 一样是 harness 才有的能力。
     # **它排在 provider 后面，不是跟 ask_user 放一起**：那个工具要 provider 才能跑（子 agent
     # 是要真发请求的），而 `registry` 建在 provider **之前**——那个顺序是有意的，见上面
-    # "接会话排在 provider 前面"那句。两条路（一次性、_chat）共用同一个 registry，所以装在
-    # 这儿两边都用得上。
+    # "接会话排在 provider 前面"那句。registry 随后交给 _chat 使用，所以装在这儿。
     registry.register(
         make_agent_tool(
             provider=provider,
@@ -690,72 +687,6 @@ def main_command(
     # fork 不单独注册：它是 `agent` 的 `type` 枚举里的一项。开没开 `--fork` 由
     # `ToolContext.fork` 判——关着的时候 `agent(type="fork")` 会回一句"没打开"。枚举是静态的，
     # 所以切换开关**不会改工具表**；变的只有系统提示里那段说明。
-    if prompt:
-        # 一次性模式下用户那句不显示出来的话，输出里只有工具和回答，看不出在答什么。
-        console.print(f"> {prompt}", style="bold", markup=False)
-        # 接上来的历史可能已经很长了，先压一次再发。**这一轮之前没有真请求**，所以没有锚点，
-        # 只能整段按字符粗估——`--resume` 接上一个长历史时走的就是这条。
-        #
-        # 折在压前面，判据和 _chat 里那条一样（会话文件久没被写过 = 缓存大概冷了）。
-        history = fold_if_stale(
-            history,
-            foldable=registry.foldable_names(),
-            path=session.path,
-            persist=_persister(workdir, session),
-            persist_tools=registry.fold_persist_names(),
-        )
-        history = _compact(
-            history,
-            provider,
-            session,
-            size=context_size(history, tokens=None),
-            window=window_for(provider.model),
-        )
-        writer = _StreamWriter()
-        # 一次性模式没有下一轮，工具只改本回合的 ctx；登记它是为了让提示词里的说明
-        # 指向一个真存在的工具。
-        registry.register(make_set_permission_mode(prompter))
-        result = runagent(
-            prompt,
-            provider,
-            registry,
-            system=build_system_prompt(
-                workdir, permission_mode, provider.model, allow_fork=fork
-            ),
-            refresh_system=lambda mode: build_system_prompt(
-                workdir, mode, provider.model, allow_fork=fork
-            ),
-            cwd=workdir,
-            allow_shell=shell,
-            permission_mode=permission_mode,
-            prompter=prompter,
-            grants=grants,
-            messages=history,
-            spill_dir=spill.session_dir(workdir, session.id),
-            allow_fork=fork,
-            on_text=writer,
-            wait_hint=writer,
-            defer_final_usage=True,
-        )
-        # 长度得在 history 被换掉之前取——和 _chat 里同一处道理。
-        session.append(result.messages[len(history) :])
-        if result.error:
-            # 一次性模式没有"下一轮"，所以报错就退出——但退出码要是 1，别让脚本以为跑成了。
-            typer.echo(f"这一轮没跑成：{result.error}", err=True)
-            _print_usage(result)
-            raise typer.Exit(code=1)
-        if result.final is None:
-            typer.echo(
-                f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
-                err=True,
-            )
-            _print_usage(result)
-            raise typer.Exit(code=1)
-        if not result.final_streamed:
-            console.print(f"\n{result.final}", markup=False)
-        _print_usage(result)
-        return
-
     _chat(
         provider,
         registry,
