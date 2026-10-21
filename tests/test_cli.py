@@ -36,12 +36,21 @@ class ScriptedProvider:
         self.systems: list[str | None] = []
         # 每一发收到的那张工具表。和 calls / systems 一样按下标对齐。
         self.tools: list[list[dict] | None] = []
+        self.stream_calls: list[list[dict]] = []
 
     def complete(self, messages, tools=None, system=None) -> ModelResponse:
         self.calls.append([dict(m) for m in messages])
         self.systems.append(system)
         self.tools.append(tools)
         return self.responses.pop(0)
+
+    def stream(self, messages, tools=None, system=None, on_text=None) -> ModelResponse:
+        """前台回合走流式：照剧本拿一发，再把正文整个交出去（测试里不必分块）。"""
+        self.stream_calls.append([dict(m) for m in messages])
+        response = self.complete(messages, tools=tools, system=system)
+        if on_text is not None and response.text:
+            on_text(response.text)
+        return response
 
 
 def text_turn(text: str, *, input_tokens: int = 0) -> ModelResponse:
@@ -255,6 +264,12 @@ class FlakyProvider:
             raise ProviderError("连不上模型服务。")
         return self.responses.pop(0)
 
+    def stream(self, messages, tools=None, system=None, on_text=None) -> ModelResponse:
+        response = self.complete(messages, tools=tools, system=system)
+        if on_text is not None and response.text:
+            on_text(response.text)
+        return response
+
 
 def test_a_failed_turn_does_not_kill_the_session(monkeypatch, tmp_path, capsys):
     """请求失败只该收掉**这一轮**：说一句，然后下一句照常发得出去。
@@ -436,8 +451,6 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
             resume="",
             list_=True,
             delete_="",
-            stream=False,
-            show_thinking=False,
         )
 
     out = capsys.readouterr().out
@@ -473,8 +486,6 @@ def run_delete(tmp_path, session_id: str, *, yes: bool) -> None:
             list_=False,
             delete_=session_id,
             yes=yes,
-            stream=False,
-            show_thinking=False,
         )
 
 
@@ -540,8 +551,6 @@ def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
             list_=False,
             delete_="20200101-000000",
             yes=True,
-            stream=False,
-            show_thinking=False,
         )
 
 
@@ -594,6 +603,7 @@ class FakeOneShotProvider:
     def __init__(self) -> None:
         self.model = "fake"
         self.tools: list[dict] | None = None
+        self.stream_calls = 0
 
     def complete(self, messages, tools=None, system=None) -> ModelResponse:
         self.tools = tools
@@ -602,6 +612,13 @@ class FakeOneShotProvider:
             assistant_content=[{"type": "text", "text": "好"}],
             stop_reason="end_turn",
         )
+
+    def stream(self, messages, tools=None, system=None, on_text=None) -> ModelResponse:
+        self.stream_calls += 1
+        response = self.complete(messages, tools=tools, system=system)
+        if on_text is not None and response.text:
+            on_text(response.text)
+        return response
 
 
 def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
@@ -627,8 +644,6 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
         resume="",
         list_=False,
         delete_="",
-        stream=False,
-        show_thinking=False,
     )
 
     offered = {schema["name"] for schema in provider.tools or []}
@@ -665,8 +680,6 @@ def test_the_model_option_reaches_the_provider(monkeypatch, tmp_path, capsys):
             resume="",
             list_=False,
             delete_="",
-            stream=False,
-            show_thinking=False,
         )
 
     run(model="deepseek-v4-pro")
@@ -701,8 +714,6 @@ def test_the_endpoint_options_reach_the_provider(monkeypatch, tmp_path, capsys):
             resume="",
             list_=False,
             delete_="",
-            stream=False,
-            show_thinking=False,
         )
 
     run(api_key="sk-test", base_url="https://example.test")
@@ -735,8 +746,6 @@ def test_fork_is_a_type_of_the_agent_tool_in_both_cases(monkeypatch, tmp_path, c
             resume="",
             list_=False,
             delete_="",
-            stream=False,
-            show_thinking=False,
         )
         agent = next(schema for schema in provider.tools or [] if schema["name"] == "agent")
         return set(agent["input_schema"]["properties"]["type"]["enum"])
@@ -1026,8 +1035,6 @@ def test_the_one_shot_path_persists_before_folding(monkeypatch, tmp_path):
         resume=session.id,
         list_=False,
         delete_="",
-        stream=False,
-        show_thinking=False,
     )
 
     assert (spill.session_dir(tmp_path, session.id) / "t0.txt").is_file()
@@ -1123,6 +1130,8 @@ class TestBackgroundReporting:
         )
 
         assert "后台任务跑完了" in capsys.readouterr().out
+        # 汇报回合面向终端，属于前台：它走流式，不是 complete。
+        assert provider.stream_calls
         assert len(provider.calls) == 1
         # 完成通知和模型的话都要落进会话文件——下次 --resume 接上来时还看得见。
         _, _, history = load(tmp_path, session.id)

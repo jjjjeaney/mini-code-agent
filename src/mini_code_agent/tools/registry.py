@@ -107,7 +107,7 @@ class ToolRegistry:
         return tool.fn(args, ctx)
 
     def schemas(self, ctx: ToolContext) -> list[dict[str, Any]]:
-        """传给 provider.complete(tools=...) 的列表。
+        """传给 provider.complete / stream 的 tools 列表。
 
         **此刻用不上的不发**（见 `Tool.available`）——广告一个做不到的能力，模型会试一次、
         吃一条报错、还花掉一步。

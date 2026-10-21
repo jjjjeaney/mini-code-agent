@@ -333,9 +333,7 @@ def runagent(
     notices: Callable[[], str | None] | None = None,
     allow_background: bool = False,
     background_prompter: Callable[[threading.Event], Prompter] | None = None,
-    stream: bool = False,
     on_text: OnText | None = None,
-    on_thinking: OnText | None = None,
     wait_hint: WaitHint | None = None,
     defer_final_usage: bool = False,
     usage: UsageMeter | None = None,
@@ -388,14 +386,13 @@ def runagent(
       交互会话传 `BrokerPrompter`——请求排队、由读键盘线程在持有终端时问；不传就退回一律
       拒绝的 `BackgroundPrompter`（一次性模式、测试）。
 
-    **流式输出**（`stream=True` + `on_text`）：模型正文边生成边交给 `on_text`，但循环拿到
-    的 `ModelResponse` 仍然来自完整消息——历史回填、工具调用、用量、stop_reason 一样不少。
-    `on_thinking` 可选：传了就把推理过程也实时交出去，和正文之间自动隔一个换行。
-    `wait_hint` 可选：请求发出到第一个 token 之间调 `begin()`，请求结束（成功、失败、
-    thinking/正文已开始）后调 `end()`，给"等待提示"一个准确的窗口。
-    只有前台主 agent 该开流式：后台任务和子 agent 与前台共用终端，实时打字会互相插字。后台
-    那一半交接时会强制关掉。`on_text` 为空时即使 `stream=True` 也走非流式。provider 没有
-    `stream` 方法（测试假实现、别的后端）时同样回退。
+    **流式输出**：传了 `on_text` 就流式——模型正文边生成边交给它，但循环拿到的
+    `ModelResponse` 仍然来自完整消息，历史回填、工具调用、用量、stop_reason 一样不少。
+    `wait_hint` 可选：请求发出到第一个正文 chunk 之间调 `begin()`，请求结束（成功、失败、
+    正文已开始）后调 `end()`，给"等待提示"一个准确的窗口。推理过程不显示。
+    只有面向终端的前台回合传 `on_text`；后台续跑、子 agent 和压缩摘要不传，走非流式的
+    `complete()`——它们和前台共用终端，实时打字会互相插字。后台那一半交接时会强制清空。
+    传了 `on_text` 的 provider 必须实现 `stream`。
 
     `defer_final_usage=True` 时，最终回答那一发的用量行不在这里打，而是放进
     `AgentResult.final_usage`，由调用方在打印完答案之后输出——这样流式和非流式都是
@@ -450,9 +447,7 @@ def runagent(
         cancel: threading.Event | None,
         allow_handoff: bool,
         notices: Callable[[], str | None] | None,
-        stream: bool,
         on_text: OnText | None,
-        on_thinking: OnText | None,
         wait_hint: WaitHint | None,
         defer_final_usage: bool,
         usage: UsageMeter,
@@ -461,15 +456,14 @@ def runagent(
 
         `allow_handoff` 为 False 时不再二次交接——后台的不能再把自己转手出去。
         `notices` 只有主 agent 传：子 agent 不该吞掉主 agent 的后台通知。
-        `stream` / `on_text` / `on_thinking` / `wait_hint` 只在前台传；后台那一半固定关掉
-        （见 continuation）。`usage` 前后台共用同一个对象——后台续跑的请求也算进这一轮。
+        `on_text` / `wait_hint` 只在前台传；后台那一半固定不传（见 continuation）。
+        `usage` 前后台共用同一个对象——后台续跑的请求也算进这一轮。
         """
         trace: list[str] = []
         final: str | None = None
         final_streamed = False
         anchor: ContextAnchor | None = None
-        # 最近一发请求有没有把**最终回答的正文**实时交出去。每发重置；thinking 不算——
-        # 显示过推理过程不代表最终回答已经在屏幕上。
+        # 最近一发请求有没有把**最终回答的正文**实时交出去。每发重置。
         last_text_shown = False
         # 最终回答那一发的用量行；`defer_final_usage` 为真时交给调用方在答案之后打印。
         pending_usage: str | None = None
@@ -496,49 +490,28 @@ def runagent(
 
             last_text_shown = False
             pending_usage = None
-            streamer = (
-                getattr(provider, "stream", None)
-                if stream and on_text is not None
-                else None
-            )
-            if streamer is None:
+            if on_text is None:
                 response = provider.complete(sent, **kwargs)
             else:
                 started = False
-                last_kind: str | None = None
 
-                def start(kind: str) -> None:
-                    nonlocal started, last_kind
+                def start() -> None:
+                    nonlocal started
                     if not started:
                         # 和轮末 `console.print(f"\n{final}")` 那个空行对齐。
                         on_text("\n")
                         started = True
-                    elif last_kind != kind:
-                        # thinking 和正文之间隔一行，否则 dim 的推理会和回答粘在一起。
-                        on_text("\n")
-                    last_kind = kind
 
                 def handle_text(chunk: str) -> None:
                     nonlocal last_text_shown
-                    start("text")
+                    start()
                     last_text_shown = True
                     on_text(chunk)
-
-                def handle_thinking(chunk: str) -> None:
-                    start("thinking")
-                    on_thinking(chunk)
 
                 try:
                     if wait_hint is not None:
                         wait_hint.begin()
-                    response = streamer(
-                        sent,
-                        **kwargs,
-                        on_text=handle_text,
-                        on_thinking=(
-                            handle_thinking if on_thinking is not None else None
-                        ),
-                    )
+                    response = provider.stream(sent, **kwargs, on_text=handle_text)
                 finally:
                     # 异常路径也要收尾：否则后面的用量行、错误消息会粘在正文末尾。
                     if started:
@@ -653,10 +626,8 @@ def runagent(
                             allow_handoff=False,
                             notices=None,
                             # 后台和前台共用终端，实时打字会互相插字；而且此时用户可能正在
-                            # 提示符上输入。后台一律不流式。
-                            stream=False,
+                            # 提示符上输入。不传 on_text，走非流式的 complete()。
                             on_text=None,
-                            on_thinking=None,
                             wait_hint=None,
                             # 后台输出进的是缓冲区，没有"调用方打印答案"这一步——用量行
                             # 必须现在就写进去，否则会丢。
@@ -781,9 +752,7 @@ def runagent(
         cancel=None,
         allow_handoff=True,
         notices=notices,
-        stream=stream,
         on_text=on_text,
-        on_thinking=on_thinking,
         wait_hint=wait_hint,
         defer_final_usage=defer_final_usage,
         usage=usage,

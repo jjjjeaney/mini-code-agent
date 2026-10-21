@@ -232,16 +232,14 @@ class AnthropicProvider:
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
         on_text: Callable[[str], None] | None = None,
-        on_thinking: Callable[[str], None] | None = None,
     ) -> ModelResponse:
         """发一次流式请求：正文边生成边交给 `on_text`，结果仍然以完整消息为准。
 
         **终端显示和程序使用是两回事**：`on_text` 只负责把 delta 写出去；历史回填、工具
         调用、用量、stop_reason 全部来自 `get_final_message()`，和非流式路径共用 `_normalize`。
 
-        `on_thinking` 收的是模型的推理过程（`thinking_delta`），和正文分开：默认不显示，
-        调用方想显示就传进来。两者都算"已经显示过"——显示过一部分后连 thinking 也不能
-        重发，否则屏幕上会重复一遍。
+        推理过程不显示：`thinking_delta` 直接跳过；thinking block 仍然留在最终消息里，由
+        `_normalize` 原样带进 `assistant_content`，续接对话时要用。
 
         几条定下来的：
 
@@ -273,14 +271,11 @@ class AnthropicProvider:
                     if event.type != "content_block_delta":
                         continue
                     delta = event.delta
-                    if delta.type == "thinking_delta":
-                        if on_thinking is not None:
-                            shown = True
-                            on_thinking(delta.thinking)
-                    elif delta.type == "text_delta":
-                        if on_text is not None:
-                            shown = True
-                            on_text(delta.text)
+                    # thinking delta 不显示；thinking block 仍然在最终消息里，由 _normalize
+                    # 原样带回 assistant_content，续接对话时要用。
+                    if delta.type == "text_delta" and on_text is not None:
+                        shown = True
+                        on_text(delta.text)
                 try:
                     response = live.get_final_message()
                 except AssertionError as exc:

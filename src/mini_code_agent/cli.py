@@ -102,10 +102,10 @@ def _persister(cwd: Path, session: Session) -> PersistText:
 
 
 class _StreamWriter:
-    """流式输出的终端写入器：正文、thinking，以及"等第一个 token"的提示。
+    """流式输出的终端写入器：正文，以及"等第一个 token"的提示。
 
-    `begin()` / `end()` 实现 agent 的 `WaitHint`；`__call__` 是正文；`thinking` 是推理。
-    等待提示只在真终端上显示，并且用 `\\r` 擦掉——重定向到文件时不能留下控制字符。
+    `begin()` / `end()` 实现 agent 的 `WaitHint`；`__call__` 是正文。等待提示只在真终端上
+    显示，并且用 `\\r` 擦掉——重定向到文件时不能留下控制字符。
     """
 
     _HINT = "（等待模型输出…）"
@@ -126,13 +126,6 @@ class _StreamWriter:
     def __call__(self, chunk: str) -> None:
         self._clear()
         console.print(chunk, end="", markup=False, highlight=False, emoji=False)
-        self._flush()
-
-    def thinking(self, chunk: str) -> None:
-        self._clear()
-        console.print(
-            chunk, end="", style="dim", markup=False, highlight=False, emoji=False
-        )
         self._flush()
 
     def _clear(self) -> None:
@@ -177,8 +170,6 @@ def _chat(
     allow_fork: bool = False,
     tasks: TaskManager | None = None,
     broker: PermissionBroker | None = None,
-    stream: bool = False,
-    show_thinking: bool = False,
 ) -> None:
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
@@ -303,11 +294,9 @@ def _chat(
             # 交互模式才有"下一轮"可以送后台结果；一次性模式那边不传。
             allow_background=True,
             notices=tasks.take_notices if tasks is not None else None,
-            stream=stream,
             on_text=writer,
-            on_thinking=writer.thinking if show_thinking else None,
             wait_hint=writer,
-            # 最终答案先打出来，用量行再跟上——和非流式保持同一个顺序。
+            # 最终答案先打出来，用量行再跟上——答案在前、用量在后。
             defer_final_usage=True,
         )
         absorb(result)
@@ -339,6 +328,9 @@ def _chat(
 
         `max_steps=1` + `NullPrompter`：这一回合只许说话。用户可能正停在提示符上输入，
         不能弹权限问题；也不该借"汇报"之名开始新的工作。
+
+        这个回合面向终端，属于前台：正文走流式。真正被交接出去的后台续跑不流式。
+        刻意不传 `wait_hint`——用户可能正停在 `> ` 上，`\\r` 擦除会清掉提示和已输入的内容。
         """
         if tasks is None:
             return
@@ -368,6 +360,7 @@ def _chat(
             spill_dir=spill.session_dir(cwd, session.id),
             allow_fork=state.allow_fork,
             allow_background=False,
+            on_text=writer,
             defer_final_usage=True,
         )
         absorb(result)
@@ -375,7 +368,7 @@ def _chat(
             typer.echo(f"后台任务的汇报没发出去：{result.error}", err=True)
             _print_usage(result)
             return
-        if result.final is not None:
+        if result.final is not None and not result.final_streamed:
             console.print(f"\n{result.final}", markup=False)
         _print_usage(result)
 
@@ -579,16 +572,6 @@ def main_command(
         "--fork",
         help="允许主 agent 派 fork 类型的子 agent：继承当前对话和缓存前缀",
     ),
-    stream: bool = typer.Option(
-        False,
-        "--stream",
-        help="实时打印模型正文（只影响前台回合；后台任务和子 agent 不流式）",
-    ),
-    show_thinking: bool = typer.Option(
-        False,
-        "--show-thinking",
-        help="把模型的推理过程也用 dim 显示出来（隐含打开 --stream）",
-    ),
     permission_mode: str = typer.Option(
         "default",
         "--permission_mode",
@@ -608,8 +591,6 @@ def main_command(
 ) -> None:
     """把指令交给 agent，把最终回复打印到标准输出。"""
     prompt = prompt.strip()
-    # 推理只有流式拿得到；单独开这个开关就是"要看过程"，隐含打开流式。
-    stream = stream or show_thinking
     if list_:
         # 只看不做的活儿，排在所有检查和构造之前：它连 provider 都不需要，所以没有 API key
         # 也跑得起来，一个打错的档位也不该把一次列目录拦下。
@@ -735,9 +716,7 @@ def main_command(
             messages=history,
             spill_dir=spill.session_dir(workdir, session.id),
             allow_fork=fork,
-            stream=stream,
             on_text=writer,
-            on_thinking=writer.thinking if show_thinking else None,
             wait_hint=writer,
             defer_final_usage=True,
         )
@@ -771,13 +750,11 @@ def main_command(
         prompter=prompter,
         grants=grants,
         # 提示词里要写"你是哪个模型"。**从这儿传进去，不是去 provider 里取**——Provider 协议
-        # 只声明了 complete，认得它不等于认得 model；手上这份是真的 AnthropicProvider。
+        # 声明的是能力，不认识 model；手上这份是真的 AnthropicProvider。
         model=provider.model,
         allow_fork=fork,
         tasks=tasks,
         broker=broker,
-        stream=stream,
-        show_thinking=show_thinking,
     )
     print("bye")
 

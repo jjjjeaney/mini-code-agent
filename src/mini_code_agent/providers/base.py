@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -74,11 +75,24 @@ class ModelResponse:
 
 
 class Provider(Protocol):
-    """agent 需要的最小后端能力：发一次请求，拿回归一化后的响应。"""
+    """agent 需要的后端能力：内部回合用 `complete`，前台终端回合用 `stream`。
+
+    **两个方法的分工不是可选项**：用户能看见的那几个回合（交互、一次性、后台任务完成后的
+    汇报）一律走 `stream`，没有"关掉流式"的开关；后台续跑、子 agent、压缩摘要不面向终端，
+    走 `complete`——它们和前台共用终端，实时打字会互相插字。
+    """
 
     def complete(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
+    ) -> ModelResponse: ...
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        system: str | None = None,
+        on_text: Callable[[str], None] | None = None,
     ) -> ModelResponse: ...

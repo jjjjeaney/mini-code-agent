@@ -137,7 +137,9 @@ def test_text_deltas_are_shown_and_the_final_message_is_normalized():
 
 def test_thinking_and_tool_blocks_are_kept_but_not_printed():
     final = _final([_thinking("想一下"), _text("好的"), _tool()], stop_reason="tool_use")
-    provider = provider_with(FakeMessages(FakeStream(["好的"], final)))
+    provider = provider_with(
+        FakeMessages(FakeStream([("thinking", "想一下"), "好的"], final))
+    )
     seen: list[str] = []
 
     response = provider.stream([], on_text=seen.append)
@@ -149,22 +151,6 @@ def test_thinking_and_tool_blocks_are_kept_but_not_printed():
         "tool_use",
     ]
     assert response.tool_calls[0].name == "read_file"
-
-
-def test_thinking_deltas_go_to_their_own_callback():
-    final = _final([_thinking("想一下"), _text("好的")])
-    provider = provider_with(
-        FakeMessages(FakeStream([("thinking", "想一下"), "好的"], final))
-    )
-    thinking: list[str] = []
-    text: list[str] = []
-
-    response = provider.stream([], on_text=text.append, on_thinking=thinking.append)
-
-    assert thinking == ["想一下"]
-    assert text == ["好的"]
-    assert response.text == "好的"
-    assert response.assistant_content[0]["thinking"] == "想一下"
 
 
 def test_a_tool_only_response_prints_nothing():
@@ -269,18 +255,14 @@ def test_a_transport_error_after_text_is_not_retried():
 class StreamingProvider:
     model = "fake"
 
-    def __init__(self, chunks=("你", "好"), thinking=(), input_tokens=0):
+    def __init__(self, chunks=("你", "好"), input_tokens=0):
         self.chunks = chunks
-        self.thinking = thinking
         self.input_tokens = input_tokens
         self.stream_calls: list[dict] = []
         self.complete_calls: list[dict] = []
 
-    def stream(self, messages, tools=None, system=None, on_text=None, on_thinking=None):
+    def stream(self, messages, tools=None, system=None, on_text=None):
         self.stream_calls.append({"tools": tools, "system": system})
-        if on_thinking is not None:
-            for chunk in self.thinking:
-                on_thinking(chunk)
         if on_text is not None:
             for chunk in self.chunks:
                 on_text(chunk)
@@ -301,51 +283,17 @@ class StreamingProvider:
         )
 
 
-class PlainProvider:
-    def __init__(self):
-        self.calls = 0
-
-    def complete(self, messages, tools=None, system=None):
-        self.calls += 1
-        return ModelResponse(
-            text="完整回复",
-            assistant_content=[{"type": "text", "text": "完整回复"}],
-            stop_reason="end_turn",
-        )
-
-
 def test_the_agent_streams_the_foreground_turn():
     provider = StreamingProvider()
     seen: list[str] = []
 
-    result = runagent("hi", provider, ToolRegistry([]), stream=True, on_text=seen.append)
+    result = runagent("hi", provider, ToolRegistry([]), on_text=seen.append)
 
     assert provider.stream_calls
     assert provider.complete_calls == []
     # 首尾各一个换行：前面隔开提示符，后面隔开用量行。
     assert seen == ["\n", "你", "好", "\n"]
     assert result.final == "你好"
-    assert result.final_streamed is True
-
-
-def test_thinking_is_shown_before_the_answer():
-    provider = StreamingProvider(chunks=("好",), thinking=("想",))
-    text: list[str] = []
-    thinking: list[str] = []
-
-    result = runagent(
-        "hi",
-        provider,
-        ToolRegistry([]),
-        stream=True,
-        on_text=text.append,
-        on_thinking=thinking.append,
-    )
-
-    assert thinking == ["想"]
-    # 开头一个换行、thinking→正文切换一个换行、正文、结尾一个换行。
-    assert text == ["\n", "\n", "好", "\n"]
-    assert result.final == "好"
     assert result.final_streamed is True
 
 
@@ -367,7 +315,6 @@ def test_the_wait_hint_brackets_a_streamed_request():
         "hi",
         StreamingProvider(),
         ToolRegistry([]),
-        stream=True,
         on_text=lambda chunk: None,
         wait_hint=hint,
     )
@@ -379,7 +326,7 @@ def test_the_wait_hint_is_cleared_when_the_request_fails():
     class FailingProvider:
         model = "fake"
 
-        def stream(self, messages, tools=None, system=None, on_text=None, on_thinking=None):
+        def stream(self, messages, tools=None, system=None, on_text=None):
             raise ProviderError("断了")
 
         def complete(self, messages, tools=None, system=None):
@@ -390,7 +337,6 @@ def test_the_wait_hint_is_cleared_when_the_request_fails():
         "hi",
         FailingProvider(),
         ToolRegistry([]),
-        stream=True,
         on_text=lambda chunk: None,
         wait_hint=hint,
     )
@@ -399,40 +345,14 @@ def test_the_wait_hint_is_cleared_when_the_request_fails():
     assert hint.calls == ["begin", "end"]
 
 
-def test_a_provider_without_stream_does_not_show_the_wait_hint():
-    hint = RecordingHint()
-
-    runagent(
-        "hi",
-        PlainProvider(),
-        ToolRegistry([]),
-        stream=True,
-        on_text=lambda chunk: None,
-        wait_hint=hint,
-    )
-
-    assert hint.calls == []
-
-
-def test_a_provider_without_stream_falls_back_to_complete():
-    provider = PlainProvider()
-    seen: list[str] = []
-
-    result = runagent("hi", provider, ToolRegistry([]), stream=True, on_text=seen.append)
-
-    assert provider.calls == 1
-    assert seen == []
-    assert result.final == "完整回复"
-    assert result.final_streamed is False
-
-
-def test_stream_without_a_callback_uses_complete():
+def test_without_a_callback_uses_complete():
     provider = StreamingProvider()
 
-    result = runagent("hi", provider, ToolRegistry([]), stream=True)
+    result = runagent("hi", provider, ToolRegistry([]))
 
     assert provider.complete_calls
     assert provider.stream_calls == []
+    assert result.final == "完整回复"
     assert result.final_streamed is False
 
 
@@ -449,7 +369,6 @@ def test_a_background_handoff_does_not_stream():
         "hi",
         provider,
         ToolRegistry([]),
-        stream=True,
         on_text=seen.append,
         background_after=0,
         handoff=handoff,
@@ -485,11 +404,12 @@ def test_the_cli_does_not_print_a_streamed_answer_twice(monkeypatch, tmp_path, c
         permission_mode="default",
         prompter=NullPrompter(),
         grants=Grants(),
-        stream=True,
     )
 
     out = capsys.readouterr().out
     assert out.count("你好") == 1
+    # 没有开关：前台回合本来就该流式。
+    assert provider.stream_calls
 
 
 def test_a_streamed_answer_also_prints_usage_after_it(monkeypatch, tmp_path, capsys):
@@ -508,37 +428,10 @@ def test_a_streamed_answer_also_prints_usage_after_it(monkeypatch, tmp_path, cap
         permission_mode="default",
         prompter=NullPrompter(),
         grants=Grants(),
-        stream=True,
     )
 
     out = capsys.readouterr().out
     assert out.index("答案") < out.index("这一发 token")
-
-
-def test_the_cli_can_show_thinking(monkeypatch, tmp_path, capsys):
-    provider = StreamingProvider(chunks=("好",), thinking=("想",))
-    answers = iter(["你好", "/exit"])
-    monkeypatch.setattr(cli.typer, "prompt", lambda *args, **kwargs: next(answers))
-    session = start(tmp_path, permission_mode="default", allow_shell=False)
-
-    cli._chat(
-        provider,
-        ToolRegistry([]),
-        session,
-        [],
-        cwd=tmp_path,
-        allow_shell=False,
-        permission_mode="default",
-        prompter=NullPrompter(),
-        grants=Grants(),
-        stream=True,
-        show_thinking=True,
-    )
-
-    out = capsys.readouterr().out
-    assert out.count("想") == 1
-    assert out.count("好") == 1
-    assert out.index("想") < out.index("好")
 
 
 def test_the_wait_hint_is_printed_and_erased_on_a_terminal(monkeypatch, capsys):
