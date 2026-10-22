@@ -156,7 +156,7 @@ class TestDecidePermission:
     @pytest.mark.parametrize("mode", PERMISSION_MODES)
     def test_read_only_tools_are_never_gated(self, mode):
         """读、列目录、搜索本来就只受路径闸门管，逐个问没人受得了。"""
-        for name in ("read_file", "list_files", "grep", "glob", "project_tree", "echo"):
+        for name in ("read_file", "list_files", "grep", "glob", "project_tree"):
             assert decide_permission(request(name), SHELL_ON, mode).decision == "allow"
 
     def test_an_unknown_tool_is_allowed(self):

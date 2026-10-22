@@ -867,7 +867,7 @@ cancel` 让它在下一步之前停下（正在跑的命令不会被硬杀，见
 
 **谁能并行**：`read_file` / `grep` / `glob` / `list_files` / `project_tree` / `read_memory` /
 `read_skill` / `read_skill_file` / `read_tool_result` / `web_search` / `web_fetch`。
-`write_file` / `edit_file` / `replace_lines` / `bash` / `remember` / `echo` / `ask_user` /
+`write_file` / `edit_file` / `replace_lines` / `bash` / `remember` / `ask_user` /
 `agent` 都是屏障。
 
 **为什么按段，而不是"读的并行、写的同时串行"**：模型给出的顺序有隐含语义——排在一个写之后

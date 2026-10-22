@@ -10,7 +10,6 @@ from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.skills import index_text as skill_index
 from mini_code_agent.tools import spill
 from mini_code_agent.tools.base import Tool, ToolContext, ToolResult
-from mini_code_agent.tools.builtin import ECHO_SCHEMA, echo
 from mini_code_agent.tools.files import (
     EDIT_FILE_SCHEMA,
     GLOB_SCHEMA,
@@ -173,16 +172,10 @@ def default_tools() -> ToolRegistry:
 
     只读的那些标了 `read_only=True`（语义见 tools/base.py 那个字段）——子 agent 里
     explore / plan 两个类型的工具池就是按它筛出来的（见 core/subagent.py）。标的时候
-    想的是"这个动作会不会改变什么"，所以 `echo` 不标：它往终端打印，那是输出。
+    想的是"这个动作会不会改变什么"：写盘、跑命令、改长期记忆的那些都不标。
     """
     return ToolRegistry(
         [
-            Tool(
-                name="echo",
-                description="把一段文本打印到终端。需要让用户看到某段内容时用它。",
-                fn=echo,
-                params=ECHO_SCHEMA,
-            ),
             Tool(
                 name="list_files",
                 description=(

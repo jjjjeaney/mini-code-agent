@@ -18,7 +18,6 @@ from mini_code_agent.tools import (
     spill,
     web,
 )
-from mini_code_agent.tools.builtin import echo as builtin_echo
 from mini_code_agent.tools.safety import MAX_TOOL_CHARS
 from mini_code_agent.tools.spill import TOOL_RESULTS_DIR
 
@@ -177,18 +176,9 @@ class TestToolRegistry:
         assert "缺少必填参数" in result.result
 
 
-class TestBuiltinEcho:
-    def test_prints_the_text_and_returns_a_confirmation(self, ctx, capsys):
-        result = builtin_echo({"text": "你好"}, ctx)
-
-        assert capsys.readouterr().out == "你好\n"
-        assert "你好" in result
-
-
 class TestDefaultTools:
     def test_registers_the_builtin_tools(self):
         assert [tool.name for tool in default_tools().list()] == [
-            "echo",
             "list_files",
             "project_tree",
             "read_file",
@@ -209,19 +199,8 @@ class TestDefaultTools:
             "read_tool_result",
         ]
 
-    def test_echo_schema_requires_text(self, ctx):
-        schema = default_tools().schemas(ctx)[0]
-
-        assert schema["name"] == "echo"
-        assert schema["input_schema"]["required"] == ["text"]
-
     def test_each_call_returns_a_fresh_registry(self):
         assert default_tools() is not default_tools()
-
-    def test_echo_runs_through_the_registry(self, ctx, capsys):
-        default_tools().run(ctx, "echo", {"text": "hi"})
-
-        assert capsys.readouterr().out == "hi\n"
 
     def test_the_read_only_ones_are_exactly_these(self):
         """子 agent 里 explore / plan 两个类型只有这批工具（见 core/subagent.py）。
@@ -247,17 +226,12 @@ class TestDefaultTools:
         }
 
     def test_the_ones_that_change_something_are_not_read_only(self):
-        """剩下这六个都会改变点什么：写盘、跑命令、改长期记忆，或者——`echo`——往终端输出。
-
-        **`echo` 是这组里唯一值得犹豫的那个**：它不碰盘也不碰记忆，但它是给用户的输出，
-        不是从外界取信息。判据是"这个动作会不会改变什么"，所以它在这儿。
-        """
+        """剩下这五个都会改变点什么：写盘、跑命令、改长期记忆。"""
         changes_something = {
             tool.name for tool in default_tools().list() if not tool.read_only
         }
 
         assert changes_something == {
-            "echo",
             "remember",
             "write_file",
             "edit_file",
