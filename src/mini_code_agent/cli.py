@@ -21,15 +21,15 @@ from mini_code_agent.core.subagent import make_agent_tool
 from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.folding import PersistText, fold_if_stale
 from mini_code_agent.interaction import PermissionBroker, ask_permission
-from mini_code_agent.memory import sync_index
+from mini_code_agent.memory import sync_memory_index
 from mini_code_agent.permission_tool import make_set_permission_mode
 from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
 from mini_code_agent.providers.anthropic import DEFAULT_MODEL, AnthropicProvider
 from mini_code_agent.providers.base import Provider
-from mini_code_agent.sessions import Session, delete, describe, load, start, summary_message
-from mini_code_agent.skills import sync_index as sync_skill_index
+from mini_code_agent.sessions import Session, delete_session, load, start, summary_message
+from mini_code_agent.skills import sync_skill_index
 from mini_code_agent.summarizing import KEEP_RECENT_TURNS, context_size, cut_point, summarize
 from mini_code_agent.system_prompt import build_system_prompt
 from mini_code_agent.tools import ToolRegistry, default_tools, spill
@@ -522,39 +522,6 @@ def _chat(
             broker.close("用户离开了，后台任务不能再请求授权。")
 
 
-def _delete_session(cwd: Path, session_id: str, *, assume_yes: bool) -> None:
-    """删掉一次会话：**先把要删的那次摆出来，问过才动手**。
-
-    顺序是有意的。会话文件是那次对话唯一的记录——没有回收站，也不像改文件那样有
-    `.agent/.history` 兜着（`Session.append` 是纯追加，从来不备份）。所以这一步要让人
-    **看清删的是哪一次**再答：id 是一串数字加后缀，光看它认不出那是哪一回，最后那句人话才是
-    认得出的那个钩子（和 `--list` 里那栏同一个用途）。
-
-    `--yes` 跳过那一次问答，给脚本用。
-    """
-    try:
-        target = describe(cwd, session_id)
-    except FileNotFoundError as exc:
-        raise typer.BadParameter(str(exc), param_hint="--delete") from None
-
-    what = f"{target.messages} 条消息" if target.messages else "没说过话"
-    spilled = spill.count_session(cwd, target.id)
-    if spilled:
-        # **要一起删的也得说出来**。只报"删掉某次会话"的话，用户不知道还端掉了一批落盘文件
-        # ——那里面可能正是他想留着的东西（某条命令的完整输出）。
-        what += f"，连同 {spilled} 个落盘文件"
-    console.print(f"要删的是 {target.id}（{what}）", style="bold", markup=False)
-    if target.preview:
-        console.print(f"  最后一句：「{target.preview}」", markup=False)
-    if not assume_yes and not typer.confirm(f"删掉 {target.id}？删了拿不回来"):
-        console.print("没删。", markup=False)
-        return
-    delete(cwd, target.id)
-    # 落盘的工具结果属于这次会话，跟着一起端掉（见 tools/spill.py）。
-    spill.remove_session(cwd, target.id)
-    console.print(f"删掉了 {target.id}。", markup=False)
-
-
 @app.command()
 def main_command(
     cwd: Path | None = typer.Option(None, "--cwd", "-C", help="agent 的工作目录，默认当前目录"),
@@ -595,9 +562,8 @@ def main_command(
         False, "--list", help="列出这个目录下有过哪些会话（连同各自的 id），然后退出"
     ),
     delete_: str = typer.Option(
-        "", "--delete", help="删掉指定 id 的会话（删之前会摆出来问一次），然后退出"
+        "", "--delete", help="删掉指定 id 的会话（连同落盘文件），然后退出"
     ),
-    yes: bool = typer.Option(False, "--yes", "-y", help="配合 --delete：不再问那一次"),
 ) -> None:
     """进入交互会话：读入每一条指令，交给 agent。"""
     if list_:
@@ -608,7 +574,10 @@ def main_command(
     if delete_:
         # 删除同理，也排在构造之前：它不是 agent 的动作，是用户对自己的文件动手——不该需要
         # provider，也不该因为顺带写错了个档位就被拦下。
-        _delete_session(cwd or Path.cwd(), delete_, assume_yes=yes)
+        try:
+            delete_session(cwd or Path.cwd(), delete_)
+        except FileNotFoundError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--delete") from None
         raise typer.Exit()
     try:
         permission_mode = parse_permission_mode(permission_mode)
@@ -638,7 +607,7 @@ def main_command(
     workdir = cwd or Path.cwd()
     # 让磁盘上那两份索引（记忆、技能）跟目录对齐：手工加/删过的话它们会漂（不影响模型——
     # 模型看的是现算的那份）。只在真不一样时才写，目录不存在就直接返回。
-    sync_index(workdir)
+    sync_memory_index(workdir)
     sync_skill_index(workdir)
     # 会话：接着上一次，或者开一个新的。两个分支共用同一份落盘。**放在 provider 前面**——
     # 接不上的时候该报的是"没有这个会话"，而不是别的什么。

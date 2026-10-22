@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mini_code_agent.memory import index_text, names, read, sync_index, write
+from mini_code_agent.memory import index_text, names, read, sync_memory_index, write
 from mini_code_agent.memory.store import INDEX_NAME, Memory, memory_dir, render
 from mini_code_agent.tools.base import ToolContext
 from mini_code_agent.tools.memory import read_memory, remember
@@ -145,7 +145,7 @@ class TestSyncIndex:
     def test_a_hand_added_memory_lands_in_the_index(self, tmp_path):
         self.hand_write(tmp_path)
 
-        assert sync_index(tmp_path) is True
+        assert sync_memory_index(tmp_path) is True
 
         assert "hand-made" in self.disk_index(tmp_path)
 
@@ -154,7 +154,7 @@ class TestSyncIndex:
         write(tmp_path, a_memory(name="bbb"))
         (memory_dir(tmp_path) / "aaa.md").unlink()
 
-        assert sync_index(tmp_path) is True
+        assert sync_memory_index(tmp_path) is True
 
         assert "aaa" not in self.disk_index(tmp_path)
         assert "bbb" in self.disk_index(tmp_path)
@@ -163,11 +163,11 @@ class TestSyncIndex:
         """稳态下一个字节都不动——不然每次启动都重写一遍。"""
         write(tmp_path, a_memory())
 
-        assert sync_index(tmp_path) is False
+        assert sync_memory_index(tmp_path) is False
 
     def test_no_directory_means_nothing_happens(self, tmp_path):
         """不因为跑一次 agent，就在别人项目里造一个 .agent/memory/。"""
-        assert sync_index(tmp_path) is False
+        assert sync_memory_index(tmp_path) is False
         assert not (tmp_path / ".agent").exists()
 
 

@@ -13,7 +13,7 @@ skill 是目录，能带附件。设计见 `docs/skill-design.md`。
   两处都写迟早会不一致，而目录名是躲不掉的。
 - **只有人手写**，所以这里没有 `write()`。agent 只读——记忆至少是"事实"，skill 是"步骤"，
   不该让模型自己给自己立规矩。
-- **索引不手工维护**，跟记忆一样：`sync_index` 重扫一遍对齐。手工加/删一份 skill 会让它漂，
+- **索引不手工维护**，跟记忆一样：`sync_skill_index` 重扫一遍对齐。手工加/删一份 skill 会让它漂，
   所以启动时对一次，只在真不一样时才写。
 - **提示词里那份索引是现算的**（`index_text()` 每次扫目录），磁盘上那个 `SKILLS.md` 只是给人
   翻的副本——所以手工加一份、还没重建索引，下次拼提示词就已经能看见它了。
@@ -120,7 +120,7 @@ def index_text(cwd: Path) -> str:
     return "\n".join(lines)
 
 
-def sync_index(cwd: Path) -> bool:
+def sync_skill_index(cwd: Path) -> bool:
     """让磁盘上那份索引跟目录里实际有什么对齐；写了返回 True。
 
     **只在真的不一样时才写**：手工加过、删过之后它会漂（模型那边不受影响——它看的是现算的

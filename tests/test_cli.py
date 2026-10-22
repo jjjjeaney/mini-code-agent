@@ -485,8 +485,8 @@ def test_sessions_marks_the_one_you_are_in(monkeypatch, tmp_path, capsys):
     assert f"* {session.id}" in capsys.readouterr().out
 
 
-def run_delete(tmp_path, session_id: str, *, yes: bool) -> None:
-    """跑一次 `mca --delete <id>`。两条路都以 typer.Exit 收场——删了，或者用户没同意。"""
+def run_delete(tmp_path, session_id: str) -> None:
+    """跑一次 `mca --delete <id>`。删除不再问，所以总是以 typer.Exit 收场。"""
     with pytest.raises(typer.Exit):
         cli.main_command(
             cwd=tmp_path,
@@ -500,52 +500,44 @@ def run_delete(tmp_path, session_id: str, *, yes: bool) -> None:
             resume="",
             list_=False,
             delete_=session_id,
-            yes=yes,
         )
 
 
-def test_delete_shows_what_it_would_remove_and_asks_first(tmp_path, capsys, monkeypatch):
-    """id 是一串时间戳，光看它认不出是哪一回——所以要把"最后说了什么"摆出来，再问一次。
+def test_delete_shows_what_it_removes_and_does_not_ask(tmp_path, capsys, monkeypatch):
+    """id 是一串时间戳，光看它认不出是哪一回——所以删之前要把"最后说了什么"摆出来。
 
-    删错了拿不回来：没有回收站，也不像改文件那样有 `.agent/.history` 兜着（会话是纯追加的，
-    从来不备份）。所以默认是要问的。
+    但**不再二次确认**：点名即删。这里把 typer.confirm 换成一碰就报错，确认那条路
+    真的没了。
     """
     session = start(tmp_path, permission_mode="default", allow_shell=False)
     session.append([{"role": "user", "content": "这一段对话我不要了"}])
-    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: False)
 
-    run_delete(tmp_path, session.id, yes=False)
+    def never_ask(*args, **kwargs):
+        raise AssertionError("--delete 不该再问")
+
+    monkeypatch.setattr(cli.typer, "confirm", never_ask)
+
+    run_delete(tmp_path, session.id)
 
     out = capsys.readouterr().out
     assert session.id in out
     assert "1 条消息" in out
     assert "这一段对话我不要了" in out
-    assert "没删" in out
-    assert session.path.exists()
-
-
-def test_answering_yes_removes_the_file(tmp_path, capsys, monkeypatch):
-    """顺带证明它**不需要 provider**：删除排在构造之前，没有 API key 也跑得起来。"""
-    session = start(tmp_path, permission_mode="default", allow_shell=False)
-    session.append([{"role": "user", "content": "删了我"}])
-    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: True)
-
-    run_delete(tmp_path, session.id, yes=False)
-
+    assert "删掉了" in out
     assert not session.path.exists()
-    assert "删掉了" in capsys.readouterr().out
 
 
-def test_the_yes_flag_skips_the_question(tmp_path, monkeypatch):
+def test_delete_does_not_need_a_provider(tmp_path, monkeypatch):
+    """删除排在 provider 构造之前：没有 API key 也跑得起来。"""
+
+    def no_provider(**kwargs):
+        raise AssertionError("删除不该构造 provider")
+
+    monkeypatch.setattr(cli, "AnthropicProvider", no_provider)
     session = start(tmp_path, permission_mode="default", allow_shell=False)
     session.append([{"role": "user", "content": "删了我"}])
 
-    def never_ask(*args, **kwargs):
-        raise AssertionError("给了 --yes 就不该再问")
-
-    monkeypatch.setattr(cli.typer, "confirm", never_ask)
-
-    run_delete(tmp_path, session.id, yes=True)
+    run_delete(tmp_path, session.id)
 
     assert not session.path.exists()
 
@@ -564,7 +556,6 @@ def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
             resume="",
             list_=False,
             delete_="20200101-000000",
-            yes=True,
         )
 
 
@@ -591,21 +582,15 @@ def test_spilled_output_lands_in_this_sessions_directory(monkeypatch, tmp_path):
     assert saved[0].read_text(encoding="utf-8") == "x" * (MAX_TOOL_CHARS + 1)
 
 
-def test_delete_takes_the_spilled_files_with_it(tmp_path, capsys, monkeypatch):
-    """落盘的工具结果属于那次会话——删会话要一起端掉，而且**动手之前要说清有几个**。"""
+def test_delete_takes_the_spilled_files_with_it(tmp_path, capsys):
+    """落盘的工具结果属于那次会话——删会话要一起端掉，而且删之前要说清有几个。"""
     session = start(tmp_path, permission_mode="default", allow_shell=False)
     session.append([{"role": "user", "content": "跑了一条很长的命令"}])
     directory = spill.session_dir(tmp_path, session.id)
     directory.mkdir(parents=True)
     (directory / "bash-abc123.txt").write_text("很长的输出", encoding="utf-8")
 
-    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: False)
-    run_delete(tmp_path, session.id, yes=False)
-    capsys.readouterr()
-    assert directory.exists()  # 答了"不删"，那批文件一个都不动
-
-    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: True)
-    run_delete(tmp_path, session.id, yes=False)
+    run_delete(tmp_path, session.id)
 
     assert "1 个落盘文件" in capsys.readouterr().out
     assert not directory.exists()

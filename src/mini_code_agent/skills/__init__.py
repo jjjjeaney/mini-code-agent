@@ -16,7 +16,7 @@ from mini_code_agent.skills.store import (
     names,
     read,
     skills_dir,
-    sync_index,
+    sync_skill_index,
 )
 
 __all__ = [
@@ -29,5 +29,5 @@ __all__ = [
     "names",
     "read",
     "skills_dir",
-    "sync_index",
+    "sync_skill_index",
 ]

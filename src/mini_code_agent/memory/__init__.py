@@ -5,6 +5,6 @@
 存储、召回、提取、整理、分类这些设计上的取舍见 `docs/memory-design.md`。
 """
 
-from mini_code_agent.memory.store import Memory, index_text, names, read, sync_index, write
+from mini_code_agent.memory.store import Memory, index_text, names, read, sync_memory_index, write
 
-__all__ = ["Memory", "index_text", "names", "read", "sync_index", "write"]
+__all__ = ["Memory", "index_text", "names", "read", "sync_memory_index", "write"]

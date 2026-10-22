@@ -32,6 +32,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mini_code_agent.console import console
+from mini_code_agent.tools import spill
+
 # 和改前备份共用 .agent/：它已经在 .gitignore 里，也被挡在模型的视野之外（EXCLUDED_DIRS +
 # SENSITIVE_DIRS）。
 SESSIONS_DIR = Path(".agent") / "sessions"
@@ -282,15 +285,37 @@ def describe(cwd: Path, session_id: str) -> SessionInfo:
 def delete(cwd: Path, session_id: str) -> None:
     """删掉一次会话——删的是那个 jsonl 文件本身。
 
-    **没有回收站、也没有备份，这一步不可逆**。所以调用方要**先给人看过再动手**（cli.py 里
-    就是这么用的：先 describe 打印一遍、问过用户，才调这里）。
+    **没有回收站、也没有备份，这一步不可逆**。这里只动 jsonl 文件；用户可见的那条命令
+    走 `delete_session`，它还会把落盘的工具结果一起端掉。
 
-    落了盘的工具结果（`.agent/tool-results/`）**不跟着删**：那些文件名里没有会话 id，认不出
-    是谁的。等它们按会话分目录了才谈得上一起删（见 docs/known-issues.md 的 G2）。
+    先撮一遍再删：报错的措辞和 describe 一致，而"文件在不在"这件事也只判一次。
     """
-    # 先撮一遍再删：报错的措辞和 describe 一致，而"文件在不在"这件事也只判一次。
     describe(cwd, session_id)
     (cwd / SESSIONS_DIR / f"{session_id}.jsonl").unlink()
+
+
+def delete_session(cwd: Path, session_id: str) -> None:
+    """删掉一次会话，连同它的落盘工具结果——`mca --delete` 用的就是这条。
+
+    **不再二次确认**：调用方决定删就删。这里仍然把要删的那次摆出来（id 是一串时间戳，光看
+    它认不出是哪一回，最后一句人话才是认得出的钩子），删完再说一句。会话文件是那次对话唯一
+    的记录，没有回收站；这条命令的约定就是"点名即删"。
+
+    找不到会话抛 `FileNotFoundError`，由调用方翻译成命令行参数错误。
+    """
+    target = describe(cwd, session_id)
+    what = f"{target.messages} 条消息" if target.messages else "没说过话"
+    spilled = spill.count_session(cwd, target.id)
+    if spilled:
+        # 要一起删的也得说出来：只报"删掉某次会话"的话，用户不知道还端掉了一批落盘文件。
+        what += f"，连同 {spilled} 个落盘文件"
+    console.print(f"要删的是 {target.id}（{what}）", style="bold", markup=False)
+    if target.preview:
+        console.print(f"  最后一句：「{target.preview}」", markup=False)
+    delete(cwd, target.id)
+    # 落盘的工具结果属于这次会话，跟着一起端掉（见 tools/spill.py）。
+    spill.remove_session(cwd, target.id)
+    console.print(f"删掉了 {target.id}。", markup=False)
 
 
 def load(cwd: Path, session_id: str | None = None) -> tuple[Session, dict[str, Any], list[dict]]:
