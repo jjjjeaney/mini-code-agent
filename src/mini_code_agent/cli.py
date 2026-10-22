@@ -316,7 +316,7 @@ def _chat(
             return
         if result.final is None:
             typer.echo(
-                f"用满步数也没等到最终回复，期间执行了 {len(result.trace)} 次工具调用。",
+                f"这一轮没得到最终回复，期间执行了 {len(result.trace)} 次工具调用。请重试",
                 err=True,
             )
             _print_usage(result)
