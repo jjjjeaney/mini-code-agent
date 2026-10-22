@@ -88,6 +88,8 @@ def context_size(messages: list[dict[str, Any]], *, tokens: int | None, covered:
     return tokens + rough_tokens(messages[covered:])
 
 
+# 计算压缩 messages 的哪些消息：用户轮数 > 6 时，压缩最近 6 轮之外的 message
+# （例：20 条消息、最近 6 轮 12 条，则返回 8，代表压缩前 8 条）；轮数 < 6 则不压缩，返回 None。
 def cut_point(
     messages: list[dict[str, Any]],
     *,
