@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
 import pytest
 
+import mini_code_agent.tools.shell as shell
 from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools import default_tools
 from mini_code_agent.tools.base import DangerousCommandError, ShellDisabledError, ToolContext
@@ -21,6 +23,7 @@ from mini_code_agent.tools.shell import (
     DEFAULT_TIMEOUT_SECONDS,
     MAX_TIMEOUT_SECONDS,
     _docker_argv,
+    _host_argv,
     _timeout,
     bash,
 )
@@ -336,3 +339,94 @@ class TestBashInDocker:
         for text in (result.result, spilled[0].read_text(encoding="utf-8")):
             assert "sk-live-abcdef" not in text
             assert "已涂黑" in text
+
+
+@pytest.fixture
+def host_ctx(tmp_path: Path) -> ToolContext:
+    return ToolContext(cwd=tmp_path, allow_shell=True, sandbox="host")
+
+
+class TestHostArguments:
+    def test_it_prefers_bash(self, monkeypatch):
+        monkeypatch.setattr(
+            shell.shutil, "which", lambda name: "/usr/bin/bash" if name == "bash" else None
+        )
+
+        argv, encoding = _host_argv("echo hi")
+
+        assert argv == ["/usr/bin/bash", "-c", "echo hi"]
+        assert encoding == "utf-8"
+
+    def test_windows_falls_back_to_comspec(self, monkeypatch):
+        monkeypatch.setattr(shell.shutil, "which", lambda name: None)
+        monkeypatch.setattr(shell.os, "name", "nt")
+        monkeypatch.setenv("COMSPEC", "C:/Windows/System32/cmd.exe")
+
+        argv, _ = _host_argv("echo hi")
+
+        assert argv == ["C:/Windows/System32/cmd.exe", "/d", "/s", "/c", "echo hi"]
+
+    def test_posix_falls_back_to_sh(self, monkeypatch):
+        monkeypatch.setattr(
+            shell.shutil, "which", lambda name: "/bin/sh" if name == "sh" else None
+        )
+        monkeypatch.setattr(shell.os, "name", "posix")
+
+        argv, encoding = _host_argv("echo hi")
+
+        assert argv == ["/bin/sh", "-c", "echo hi"]
+        assert encoding == "utf-8"
+
+
+class TestBashOnHost:
+    def test_it_runs_on_the_host_and_returns_output(self, host_ctx):
+        out = bash({"description": "打个招呼", "command": "echo hello"}, host_ctx)
+
+        assert "[退出码 0]" in out
+        assert "hello" in out
+
+    def test_a_nonzero_exit_code_is_a_result(self, host_ctx):
+        command = f'"{sys.executable}" -c "import sys; sys.exit(3)"'
+
+        out = bash({"description": "故意失败", "command": command}, host_ctx)
+
+        assert "[退出码 3]" in out
+
+    def test_it_runs_in_the_project_directory(self, host_ctx, tmp_path):
+        command = (
+            f'"{sys.executable}" -c '
+            '"import os; print(os.path.basename(os.getcwd()))"'
+        )
+
+        out = bash({"description": "看工作目录", "command": command}, host_ctx)
+
+        assert tmp_path.name in out
+
+    def test_output_is_still_redacted(self, host_ctx):
+        out = bash(
+            {
+                "description": "打印一个假密钥",
+                "command": "echo DEEPSEEK_API_KEY=sk-live-abcdef",
+            },
+            host_ctx,
+        )
+
+        assert "sk-live-abcdef" not in out
+        assert "已涂黑" in out
+
+    def test_a_timeout_kills_the_command(self, host_ctx):
+        command = f'"{sys.executable}" -c "import time; time.sleep(30)"'
+
+        out = bash(
+            {"description": "睡很久", "command": command, "timeout_seconds": 1},
+            host_ctx,
+        )
+
+        assert "已超时" in out
+        assert "命令进程已经终止" in out
+
+    def test_an_unknown_sandbox_refuses_before_running(self, tmp_path):
+        ctx = ToolContext(cwd=tmp_path, allow_shell=True, sandbox="podman")
+
+        with pytest.raises(ValueError, match="不是沙箱模式"):
+            bash({"description": "跑一条", "command": "echo hi"}, ctx)

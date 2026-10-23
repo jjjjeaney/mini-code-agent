@@ -82,6 +82,11 @@ class Provider(Protocol):
     走 `complete`——它们和前台共用终端，实时打字会互相插字。
     """
 
+    # 请求里使用的模型 id。`complete` / `stream` 每次调用现读它，所以运行时改这个属性就能
+    # 让后续请求换模型（`/model` 就是这么做的）。测试里的假 provider 可以不接真模型，所以
+    # 允许 None。
+    model: str | None
+
     def complete(
         self,
         messages: list[dict[str, Any]],

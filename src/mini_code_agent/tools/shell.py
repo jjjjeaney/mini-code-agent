@@ -1,26 +1,31 @@
-"""命令执行工具：把命令放进一次性 docker 容器里跑。
+"""命令执行工具：按 `ctx.sandbox` 跑在一次性 docker 容器里，或直接跑在宿主机上。
 
-为什么要容器：模型能跑任意 shell 命令，那就等于把整个宿主机交给它。容器把"它能碰
-什么"压到最小——只读的根文件系统、没有网络、只有挂载进去的项目目录可写、跑完就删。
-
-**沙箱才是这里的安全边界。** 下面的命令风险分类和输出涂黑都只是降低概率的启发式，
-别拿它们当防线——它们挡的是"手滑"和"顺手读一下"，挡不住真想绕的。
+docker 是默认模式，也是这里的安全边界：只读根文件系统、没有网络、只有项目目录可写、
+跑完就删。`host` 模式没有这层隔离——命令以当前用户身份跑，能访问整个用户环境、网络和
+凭据。下面的命令风险分类和输出涂黑都只是降低概率的启发式，两种模式都别拿它们当防线。
 """
 
 from __future__ import annotations
 
+import locale
+import os
+import shutil
+import signal
 import subprocess
 import tempfile
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from mini_code_agent.sandbox import DEFAULT_SANDBOX, parse_sandbox
 from mini_code_agent.tools.base import (
     ContainerStartFailedError,
     DangerousCommandError,
     DockerUnavailableError,
     ShellDisabledError,
+    ShellUnavailableError,
     ToolContext,
 )
 from mini_code_agent.tools.safety import deny_reason, redact_sensitive
@@ -53,13 +58,13 @@ SHELL_SCHEMA: dict[str, Any] = {
         },
         "command": {
             "type": "string",
-            "description": "要执行的 shell 命令，交给容器里的 /bin/sh -c 跑",
+            "description": "要执行的 shell 命令；具体由本次运行的沙箱模式决定用哪个 shell 解释",
         },
         "timeout_seconds": {
             "type": "integer",
             "description": (
                 f"最多跑多少秒，默认 {DEFAULT_TIMEOUT_SECONDS}，"
-                f"上限 {MAX_TIMEOUT_SECONDS}。到点容器会被终止"
+                f"上限 {MAX_TIMEOUT_SECONDS}。到点命令进程会被终止"
             ),
         },
     },
@@ -68,13 +73,14 @@ SHELL_SCHEMA: dict[str, Any] = {
 
 
 def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
-    """在一次性容器里跑一条命令，返回退出码和输出。
+    """按 `ctx.sandbox` 跑一条命令，返回退出码和输出。
 
-    容器能碰到的只有 ctx.cwd 挂进去的 /workspace，其它一概没有：根文件系统只读、
-    没有网络、没有 capabilities、以非 root 身份跑、进程数和内存都有上限。
+    docker 模式下，容器能碰到的只有 ctx.cwd 挂进去的 /workspace，其它一概没有：根文件
+    系统只读、没有网络、没有 capabilities、以非 root 身份跑、进程数和内存都有上限。
+    超时路径会拿 --cidfile 里的 id 去 docker rm -f。
 
-    时间到了或者命令卡住了，**杀掉 docker 客户端是不够的**——容器会继续跑。所以超时
-    路径会拿 --cidfile 里的 id 去 docker rm -f。（实测过：杀掉客户端之后容器还在。）
+    host 模式下命令直接以当前用户身份跑在 ctx.cwd 里：没有隔离，能访问整个用户环境、
+    网络和凭据。超时路径尽力杀掉进程树（POSIX killpg / Windows taskkill /T）。
 
     输出会先涂黑（含密钥关键词的整行换掉）。涂黑是**在落盘之前**做的——落下去的那份和
     给模型看的那份必须是同一份，不然落盘就成了绕开涂黑的一条路。
@@ -120,10 +126,17 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
         )
 
     timeout = _timeout(kwargs.get("timeout_seconds"))
+    sandbox = parse_sandbox(ctx.sandbox)
+    if sandbox == "docker":
+        return _bash_in_docker(ctx.cwd, command, timeout)
+    return _bash_on_host(ctx.cwd, command, timeout)
 
+
+def _bash_in_docker(cwd: Path, command: str, timeout: int) -> str:
+    """docker 分支：原来的容器执行路径，原样搬过来。"""
     with tempfile.TemporaryDirectory(prefix="mca-shell-") as workspace:
         cidfile = Path(workspace) / "container.cid"
-        argv = _docker_argv(ctx.cwd, command, cidfile)
+        argv = _docker_argv(cwd, command, cidfile)
 
         try:
             process = subprocess.Popen(
@@ -137,7 +150,14 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
                 "没找到 docker 命令。命令执行能力依赖 docker，先装好并让它跑起来。"
             ) from exc
 
-        stdout, stderr, totals, timed_out = _run(process, timeout, cidfile)
+        def stop_container() -> None:
+            # 杀掉 docker 客户端不会让容器停下来，--rm 也只在容器自己正常退出时才生效。
+            # 所以先杀客户端、等它退出，再照着 cidfile 把容器强删。
+            process.kill()
+            process.wait()
+            _force_remove(cidfile)
+
+        stdout, stderr, totals, timed_out = _run(process, timeout, stop_container)
 
     if not timed_out and process.returncode == 125:
         # docker run 自己的退出码 125 表示"容器都没起来"，不是命令的失败——
@@ -153,7 +173,89 @@ def bash(kwargs: dict[str, Any], ctx: ToolContext) -> str:
             )
         raise ContainerStartFailedError(f"容器没起来，命令没有执行过。docker 说：{said}{hint}")
 
-    return _format(process.returncode, stdout, stderr, totals, timed_out, timeout)
+    return _format(
+        process.returncode, stdout, stderr, totals, timed_out, timeout, sandbox="docker"
+    )
+
+
+def _bash_on_host(cwd: Path, command: str, timeout: int) -> str:
+    """host 分支：直接在当前用户环境里跑，没有容器隔离。"""
+    if not cwd.is_dir():
+        raise ValueError(f"工作目录不存在：{cwd}")
+    argv, encoding = _host_argv(command)
+    try:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=None,
+            # POSIX 下让 shell 单独成为一个进程组，超时时才能整组杀掉。
+            start_new_session=(os.name != "nt"),
+        )
+    except FileNotFoundError as exc:
+        raise ShellUnavailableError(
+            "host 模式没找到可用的 shell。优先用 bash；没有 bash 时 Windows 用 COMSPEC、"
+            "POSIX 用 /bin/sh。确认 PATH 里有 bash，或者改用 --sandbox docker。"
+        ) from exc
+
+    stdout, stderr, totals, timed_out = _run(
+        process, timeout, lambda: _kill_tree(process)
+    )
+    return _format(
+        process.returncode,
+        stdout,
+        stderr,
+        totals,
+        timed_out,
+        timeout,
+        sandbox="host",
+        encoding=encoding,
+    )
+
+
+def _host_argv(command: str) -> tuple[list[str], str]:
+    """host 模式下用哪个 shell，以及输出按什么编码解码。
+
+    优先 bash（Git Bash / WSL 都算），它和 docker 里那个 `/bin/sh -c` 的语义最接近。
+    找不到再退回系统 shell：Windows 的 cmd 默认代码页不是 UTF-8，所以解码也跟着变。
+    """
+    bash = shutil.which("bash")
+    if bash:
+        return [bash, "-c", command], "utf-8"
+    if os.name == "nt":
+        comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        return [comspec, "/d", "/s", "/c", command], locale.getpreferredencoding(False)
+    return [shutil.which("sh") or "/bin/sh", "-c", command], "utf-8"
+
+
+def _kill_tree(process: subprocess.Popen[bytes]) -> None:
+    """尽力杀掉 host 命令的整棵进程树。
+
+    POSIX 用 killpg（配合 start_new_session），Windows 用 taskkill /T。主动脱离进程组
+    或父子关系的进程仍可能活下来——这是尽力而为，不是保证。
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except OSError:
+            pass
+        if process.poll() is None:
+            process.kill()
+        return
+
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except OSError:
+        pass
+    if process.poll() is None:
+        process.kill()
 
 
 def _timeout(value: Any) -> int:
@@ -241,9 +343,9 @@ def _docker_argv(workspace: Path, command: str, cidfile: Path) -> list[str]:
 
 
 def _run(
-    process: subprocess.Popen[bytes], timeout: int, cidfile: Path
+    process: subprocess.Popen[bytes], timeout: int, on_timeout: Callable[[], None]
 ) -> tuple[bytes, bytes, tuple[int, int], bool]:
-    """读输出、等它结束；超时就把客户端和容器一起收掉。
+    """读输出、等它结束；超时就让调用方收掉进程或容器。
 
     第三个返回值是两条流**各自吐了多少字节**（不是留住多少）。留住的那份超长时会被落盘，
     一般用不上它；只有连落盘那份都装不下的时候，_format 才需要拿它说清丢了多少。
@@ -263,9 +365,8 @@ def _run(
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        process.kill()
+        on_timeout()
         process.wait()
-        _force_remove(cidfile)
 
     for reader in readers:
         reader.join(timeout=10)
@@ -316,18 +417,25 @@ def _format(
     totals: tuple[int, int],
     timed_out: bool,
     timeout: int,
+    *,
+    sandbox: str = DEFAULT_SANDBOX,
+    encoding: str = "utf-8",
 ) -> str:
     """把结果拼成给模型看的文本。
 
     totals 是两条流各吐了多少字节。只在超过"留得住的量"时才用得上——那是**真的丢了**：
     落盘救不回来，因为落下去的也只有留住的那部分。
+
+    host 模式在 Windows 上没有 bash 时走 cmd.exe，输出是本地代码页，所以解码编码由调用方
+    传进来；docker 和 bash 都是 UTF-8。
     """
-    out_text, out_hidden = redact_sensitive(stdout.decode("utf-8", "replace"))
-    err_text, err_hidden = redact_sensitive(stderr.decode("utf-8", "replace"))
+    out_text, out_hidden = redact_sensitive(stdout.decode(encoding, "replace"))
+    err_text, err_hidden = redact_sensitive(stderr.decode(encoding, "replace"))
 
     sections: list[str] = []
     if timed_out:
-        sections.append(f"[已超时：{timeout} 秒没跑完，容器已经终止]")
+        where = "容器已经终止" if sandbox == "docker" else "命令进程已经终止"
+        sections.append(f"[已超时：{timeout} 秒没跑完，{where}]")
     else:
         sections.append(f"[退出码 {exit_code}]")
 

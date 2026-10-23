@@ -25,8 +25,16 @@ from mini_code_agent.core.agent import CANCELLED_ERROR, AgentResult
 from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.interaction import PermissionBroker
 from mini_code_agent.permissions import Grants, PermissionRequest
+from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.sessions import SESSIONS_DIR, Session, start
 from mini_code_agent.summarizing import COMPACT_AT
+
+
+class StubProvider:
+    """命令测试只需要 `model`；请求方法不走，所以不实现 complete / stream。"""
+
+    def __init__(self, model: str | None = None) -> None:
+        self.model = model
 
 
 def make_ctx(
@@ -38,7 +46,8 @@ def make_ctx(
     grants: Grants | None = None,
     messages: list[dict] | None = None,
     compact: Callable[[], str | None] | None = None,
-    window: int | None = None,
+    model: str | None = None,
+    sandbox: str = DEFAULT_SANDBOX,
     context_tokens: int | None = None,
     context_covered: int = 0,
     tasks: TaskManager | None = None,
@@ -47,16 +56,21 @@ def make_ctx(
     """一份手边的东西。全给上默认值，测哪一块就只改哪一块。
 
     `compact` 默认是个"什么都不做、什么都不说"的桩——真那个要连 provider，在 cli 里。
-    `window` 默认按"未知模型"那一档（见 context_window），所以是 40 万而不是 0——印出
-    "窗口 0" 那种数谁看都不对。
+    `model` 默认是 None，窗口按"未知模型"那一档（见 context_window），所以是 40 万而不是
+    0——印出"窗口 0" 那种数谁看都不对。
     """
-    state = ChatState(permission_mode=mode, messages=list(messages or []))
+    state = ChatState(
+        permission_mode=mode,
+        messages=list(messages or []),
+        provider=StubProvider(model),
+        window=window_for(model),
+        sandbox=sandbox,
+    )
     if context_tokens is not None:
         state.remember_context(context_tokens, context_covered)
     return CommandContext(
         console=console,
         state=state,
-        window=window_for(None) if window is None else window,
         cwd=cwd or Path("proj"),
         allow_shell=allow_shell,
         # opened=True：这就是"盘上已经有一次会话"的样子。没落盘的那种由 /status 那条单独的
@@ -87,7 +101,12 @@ class TestChatState:
     """`ChatState` 上那两个"换历史"的东西——压缩和折叠都要走它，所以它自己得是对的。"""
 
     def test_replacing_swaps_the_history_and_drops_the_anchor(self):
-        state = ChatState(permission_mode="default", messages=[{"role": "user", "content": "a"}])
+        state = ChatState(
+            permission_mode="default",
+            messages=[{"role": "user", "content": "a"}],
+            provider=StubProvider(),
+            window=window_for(None),
+        )
         state.remember_context(120_000, 1)
         fresh = [{"role": "user", "content": "b"}]
 
@@ -102,7 +121,12 @@ class TestChatState:
 
         没换就不动能锚点——不然每轮都会白白退回粗估。
         """
-        state = ChatState(permission_mode="default", messages=[{"role": "user", "content": "a"}])
+        state = ChatState(
+            permission_mode="default",
+            messages=[{"role": "user", "content": "a"}],
+            provider=StubProvider(),
+            window=window_for(None),
+        )
         state.remember_context(120_000, 1)
 
         assert state.replaced(state.messages) is False
@@ -141,6 +165,8 @@ class TestHelp:
         wanted = (
             "/help",
             "/permission_mode",
+            "/sandbox",
+            "/model",
             "/status",
             "/sessions",
             "/tasks",
@@ -193,13 +219,15 @@ class TestPermissionMode:
         assert ctx.state.permission_mode == "plan"
         assert "不是权限模式" in capsys.readouterr().out
 
-    def test_bypass_cannot_be_switched_on_from_within(self, capsys):
-        """F4：唯一一档把用户整个从回路里拿掉的，只能启动时显式开。"""
+    def test_bypass_can_be_switched_on_from_within_with_a_warning(self, capsys):
+        """用户自己点名切 bypass 是允许的，但会当场打一行红色警告。"""
         ctx = make_ctx()
         assert default_commands().dispatch("/permission_mode bypass", ctx) == "handled"
 
-        assert ctx.state.permission_mode == "default"
-        assert "F4" in capsys.readouterr().out
+        assert ctx.state.permission_mode == "bypass permissions"
+        out = capsys.readouterr().out
+        assert "⚠" in out
+        assert "什么都不问" in out
 
     def test_switching_to_the_mode_it_is_already_on_says_so(self, capsys):
         ctx = make_ctx("plan")
@@ -258,7 +286,147 @@ class TestFork:
         assert "/fork" in capsys.readouterr().out
 
 
+class TestModel:
+    def test_no_argument_reports_the_current_one(self, capsys):
+        default_commands().dispatch("/model", make_ctx(model="deepseek-v4-flash"))
+
+        out = capsys.readouterr().out
+        assert "模型：deepseek-v4-flash" in out
+        assert f"窗口 {window_for('deepseek-v4-flash'):,}" in out
+        assert "/model <模型id>" in out
+
+    def test_switching_changes_provider_and_window(self, capsys):
+        ctx = make_ctx(model="deepseek-v4-flash")
+
+        assert default_commands().dispatch("/model qwen-max", ctx) == "handled"
+
+        assert ctx.state.provider.model == "qwen-max"
+        assert ctx.state.window == window_for("qwen-max")
+        out = capsys.readouterr().out
+        assert "模型换成 qwen-max" in out
+        assert "下一轮" in out
+        assert "缓存" in out
+        assert f"窗口 {window_for('qwen-max'):,}" in out
+
+    def test_switching_to_the_same_model_says_so(self, capsys):
+        ctx = make_ctx(model="deepseek-v4-flash")
+
+        default_commands().dispatch("/model deepseek-v4-flash", ctx)
+
+        assert ctx.state.provider.model == "deepseek-v4-flash"
+        assert "已经是" in capsys.readouterr().out
+
+    def test_an_unknown_model_is_accepted_with_the_default_window(self, capsys):
+        ctx = make_ctx(model="deepseek-v4-flash")
+
+        assert default_commands().dispatch("/model made-up", ctx) == "handled"
+
+        assert ctx.state.provider.model == "made-up"
+        assert ctx.state.window == window_for("made-up")
+        out = capsys.readouterr().out
+        assert "窗口表里没有" in out
+        assert f"{window_for('made-up'):,}" in out
+
+    def test_a_blank_argument_just_reports(self, capsys):
+        ctx = make_ctx(model="deepseek-v4-flash")
+
+        default_commands().dispatch("/model   ", ctx)
+
+        assert ctx.state.provider.model == "deepseek-v4-flash"
+        assert "模型：deepseek-v4-flash" in capsys.readouterr().out
+
+    def test_it_warns_about_running_background_tasks(self, capsys):
+        class BusyTasks:
+            def running(self) -> int:
+                return 2
+
+        ctx = make_ctx(model="deepseek-v4-flash", tasks=BusyTasks())
+
+        default_commands().dispatch("/model qwen-max", ctx)
+
+        assert "后台任务" in capsys.readouterr().out
+
+    def test_it_is_listed_in_help(self, capsys):
+        default_commands().dispatch("/help", make_ctx())
+
+        assert "/model" in capsys.readouterr().out
+
+
+class TestSandbox:
+    def test_no_argument_reports_the_current_one(self, capsys):
+        default_commands().dispatch("/sandbox", make_ctx())
+
+        out = capsys.readouterr().out
+        assert "当前的沙箱：docker" in out
+        assert "/sandbox docker|host" in out
+
+    def test_it_switches_to_host_with_a_warning(self, capsys):
+        ctx = make_ctx()
+
+        assert default_commands().dispatch("/sandbox host", ctx) == "handled"
+
+        assert ctx.state.sandbox == "host"
+        out = capsys.readouterr().out
+        assert "⚠" in out
+        assert "宿主机" in out
+        assert "缓存" in out
+
+    def test_it_switches_back_to_docker(self, capsys):
+        ctx = make_ctx(sandbox="host")
+
+        assert default_commands().dispatch("/sandbox docker", ctx) == "handled"
+
+        assert ctx.state.sandbox == "docker"
+        assert "docker" in capsys.readouterr().out
+
+    def test_the_same_mode_says_so(self, capsys):
+        ctx = make_ctx()
+
+        default_commands().dispatch("/sandbox docker", ctx)
+
+        assert ctx.state.sandbox == "docker"
+        assert "已经是" in capsys.readouterr().out
+
+    def test_a_bad_mode_changes_nothing(self, capsys):
+        ctx = make_ctx(sandbox="host")
+
+        default_commands().dispatch("/sandbox podman", ctx)
+
+        assert ctx.state.sandbox == "host"
+        assert "不是沙箱模式" in capsys.readouterr().out
+
+    def test_it_says_the_setting_has_no_effect_without_shell(self, capsys):
+        default_commands().dispatch("/sandbox", make_ctx(allow_shell=False))
+
+        assert "暂时不生效" in capsys.readouterr().out
+
+    def test_it_warns_about_running_background_tasks(self, capsys):
+        class BusyTasks:
+            def running(self) -> int:
+                return 1
+
+        ctx = make_ctx(tasks=BusyTasks())
+
+        default_commands().dispatch("/sandbox host", ctx)
+
+        assert "后台任务" in capsys.readouterr().out
+
+
 class TestStatus:
+    def test_it_reports_the_sandbox(self, capsys):
+        default_commands().dispatch("/status", make_ctx(sandbox="host"))
+
+        out = capsys.readouterr().out
+        assert "沙箱：host" in out
+        assert "宿主机" in out
+
+    def test_it_reports_the_current_model(self, capsys):
+        default_commands().dispatch("/status", make_ctx(model="qwen-max"))
+
+        out = capsys.readouterr().out
+        assert "模型：qwen-max" in out
+        assert f"窗口 {window_for('qwen-max'):,}" in out
+
     def test_it_reports_where_it_runs_and_under_what(self, capsys, tmp_path):
         default_commands().dispatch("/status", make_ctx("plan", cwd=tmp_path))
 

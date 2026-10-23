@@ -28,7 +28,7 @@ cp .env.example .env
 uv run mca
 ```
 
-启动即进入交互模式，能连着聊：每条 prompt 接着上一条。`--model` 换模型；不写就用 `providers/anthropic.py` 里的 `DEFAULT_MODEL`（`deepseek-v4-flash`）。上下文窗口和压缩阈值会跟着模型名走。
+启动即进入交互模式，能连着聊：每条 prompt 接着上一条。`--model` 选启动时的模型；不写就用 `providers/anthropic.py` 里的 `DEFAULT_MODEL`（`deepseek-v4-flash`）。会话里还可以用 `/model <模型id>` 中途换模型（下一轮起生效，会重建前缀缓存）。上下文窗口和压缩阈值会跟着模型名走。
 
 ```bash
 uv run mca --model deepseek-v4-pro
@@ -38,17 +38,19 @@ uv run mca --model deepseek-v4-pro
 
 `--api-key` / `--base-url` 可以临时覆盖 `.env` 里的 `DEEPSEEK_API_KEY` / `DEEPSEEK_ANTHROPIC_BASE_URL`。**密钥写在命令行上会留在 shell 历史和进程列表里**，日常还是用 `.env`；这两个参数主要给脚本或临时切换端点用。
 
+`--shell` 打开命令执行；`--sandbox docker|host` 决定命令跑在哪儿：`docker`（默认，一次性容器，没有网络、根文件系统只读、只挂项目目录）或 `host`（直接跑在宿主机上，没有容器隔离，能访问整个用户环境、网络和凭据）。host 模式只在明确需要宿主工具或网络时用；启动时和会话里切到 host 都会打红色警告。
+
 前台回合（交互，以及后台任务完成后的汇报回合）**总是流式**：模型正文边生成边打到终端上，没有关闭的开关。进历史、工具调用、用量和 `stop_reason` 仍然来自完整的最终消息。后台续跑、子 agent、压缩摘要不走流式——它们和前台共用终端，实时打字会互相插字。显示过一部分之后如果连接断了，**不会自动重连重发**（那会把已经打出来的字再打一遍），屏幕上留下的是不完整的内容，错误信息会提示你再发一次。
 
 等待第一个正文 token 时，真终端上会显示一行「（等待模型输出…）」，输出一开始就擦掉；重定向到文件时这行不会出现。模型的推理过程不显示——thinking 块仍然随 `assistant_content` 落盘，续接对话时要用。
 
 每一轮结束时，最终答案之后会打用量：先是这一发的 token 用量；这一轮发了两发以上时，再跟一行「本次任务共 N 发」的合计（含同步跑完的子 agent）。只有一发时不重复打合计——那一发本身就是总和。只算 token，不换算金额。
 
-会话里以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/tasks`、`/compact`、`/grants`、`/permission_mode`、`/fork`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉提示词里那段说明，也就是重建前缀缓存）。
+会话里以 `/` 开头的由**程序**处理、不发给模型——`/help` 列出有哪些（`/status`、`/sessions`、`/tasks`、`/compact`、`/grants`、`/permission_mode`、`/sandbox`、`/fork`、`/model`、`/exit`）。`/fork` 是 `--fork` 那个开关的运行时版本：`/fork on` / `/fork off`，下一轮起生效（它会换掉提示词里那段说明，也就是重建前缀缓存）。`/model <模型id>` 换模型：下一轮起生效，请求的 `model` 字段和系统提示都会变，下一发前缀缓存从头算；窗口表里没有的 id 也接受，按默认 40 万窗口算。`/sandbox docker|host` 换命令执行环境：下一轮起生效，切到 host 会打红色警告。
 
 权限档位有四档：`default`（改文件和跑命令都问）、`accept edits`（改文件不问，命令仍问）、`plan`（只读：改文件直接拒，命令仍问）、`bypass permissions`（什么都不问）。启动时用 `--permission_mode`，会话里用 `/permission_mode <档位>`；两者都从下一轮生效。
 
-模型自己也能用 `set_permission_mode` 切档：要方案、只做只读调查时切到 `plan`，你要求“每次改文件或跑命令都先问我”时切到 `default`——往更严格的方向切不询问。往更宽松的方向切（离开 `plan`、切到 `accept edits` 或 `bypass permissions`）会停下来问一次，你不同意就保持原档。`bypass permissions` 只有模型请求、并且你确认过写明风险的提示后才生效；`/permission_mode bypass` 仍然拒绝，启动参数仍是最直接的入口。切换对本回合后续调用立即生效，下一次请求前系统提示也会按新档位重拼（缓存前缀因此重算一次）。普通子 agent 的工具池里没有这个工具；fork 会继承父 agent 的工具表，所以它也能请求切档。
+模型自己也能用 `set_permission_mode` 切档：要方案、只做只读调查时切到 `plan`，你要求“每次改文件或跑命令都先问我”时切到 `default`——往更严格的方向切不询问。往更宽松的方向切（离开 `plan`、切到 `accept edits` 或 `bypass permissions`）会停下来问一次，你不同意就保持原档。模型请求 `bypass permissions` 仍要先停下问你；用户自己用 `/permission_mode bypass` 可以直接切，但会当场打一行红色警告。切换对本回合后续调用立即生效，下一次请求前系统提示也会按新档位重拼（缓存前缀因此重算一次）。普通子 agent 的工具池里没有这个工具；fork 会继承父 agent 的工具表，所以它也能请求切档。
 
 会话按目录存在 `.agent/sessions/` 里。`--list` 列出有过哪些（连同各自的 id），`--resume <id>` 接上某一次；`--continue` 接最近一次**说过话**的。
 

@@ -32,6 +32,8 @@ class ScriptedProvider:
 
     def __init__(self, responses: list[ModelResponse]) -> None:
         self.responses = list(responses)
+        # `_chat` 每轮从 provider 上读模型名；默认 None，和以前的“测试不指定模型”一致。
+        self.model: str | None = None
         self.calls: list[list[dict]] = []
         self.systems: list[str | None] = []
         # 每一发收到的那张工具表。和 calls / systems 一样按下标对齐。
@@ -82,6 +84,7 @@ def run_loop(
     registry: ToolRegistry | None = None,
     grants: Grants | None = None,
     allow_fork: bool = False,
+    sandbox: str = "docker",
     tasks: TaskManager | None = None,
     broker: PermissionBroker | None = None,
     prompter: Prompter | None = None,
@@ -98,6 +101,7 @@ def run_loop(
         cwd=tmp_path,
         allow_shell=False,
         permission_mode="default",
+        sandbox=sandbox,
         prompter=prompter if prompter is not None else NullPrompter(),
         grants=grants if grants is not None else Grants(),
         allow_fork=allow_fork,
@@ -229,6 +233,44 @@ def test_switching_the_mode_lands_on_the_next_turn(monkeypatch, tmp_path):
     assert provider.systems == [build_system_prompt(tmp_path, "plan")]
 
 
+def test_switching_the_model_lands_on_the_next_turn(monkeypatch, tmp_path):
+    """`/model` 直接改 provider.model 和窗口，下一轮系统提示按新模型拼。"""
+    provider = ScriptedProvider([text_turn("嗯")])
+
+    run_loop(monkeypatch, provider, ["/model qwen-max", "看看再说", "/exit"], tmp_path)
+
+    assert provider.model == "qwen-max"
+    assert len(provider.systems) == 1
+    assert "模型 qwen-max" in provider.systems[0]
+
+
+def test_switching_to_a_smaller_window_compacts_before_the_next_turn(
+    monkeypatch, tmp_path
+):
+    """切到小窗口模型后，压缩阈值立刻按新窗口算——不需要等下一发请求报新用量。"""
+    provider = ScriptedProvider(
+        [
+            text_turn("第一轮", input_tokens=100_000),  # 旧窗口下不该压
+            text_turn("前面聊过八件事"),  # 摘要那一次
+            text_turn("接着说"),  # 压完之后的这一轮
+        ]
+    )
+
+    run_loop(
+        monkeypatch,
+        provider,
+        ["第一句", "/model qwen-max", "第二句", "/exit"],
+        tmp_path,
+        messages=an_eight_turn_history(),
+        registry=a_registry_with_one_tool(),
+    )
+
+    # 第二次请求是摘要：新窗口 32,768，100,000 token 已经超过 80%
+    assert "摘要" in provider.calls[1][-1]["content"]
+    # 第三次请求才是切换后的第一句，系统提示已经是新模型
+    assert "模型 qwen-max" in provider.systems[2]
+
+
 def test_a_tool_mode_switch_lands_on_the_next_turn(monkeypatch, tmp_path):
     """模型自己切档时改的是同一个 ChatState，下一轮的系统提示跟着换。"""
     provider = ScriptedProvider(
@@ -270,6 +312,8 @@ def test_a_session_that_never_says_anything_leaves_nothing_behind(monkeypatch, t
 
 class FlakyProvider:
     """第一次报错，之后正常——模拟网络抖了一下。"""
+
+    model: str | None = None
 
     def __init__(self, responses: list[ModelResponse]) -> None:
         self.responses = list(responses)
@@ -366,6 +410,7 @@ def test_the_transcript_lands_on_disk(monkeypatch, tmp_path):
     _, meta, messages = load(tmp_path)
 
     assert meta["permission_mode"] == "default"
+    assert meta["sandbox"] == "docker"
     assert [m["role"] for m in messages] == ["user", "assistant"]
     assert messages[0]["content"] == "第一句"
 
@@ -461,6 +506,7 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
             api_key="",
             base_url="",
             shell=False,
+            sandbox="docker",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -494,6 +540,7 @@ def run_delete(tmp_path, session_id: str) -> None:
             api_key="",
             base_url="",
             shell=False,
+            sandbox="docker",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -550,6 +597,7 @@ def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
             api_key="",
             base_url="",
             shell=False,
+            sandbox="docker",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -611,6 +659,7 @@ def run_main(
     tmp_path,
     *,
     fork: bool = False,
+    sandbox: str = "docker",
 ) -> None:
     """让 `main_command` 真的进入交互循环，喂一串输入。
 
@@ -626,6 +675,7 @@ def run_main(
         api_key="",
         base_url="",
         shell=False,
+        sandbox=sandbox,
         fork=fork,
         permission_mode="default",
         continue_=False,
@@ -658,6 +708,103 @@ def test_the_agent_tool_is_offered_to_the_model(monkeypatch, tmp_path, capsys):
     capsys.readouterr()
 
 
+def test_the_sandbox_option_reaches_the_loop(monkeypatch, tmp_path):
+    seen: dict = {}
+    provider = FakeProvider([])
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
+    monkeypatch.setattr(cli, "_chat", lambda *args, **kwargs: seen.update(kwargs))
+
+    cli.main_command(
+        cwd=tmp_path,
+        model="",
+        api_key="",
+        base_url="",
+        shell=False,
+        sandbox="host",
+        fork=False,
+        permission_mode="default",
+        continue_=False,
+        resume="",
+        list_=False,
+        delete_="",
+    )
+
+    assert seen["sandbox"] == "host"
+
+
+def test_host_sandbox_warns_at_startup(monkeypatch, tmp_path, capsys):
+    provider = FakeProvider([])
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
+    monkeypatch.setattr(cli, "_chat", lambda *args, **kwargs: None)
+
+    cli.main_command(
+        cwd=tmp_path,
+        model="",
+        api_key="",
+        base_url="",
+        shell=False,
+        sandbox="host",
+        fork=False,
+        permission_mode="default",
+        continue_=False,
+        resume="",
+        list_=False,
+        delete_="",
+    )
+
+    out = capsys.readouterr().out
+    assert "sandbox host" in out
+    assert "没有容器隔离" in out
+    assert "暂时不生效" in out
+
+
+def test_a_bad_sandbox_is_a_bad_parameter(tmp_path):
+    with pytest.raises(typer.BadParameter, match="不是沙箱模式"):
+        cli.main_command(
+            cwd=tmp_path,
+            model="",
+            api_key="",
+            base_url="",
+            shell=False,
+            sandbox="podman",
+            fork=False,
+            permission_mode="default",
+            continue_=False,
+            resume="",
+            list_=False,
+            delete_="",
+        )
+
+
+def test_resume_reports_the_recorded_sandbox(monkeypatch, tmp_path, capsys):
+    session = start(
+        tmp_path, permission_mode="default", allow_shell=False, sandbox="host"
+    )
+    session.append([{"role": "user", "content": "你好"}])
+    provider = FakeProvider([])
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
+    monkeypatch.setattr(cli, "_chat", lambda *args, **kwargs: None)
+
+    cli.main_command(
+        cwd=tmp_path,
+        model="",
+        api_key="",
+        base_url="",
+        shell=False,
+        sandbox="docker",
+        fork=False,
+        permission_mode="default",
+        continue_=False,
+        resume=session.id,
+        list_=False,
+        delete_="",
+    )
+
+    out = capsys.readouterr().out
+    assert "上次沙箱 host" in out
+    assert "这次按 docker 走" in out
+
+
 def test_the_model_option_reaches_the_provider(monkeypatch, tmp_path, capsys):
     """`--model` 要真的落到 provider 上；不写就用 DEFAULT_MODEL。"""
     seen: list[dict] = []
@@ -676,6 +823,7 @@ def test_the_model_option_reaches_the_provider(monkeypatch, tmp_path, capsys):
             api_key="",
             base_url="",
             shell=False,
+            sandbox="docker",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -710,6 +858,7 @@ def test_the_endpoint_options_reach_the_provider(monkeypatch, tmp_path, capsys):
             api_key=api_key,
             base_url=base_url,
             shell=False,
+            sandbox="docker",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -1087,6 +1236,7 @@ class TestBackgroundReporting:
             cwd=tmp_path,
             allow_shell=False,
             permission_mode="default",
+            sandbox="docker",
             prompter=NullPrompter(),
             grants=Grants(),
             tasks=manager,

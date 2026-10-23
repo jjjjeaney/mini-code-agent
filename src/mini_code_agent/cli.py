@@ -23,11 +23,17 @@ from mini_code_agent.folding import PersistText, fold_if_stale
 from mini_code_agent.interaction import PermissionBroker, ask_permission
 from mini_code_agent.memory import sync_memory_index
 from mini_code_agent.permission_tool import make_set_permission_mode
-from mini_code_agent.permissions import PERMISSION_MODES, Grants, parse_permission_mode
+from mini_code_agent.permissions import (
+    BYPASS_WARNING,
+    PERMISSION_MODES,
+    Grants,
+    parse_permission_mode,
+)
 from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
 from mini_code_agent.providers.anthropic import DEFAULT_MODEL, AnthropicProvider
 from mini_code_agent.providers.base import Provider
+from mini_code_agent.sandbox import DEFAULT_SANDBOX, parse_sandbox
 from mini_code_agent.sessions import Session, delete_session, load, start, summary_message
 from mini_code_agent.skills import sync_skill_index
 from mini_code_agent.summarizing import KEEP_RECENT_TURNS, context_size, cut_point, summarize
@@ -165,9 +171,9 @@ def _chat(
     cwd: Path,
     allow_shell: bool,
     permission_mode: str,
+    sandbox: str,
     prompter: Prompter,
     grants: Grants,
-    model: str | None = None,
     allow_fork: bool = False,
     tasks: TaskManager | None = None,
     broker: PermissionBroker | None = None,
@@ -175,9 +181,10 @@ def _chat(
     """交互循环：读一行、跑一轮、把消息接下去并落盘。
 
     **每轮重拼一次 system prompt**：记忆和 `AGENTS.md` 都可能在中途变（模型刚 `remember` 了
-    一条），拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位和历史同理——前者
-    `/permission_mode` 能换，后者 `/status` 要报它多长，所以这两个从局部量挪进了 `state`，
-    和提示词一起每轮现读。传进来的 `permission_mode` 和 `messages` 只是这次运行的**起始值**。
+    一条），拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位、模型、沙箱和历史
+    同理——`/permission_mode`、`/model` 和 `/sandbox` 能换前三个，`/status` 要报历史多长，
+    所以它们都放进 `state`，和提示词一起每轮现读。传进来的 `permission_mode`、`messages` 和
+    `sandbox` 只是起始值；模型名直接读 `provider.model`。
 
     这一行先过命令表（见 commands/）：认出来的命令就地办掉、**不发给模型**，也不落盘——
     命令是用户对程序说的话，不是对话的一部分，接上历史时不该看见它。
@@ -190,14 +197,34 @@ def _chat(
     一个 provider 进来，测试就能拿剧本化的假 provider 跑两轮，看第二轮有没有带上第一轮。
     """
     state = ChatState(
-        permission_mode=permission_mode, messages=messages, allow_fork=allow_fork
+        permission_mode=permission_mode,
+        messages=messages,
+        provider=provider,
+        window=window_for(provider.model),
+        allow_fork=allow_fork,
+        sandbox=sandbox,
     )
-    # 切档工具拿的是这个**活对象**：`/permission_mode` 和工具自己都会改它，存副本就过期。
+    # harness 才有的三个工具都在这儿装：ask_user 需要有人可问，agent 需要 provider /
+    # tasks / broker，切档工具需要 state 这个活对象。它们不在 default_tools() 里。
+    #
     # 先查重：测试里同一个 registry 可能被多次 `_chat` 复用。
-    if "set_permission_mode" not in {tool.name for tool in registry.list()}:
+    names = {tool.name for tool in registry.list()}
+    if "ask_user" not in names:
+        registry.register(make_ask_user(prompter))
+        names.add("ask_user")
+    if "agent" not in names:
+        registry.register(
+            make_agent_tool(
+                provider=provider,
+                prompter=prompter,
+                grants=grants,
+                tasks=tasks,
+                broker=broker,
+            )
+        )
+        names.add("agent")
+    if "set_permission_mode" not in names:
         registry.register(make_set_permission_mode(prompter, state=state))
-    # 模型的窗口一次运行里定死，所以不进 ChatState 那个"会变的东西"的盒子（见它的类注释）。
-    window = window_for(model)
     # 哪些工具的结果允许被折——一次运行里不变（见 tools/registry.py 的 foldable_names）。
     foldable = registry.foldable_names()
     # 其中哪些"重跑拿不回来"、折之前得先落一份（见 fold_persist_names）。
@@ -216,7 +243,12 @@ def _chat(
         """压一次（够不够大由 force 决定），返回"真压了没有"。"""
         return state.replaced(
             _compact(
-                state.messages, provider, session, size=size_now(), window=window, force=force
+                state.messages,
+                provider,
+                session,
+                size=size_now(),
+                window=state.window,
+                force=force,
             )
         )
 
@@ -226,7 +258,7 @@ def _chat(
         判"有没有可压的"用的是同一个 cut_point，所以这儿的规矩和自动那条路一模一样：切点
         必须落在真正的用户轮上，最近几轮一律留着——区别只在于不看大小。
         """
-        if cut_point(state.messages, size=size_now(), window=window, force=True) is None:
+        if cut_point(state.messages, size=size_now(), window=state.window, force=True) is None:
             return f"没什么可压的——最近 {KEEP_RECENT_TURNS} 轮一律原样留着，要压得先多聊几轮。"
         # 压在第几条、成没成，_compact 自己会说；只有它没说到的那些才由这里补。
         compact_once(force=True)
@@ -278,7 +310,11 @@ def _chat(
         fold_once()
         compact_once()
         system = build_system_prompt(
-            cwd, state.permission_mode, model, allow_fork=state.allow_fork
+            cwd,
+            state.permission_mode,
+            provider.model,
+            allow_fork=state.allow_fork,
+            sandbox=state.sandbox,
         )
         result = runagent(
             line,
@@ -286,11 +322,16 @@ def _chat(
             registry,
             system=system,
             refresh_system=lambda mode: build_system_prompt(
-                cwd, mode, model, allow_fork=state.allow_fork
+                cwd,
+                mode,
+                provider.model,
+                allow_fork=state.allow_fork,
+                sandbox=state.sandbox,
             ),
             cwd=cwd,
             allow_shell=allow_shell,
             permission_mode=state.permission_mode,
+            sandbox=state.sandbox,
             prompter=prompter,
             grants=grants,
             messages=state.messages,
@@ -349,7 +390,11 @@ def _chat(
             return
         fold_once()
         system = build_system_prompt(
-            cwd, state.permission_mode, model, allow_fork=state.allow_fork
+            cwd,
+            state.permission_mode,
+            provider.model,
+            allow_fork=state.allow_fork,
+            sandbox=state.sandbox,
         )
         result = runagent(
             f"{notice}\n\n"
@@ -359,12 +404,17 @@ def _chat(
             registry,
             system=system,
             refresh_system=lambda mode: build_system_prompt(
-                cwd, mode, model, allow_fork=state.allow_fork
+                cwd,
+                mode,
+                provider.model,
+                allow_fork=state.allow_fork,
+                sandbox=state.sandbox,
             ),
             max_steps=1,
             cwd=cwd,
             allow_shell=allow_shell,
             permission_mode=state.permission_mode,
+            sandbox=state.sandbox,
             prompter=NullPrompter(),
             grants=grants,
             messages=state.messages,
@@ -386,7 +436,6 @@ def _chat(
     ctx = CommandContext(
         console=console,
         state=state,
-        window=window,
         cwd=cwd,
         allow_shell=allow_shell,
         session=session,
@@ -542,7 +591,14 @@ def main_command(
         help="Anthropic 兼容端点；优先用 .env 里的 DEEPSEEK_ANTHROPIC_BASE_URL",
     ),
     shell: bool = typer.Option(
-        False, "--shell", help="允许 agent 执行命令（跑在一次性 docker 容器里）"
+        False,
+        "--shell",
+        help="允许 agent 执行命令（默认跑在一次性 docker 容器里，可用 --sandbox 改）",
+    ),
+    sandbox: str = typer.Option(
+        DEFAULT_SANDBOX,
+        "--sandbox",
+        help="命令执行环境：docker（一次性容器，默认）/ host（直接跑在宿主机上，没有隔离）",
     ),
     fork: bool = typer.Option(
         False,
@@ -584,16 +640,36 @@ def main_command(
     except ValueError as exc:
         # 在门口就把错字拦住。跑起来才发现档位不对的话，那时已经有工具调用被放行了。
         raise typer.BadParameter(str(exc), param_hint="--permission_mode") from None
+    try:
+        sandbox = parse_sandbox(sandbox)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--sandbox") from None
 
     if permission_mode == "bypass permissions":
         # 唯一一档把用户从回路里拿掉。开的时候说一声，别让它悄悄生效——它不是常驻设置，
         # 是这一次运行的选择。
+        console.print(BYPASS_WARNING, style="bold red", markup=False)
+
+    if sandbox == "host":
         console.print(
-            "⚠ bypass permissions：什么都不问。模型跑命令不再经过你，"
-            "而命令能改项目里任何文件、也能把 .env 读进上下文。",
+            "⚠ sandbox host：命令将直接跑在宿主机上——没有容器隔离，"
+            "能访问整个用户环境、网络和凭据，也能改项目目录以外的文件。",
             style="bold red",
             markup=False,
         )
+        if not shell:
+            console.print(
+                "（这次 --shell 没开，命令执行仍然不可用；这个设置暂时不生效。）",
+                style="dim",
+                markup=False,
+            )
+        if permission_mode == "bypass permissions":
+            console.print(
+                "⚠ 同时开着 bypass permissions 和 sandbox host：命令不再经你确认，"
+                "也不再有任何沙箱——模型可以对你整个用户环境做任何事。",
+                style="bold red",
+                markup=False,
+            )
 
     # prompter 建一次、两个分支共用：它的答案以后要带"这一次会话别再问了"这种记忆，
     # 每轮新建一个的话那份记忆就丢了。
@@ -601,9 +677,9 @@ def main_command(
     # "本会话这个别再问了"记在这儿。和 prompter 一样得建在循环外面——runagent 每轮新建，
     # 放里面的话下一轮就忘了，等于每轮都重新问一遍。
     grants = Grants()
-    # ask_user 只在"有人可问"的时候才存在，所以它不在 default_tools() 里，在这儿装进来。
+    # ask_user / agent / set_permission_mode 都在 _chat 里注册：它们需要 prompter、provider、
+    # tasks、broker 和 state 这些循环里才有的东西。
     registry = default_tools()
-    registry.register(make_ask_user(prompter))
     workdir = cwd or Path.cwd()
     # 让磁盘上那两份索引（记忆、技能）跟目录对齐：手工加/删过的话它们会漂（不影响模型——
     # 模型看的是现算的那份）。只在真不一样时才写，目录不存在就直接返回。
@@ -618,15 +694,22 @@ def main_command(
         except FileNotFoundError as exc:
             raise typer.BadParameter(str(exc)) from None
         # 档位**不跟着历史走**：它是"我这次要多大权限"的选择，不该被上次带着跑。上次是什么
-        # 档打在这儿，对不上你能看见。
+        # 档打在这儿，对不上你能看见。沙箱同理。
+        last_sandbox = meta.get("sandbox") or "未记录"
         console.print(
             f"接上 {session.id}：{len(history)} 条消息，上次档位 {meta.get('permission_mode')}"
-            f"（这次按 {permission_mode} 走）",
+            f"（这次按 {permission_mode} 走），上次沙箱 {last_sandbox}"
+            f"（这次按 {sandbox} 走）",
             style="bold",
             markup=False,
         )
     else:
-        session = start(workdir, permission_mode=permission_mode, allow_shell=shell)
+        session = start(
+            workdir,
+            permission_mode=permission_mode,
+            allow_shell=shell,
+            sandbox=sandbox,
+        )
     # provider 建一次就够（一次运行一个 HTTP 客户端）。system prompt 不在这儿建：每轮重拼
     # ——记忆会中途变，见 _chat。
     provider = AnthropicProvider(
@@ -637,22 +720,8 @@ def main_command(
     # 后台任务表：`agent` 工具把跑长的活交给它，`/tasks` 和空闲时唤醒的汇报回合共用同一份。
     tasks = TaskManager()
     # 后台任务的授权请求表：后台线程往里放，读键盘线程在持有终端时取出来问用户。**要在
-    # `make_agent_tool` 之前建**——那个工具的闭包会抓着它。
+    # _chat 之前建**——那里注册的 `agent` 工具闭包会抓着它。
     broker = PermissionBroker()
-    # 子 agent 那个工具在这儿装进去（`agent`），和上面的 `ask_user` 一样是 harness 才有的能力。
-    # **它排在 provider 后面，不是跟 ask_user 放一起**：那个工具要 provider 才能跑（子 agent
-    # 是要真发请求的），而 `registry` 建在 provider **之前**——那个顺序是有意的，见上面
-    # "接会话排在 provider 前面"那句。registry 随后交给 _chat 使用，所以装在这儿。
-    registry.register(
-        make_agent_tool(
-            provider=provider,
-            prompter=prompter,
-            grants=grants,
-            model=provider.model,
-            tasks=tasks,
-            broker=broker,
-        )
-    )
     # fork 不单独注册：它是 `agent` 的 `type` 枚举里的一项。开没开 `--fork` 由
     # `ToolContext.fork` 判——关着的时候 `agent(type="fork")` 会回一句"没打开"。枚举是静态的，
     # 所以切换开关**不会改工具表**；变的只有系统提示里那段说明。
@@ -664,11 +733,10 @@ def main_command(
         cwd=workdir,
         allow_shell=shell,
         permission_mode=permission_mode,
+        sandbox=sandbox,
         prompter=prompter,
         grants=grants,
-        # 提示词里要写"你是哪个模型"。**从这儿传进去，不是去 provider 里取**——Provider 协议
-        # 声明的是能力，不认识 model；手上这份是真的 AnthropicProvider。
-        model=provider.model,
+        # 模型名由 provider 自己带着，_chat 每轮现读 provider.model；`/model` 改的也是它。
         allow_fork=fork,
         tasks=tasks,
         broker=broker,

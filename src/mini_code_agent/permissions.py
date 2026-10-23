@@ -7,12 +7,13 @@
 - `plan`：不给改文件——计划模式，先让模型把打算怎么做讲清楚，再切出去执行
 - `bypass permissions`：什么都不问
 
-**bypass permissions 是唯一一档把用户从回路里拿掉的**，所以启动时显式给最好；会话里唯一
-能进去的路是模型调用 `set_permission_mode`、并在用户确认过写明风险的提示之后生效——
-`/permission_mode` 命令仍然拒绝这一档。开了之后模型跑命令不再经过用户，而命令能改项目里
-任何文件、也能把 `.env` 读进上下文（见 known-issues A1 / A2）。它放行的只是"要不要问"这一层
-——工具自己的闸门（围栏、符号链接、敏感路径、读-before-写、改前备份）照样管用：权限不是
-授权，批准过的事也不该能写出围栏。
+**bypass permissions 是唯一一档把用户从回路里拿掉的**：启动时可以直接给；会话里用户
+可以用 `/permission_mode bypass` 自己切，模型则必须调用 `set_permission_mode`、并在用户
+确认过写明风险的提示之后才生效。用户自己敲的命令和模型请求不是一回事，所以两边的确认
+策略不同。开了之后模型跑命令不再经过用户，而命令能改项目里任何文件、也能把 `.env` 读进
+上下文（见 known-issues A1 / A2）。它放行的只是"要不要问"这一层——工具自己的闸门（围栏、
+符号链接、敏感路径、读-before-写、改前备份）照样管用：权限不是授权，批准过的事也不该能
+写出围栏。
 
 bash 跟不跟档位走，看档位：`default` 和 `accept edits` 下它一律要问（一条命令会干什么，
 用户事先看不出来），`bypass permissions` 下不问，`plan` 下仍然要问——那一格还没定，见
@@ -31,11 +32,20 @@ import threading
 from dataclasses import dataclass, field
 from typing import Literal, get_args
 
+from mini_code_agent.sandbox import DEFAULT_SANDBOX
+
 # 四个档位。参数标注、parse_permission_mode 的返回值、报错里列出的可选值都指向这一处，
 # 以后想加第五档只改这里。
 PermissionMode = Literal["accept edits", "bypass permissions", "default", "plan"]
 
 PERMISSION_MODES: tuple[PermissionMode, ...] = get_args(PermissionMode)
+
+# 把用户从回路里拿掉的提醒。启动时和 `/permission_mode bypass` 共用同一句，避免两处文案
+# 漂移。
+BYPASS_WARNING = (
+    "⚠ bypass permissions：什么都不问。模型跑命令不再经过你，"
+    "而命令能改项目里任何文件、也能把 .env 读进上下文。"
+)
 
 # 档位从紧到松的顺序。**只用来判"这次切换要不要征求同意"**（见 permission_tool）：
 # `decide_permission` 的判定表不是一个简单全序（bash 在 plan/default/accept 下都问），
@@ -68,6 +78,8 @@ RULES_FILE = "AGENTS.md"
 class PermissionRequest:
     tool_name: str
     tool_args: dict
+    # 命令在哪儿跑（docker / host）。只用于权限预览里的说明，不参与 decide_permission。
+    sandbox: str = DEFAULT_SANDBOX
 
 
 @dataclass

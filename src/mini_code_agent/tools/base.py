@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.usage import UsageMeter
 
 
@@ -116,6 +117,10 @@ class ContainerStartFailedError(ToolShellError):
     """容器没起来（镜像不存在、参数不对之类）。命令没有执行过。"""
 
 
+class ShellUnavailableError(ToolShellError):
+    """host 模式下找不到可用的 shell。命令没有执行过。"""
+
+
 @dataclass
 class ToolContext:
     """调用工具时的运行环境。
@@ -179,6 +184,13 @@ class ToolContext:
     #
     # 追加在最后，按位置构造 ToolContext 的测试不受影响。
     usage: UsageMeter | None = None
+
+    # 命令执行在哪儿跑：docker（一次性容器，默认）或 host（直接跑在宿主机上）。
+    # `allow_shell` 决定"能不能跑"，它决定"在哪儿跑"。
+    #
+    # host 没有隔离，生产代码里只有 core/agent.py 一处构造 ToolContext；默认值落在安全
+    # 一侧。追加在最后，同样是为了不影响按位置构造的测试。
+    sandbox: str = DEFAULT_SANDBOX
 
 
 def _always_available(_: ToolContext) -> bool:

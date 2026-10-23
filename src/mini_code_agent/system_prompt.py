@@ -7,9 +7,9 @@
   便宜价算（实测：这个项目的提示词 + 工具 schema 那一大段里，2560 个 token 走缓存、只有 236
   按原价）。所以这半写得细一点是划算的，但它**每一发都要发**，不是草稿纸——加一条就问一次
   "模型照着这条会做错什么事，不加会做错什么事"。
-- **动态的**：这次运行的实情（日期/平台/模型）、当前档位、从 cwd 到仓库根那几份 `AGENTS.md`
-  的原文、技能清单、长期记忆的清单、git 状态。按"变得越勤越靠后"排，这样改一处不会把它后面
-  的缓存全冲掉（git 状态最勤——模型每改一个文件它就变，所以垫底）。
+- **动态的**：这次运行的实情（日期/平台/模型）、当前档位、沙箱模式、从 cwd 到仓库根那几份
+  `AGENTS.md` 的原文、技能清单、长期记忆的清单、git 状态。按"变得越勤越靠后"排，这样改一处
+  不会把它后面的缓存全冲掉（git 状态最勤——模型每改一个文件它就变，所以垫底）。
 
 单独一个模块，是因为它要读盘、要认识档位，而 `core/agent.py` 只该拿到一个现成的字符串。
 它只读**环境**——读盘、读几个环境变量、跑几条只读的 git 命令——不碰 provider、不碰会话状态；
@@ -30,6 +30,7 @@ from pathlib import Path
 
 from mini_code_agent.memory import index_text as memory_index
 from mini_code_agent.permissions import RULES_FILE, parse_permission_mode
+from mini_code_agent.sandbox import DEFAULT_SANDBOX, parse_sandbox
 from mini_code_agent.skills import index_text as skill_index
 from mini_code_agent.tools.safety import truncate_text
 
@@ -67,12 +68,8 @@ _STATIC = """\
 
 ## 执行操作
 
-- `bash` 跑在**一次性容器**里：没有网络、根文件系统只读、只有项目目录挂进去（可写）、跑完就删。
-  所以命令碰不到宿主机。
 - **但项目目录是可写的**：`rm -rf`、重定向覆盖照样能毁掉还没提交的工作，而且那条路**不经过
   文件工具的备份**。破坏性的动作（删、覆盖、重置）动手前先想爆炸半径。
-- 容器里的路径和宿主机不一样（项目在容器里挂在 `/workspace`）。**别把宿主机的路径塞给容器里
-  的命令。**
 - 文件工具有路径闸门：只能碰工作目录之内，`.env` 这类敏感文件读不了。
 
 ## 使用工具
@@ -252,8 +249,8 @@ def _session_note(model: str | None) -> str:
     **日期取到"天"、不取到秒。** 这段每轮重拼一次，取到秒就等于每轮换一个前缀——缓存从这一
     行往后全废。取到天的话，一天之内它一个字都不变。
 
-    平台要说，因为这个项目两边不一样：`bash` 在 Linux 容器里跑，文件工具在宿主机上（这台是
-    Windows）。不说的话，模型给路径、给命令会按错的那边来。
+    平台要说，因为这个项目两边不一样：`bash` 在本次运行的沙箱里跑（docker 容器或宿主机），
+    文件工具在宿主机上（这台是 Windows）。不说的话，模型给路径、给命令会按错的那边来。
 
     **shell 只在环境告诉我们的时候才写**——Windows 上常常没有 `SHELL` 这个变量，那就不写：
     与其猜一个，不如不说。写的是 `SHELL` 的值，也就是**启动这次运行的那个** shell（通常就是
@@ -410,11 +407,38 @@ def project_context(cwd: Path) -> list[str]:
     return parts
 
 
+_SANDBOX_NOTES: dict[str, str] = {
+    "docker": (
+        "## 命令执行的沙箱\n\n"
+        "- `bash` 跑在**一次性容器**里：没有网络、根文件系统只读、只有项目目录挂进去"
+        "（可写）、跑完就删。所以命令碰不到宿主机。\n"
+        "- 容器里的路径和宿主机不一样（项目在容器里挂在 `/workspace`）。"
+        "**别把宿主机的路径塞给容器里的命令**；用相对路径。"
+    ),
+    "host": (
+        "## 命令执行的沙箱\n\n"
+        "- `bash` **直接跑在宿主机上**（优先 `bash -c`，没有 bash 时用系统 shell）："
+        "没有容器隔离，能访问用户的整个环境、网络和凭据，也能改项目目录以外的文件。\n"
+        "- 工作目录就是项目目录；用相对路径最稳（Windows 上 bash 可能是 Git Bash，"
+        "绝对路径写法不一定和 cmd 一样）。\n"
+        "- 破坏性动作（删、覆盖、重置）动手前先想爆炸半径——命令碰到的东西不再只限于"
+        "项目目录。"
+    ),
+}
+
+
+def _sandbox_note(sandbox: str) -> str:
+    """当前模式决定了 `bash` 能碰到什么。这段是动态区，切换会重建它后面的前缀。"""
+    return _SANDBOX_NOTES[parse_sandbox(sandbox)]
+
+
 def build_system_prompt(
     cwd: Path,
     permission_mode: str,
     model: str | None = None,
     allow_fork: bool = False,
+    *,
+    sandbox: str = DEFAULT_SANDBOX,
 ) -> str:
     """拼主 agent 的 system prompt：静态那半 + 这次运行的实情 + 档位 + 项目自己的那几段。
 
@@ -422,7 +446,7 @@ def build_system_prompt(
     和子 agent 那份共用——**它的顺序理由写在那儿**。
 
     前三段的顺序也是按"变得多勤"排的：静态那半永远不变；这次运行的实情一天一变（平台、
-    模型一次运行里不动）；档位会在会话里换（`/permission_mode` 或模型自己调
+    模型可在会话里用 `/model` 换）；档位会在会话里换（`/permission_mode` 或模型自己调
     `set_permission_mode`），但一次运行里通常不动。
 
     **切档说明假设调用方注册了 `permission_tool.make_set_permission_mode`**——CLI 的两条路
@@ -434,6 +458,9 @@ def build_system_prompt(
     `allow_fork` 是启动时的开关：开着才加 fork 那段。关着的时候输出**逐字节和以前一样**，
     没开这个功能的人不会在提示词里看到一个不存在的工具。
 
+    `sandbox` 是本次运行命令执行的模式（docker / host），决定动态区里那段"命令执行的沙箱"
+    说明；切换它会从这一段起重建缓存前缀。
+
     交互那条路**每轮重拼一次**：记忆和 `AGENTS.md` 都可能中途变（模型刚 `remember` 了一条），
     拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位同理——`/permission_mode` 能
     中途换，所以它也得每轮现读。
@@ -442,12 +469,18 @@ def build_system_prompt(
     parts = [_STATIC, _session_note(model), _MODE_HINTS[mode], _MODE_SWITCH_HINT]
     if allow_fork:
         parts.append(_FORK_HINT)
+    parts.append(_sandbox_note(sandbox))
     parts.extend(project_context(cwd))
     return "\n\n".join(parts)
 
 
 def build_subagent_prompt(
-    cwd: Path, agent_type: str, permission_mode: str, model: str | None = None
+    cwd: Path,
+    agent_type: str,
+    permission_mode: str,
+    model: str | None = None,
+    *,
+    sandbox: str = DEFAULT_SANDBOX,
 ) -> str:
     """拼子 agent 的 system prompt：公用静态头 + 这个类型那段 + 档位 + 项目那几段。
 
@@ -455,7 +488,8 @@ def build_subagent_prompt(
     它问不了用户，所以"拿不准就问"那句对它是有害的。
 
     **档位照旧要给它**：子 agent 继承主 agent 当前那一档（见 core/subagent.py），所以 plan
-    档下它得知道"改文件会被拒"——不然它会一路试到把步数烧完。
+    档下它得知道"改文件会被拒"——不然它会一路试到把步数烧完。`sandbox` 同理，决定它看到的
+    bash 环境说明和实际执行环境一致。
 
     `agent_type` 认不出来就**报错，不兜底**：调用方是 harness，这个字符串是从那张表里来的，
     到这一步还不认识说明是代码写错了。模型给的那个类型在 core/subagent.py 就已经拦下了，
@@ -471,6 +505,7 @@ def build_subagent_prompt(
         head,
         _session_note(model),
         _MODE_HINTS[mode],
+        _sandbox_note(sandbox),
         *project_context(cwd),
     ]
     return "\n\n".join(parts)

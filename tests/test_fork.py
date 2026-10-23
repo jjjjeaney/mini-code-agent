@@ -89,11 +89,12 @@ class RecordingPrompter:
 def the_tool(
     provider, prompter=None, *, tasks=None, background_after=120.0
 ) -> Tool:
+    # 模型名在派发时从 provider.model 现读，不再作为工具参数冻结。
+    provider.model = "test-model"
     return make_agent_tool(
         provider=provider,
         prompter=prompter or RecordingPrompter(),
         grants=Grants(),
-        model="test-model",
         tasks=tasks,
         background_after=background_after,
     )

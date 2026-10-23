@@ -21,6 +21,7 @@ from mini_code_agent.providers.base import (
     ToolCall,
     TransientProviderError,
 )
+from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.tools import (
     ForkContext,
     ReadFileState,
@@ -287,7 +288,9 @@ def _gate(
     拒绝走**结果**不走异常：模型收到"用户不同意"才能换个做法，抛异常是把一次正常的人机
     协商变成崩溃。也不让它原样重试——那只会再被拒一次。
     """
-    request = PermissionRequest(tool_name=call.name, tool_args=call.arguments)
+    request = PermissionRequest(
+        tool_name=call.name, tool_args=call.arguments, sandbox=ctx.sandbox
+    )
     decision = decide_permission(request, ctx.allow_shell, ctx.permission_mode)
 
     blocked: str | None = None
@@ -340,6 +343,7 @@ def runagent(
     wait_hint: WaitHint | None = None,
     defer_final_usage: bool = False,
     usage: UsageMeter | None = None,
+    sandbox: str = DEFAULT_SANDBOX,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -351,6 +355,9 @@ def runagent(
     permission_mode 是权限档位（四档见 permissions.py），决定什么要问用户。它只是**起始值**：
     模型可以在回合中途调用 `set_permission_mode` 改 `ctx.permission_mode`，同一轮后面的调用
     立即按新档位判定。
+
+    sandbox 决定 `bash` 跑在一次性容器里还是宿主机上（见 tools/shell.py）。它只是起始环境：
+    子 agent 通过 `ctx.sandbox` 继承；权限判定不看它，但权限预览会用它说明命令在哪儿跑。
 
     `refresh_system` 可选：收当前档位、返回一份新 system。模型切档之后，**下一次请求前**用它
     重拼，让提示词里的档位说明立刻跟上；档位没变就不调用。它会重读 AGENTS.md、记忆和 git，
@@ -435,6 +442,7 @@ def runagent(
         fork=fork_ctx,
         allow_background=allow_background,
         usage=usage,
+        sandbox=sandbox,
     )
     tools = tool_schemas if tool_schemas is not None else registry.schemas(ctx)
     if fork_ctx is not None:

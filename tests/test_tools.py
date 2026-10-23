@@ -202,6 +202,14 @@ class TestDefaultTools:
     def test_each_call_returns_a_fresh_registry(self):
         assert default_tools() is not default_tools()
 
+    def test_the_schemas_do_not_depend_on_the_sandbox(self, tmp_path):
+        """切沙箱不能改工具表——工具那一半是缓存前缀的一部分。"""
+        registry = default_tools()
+        docker = registry.schemas(ToolContext(cwd=tmp_path, sandbox="docker"))
+        host = registry.schemas(ToolContext(cwd=tmp_path, sandbox="host"))
+
+        assert docker == host
+
     def test_the_read_only_ones_are_exactly_these(self):
         """子 agent 里 explore / plan 两个类型只有这批工具（见 core/subagent.py）。
 

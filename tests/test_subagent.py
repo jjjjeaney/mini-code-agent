@@ -293,11 +293,13 @@ def the_tool(
     background_after=120.0,
     broker=None,
 ) -> Tool:
+    # `make_agent_tool` 在派子 agent 时现读 provider.model，所以模型名挂在 provider 上，
+    # 不再作为工具参数冻结。
+    provider.model = "test-model"
     return make_agent_tool(
         provider=provider,
         prompter=prompter if prompter is not None else NullPrompter(),
         grants=grants if grants is not None else Grants(),
-        model="test-model",
         tasks=tasks,
         background_after=background_after,
         broker=broker,
@@ -339,6 +341,20 @@ class TestTheAgentToolShape:
         """总结没有天然上限。不封顶的话，"只把结论拿回来"这句话就是空的。"""
         assert the_tool(ScriptedProvider([])).spill is True
 
+    def test_the_model_name_is_read_when_the_subagent_starts(self, tmp_path):
+        """模型名在派发时现读 provider.model——`/model` 中途换了它，下一次派发就该用新的。"""
+        provider = ScriptedProvider([text_turn("结论"), text_turn("结论")])
+        tool = the_tool(provider)
+        ctx = ToolContext(cwd=tmp_path)
+
+        provider.model = "model-a"
+        call_the_tool(tool, ctx, prompt="第一件事")
+        provider.model = "model-b"
+        call_the_tool(tool, ctx, prompt="第二件事")
+
+        assert "模型 model-a" in provider.calls[0]["system"]
+        assert "模型 model-b" in provider.calls[1]["system"]
+
     def test_its_result_can_never_be_folded(self):
         """**子 agent 交回来的结论不许被折掉。**
 
@@ -370,6 +386,13 @@ class TestRunningASubagent:
         assert "没有名为" in text
         assert "explore" in text  # 把可选的列出来，它才知道该改成什么
         assert provider.calls == []  # 一发都没发出去
+
+    def test_it_inherits_the_parents_sandbox_mode(self, tmp_path):
+        provider = ScriptedProvider([text_turn("结论")])
+
+        call_the_tool(the_tool(provider), ToolContext(cwd=tmp_path, sandbox="host"))
+
+        assert "宿主机" in provider.calls[0]["system"]
 
     def test_its_requests_go_into_the_parents_turn_meter(self, tmp_path):
         """子 agent 花的是另一串请求，但记的是主 agent 这一轮的账。"""

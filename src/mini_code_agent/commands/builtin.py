@@ -11,8 +11,10 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 
 from mini_code_agent.commands.base import Command, CommandContext, CommandOutcome
+from mini_code_agent.context_window import CONTEXT_WINDOWS, UNKNOWN_MODEL_WINDOW, window_for
 from mini_code_agent.core.tasks import format_duration
-from mini_code_agent.permissions import PERMISSION_MODES, parse_permission_mode
+from mini_code_agent.permissions import BYPASS_WARNING, PERMISSION_MODES, parse_permission_mode
+from mini_code_agent.sandbox import SANDBOX_GLOSS, parse_sandbox
 from mini_code_agent.sessions import SESSIONS_DIR, list_sessions
 from mini_code_agent.summarizing import COMPACT_AT, context_size
 from mini_code_agent.tools.safety import truncate_text
@@ -31,11 +33,10 @@ GLOSS: dict[str, str] = {
     "bypass permissions": "什么都不问——问这一层整个关掉了",
 }
 
-# 会话里能直接切的几档。**bypass permissions 不在里面**，理由见 known-issues F4：它是唯一
-# 一档把用户整个从回路里拿掉的，命令行启动仍是最直接的入口；模型可以调用
-# `set_permission_mode` 请求它，但那条路会弹一句写明风险的确认，用户同意才生效。
-# 按 PERMISSION_MODES 推出来，以后加第五档不必记得回来改这儿。
-SWITCHABLE: tuple[str, ...] = tuple(m for m in PERMISSION_MODES if m != "bypass permissions")
+# 会话里能直接切的几档。bypass 现在也在里面：用户自己点名切，就当场打一行红色警告，
+# 不再拒绝。模型通过 `set_permission_mode` 请求它时仍要确认——用户自己敲的命令和模型
+# 请求不是一回事。
+SWITCHABLE: tuple[str, ...] = PERMISSION_MODES
 
 
 def _relative(path: Path, cwd: Path) -> str:
@@ -122,7 +123,9 @@ def make_permission_mode() -> Command:
                 f"能在这儿切的：{'、'.join(SWITCHABLE)}", style="dim", markup=False
             )
             ctx.console.print(
-                "（带空格的档位还有短写法：accept = accept edits）", style="dim", markup=False
+                "（带空格的档位还有短写法：accept = accept edits，bypass = bypass permissions）",
+                style="dim",
+                markup=False,
             )
             return "handled"
 
@@ -134,19 +137,12 @@ def make_permission_mode() -> Command:
             ctx.console.print(str(exc), style="red", markup=False)
             return "handled"
 
-        if mode == "bypass permissions":
-            ctx.console.print(
-                "bypass permissions 不能直接用 /permission_mode 切：它只能启动时用 "
-                "--permission_mode bypass 开，或者由模型调用 set_permission_mode、"
-                "在你确认过写明风险的提示之后才会生效（见 known-issues F4）。",
-                style="red",
-                markup=False,
-            )
-            return "handled"
-
         if mode == current:
             ctx.console.print(f"已经是 {mode} 了。", style="dim", markup=False)
             return "handled"
+
+        if mode == "bypass permissions":
+            ctx.console.print(BYPASS_WARNING, style="bold red", markup=False)
 
         ctx.state.permission_mode = mode
         ctx.console.print(f"档位换成 {mode}：{GLOSS.get(mode, '')}（下一轮起生效）", markup=False)
@@ -207,19 +203,164 @@ def make_fork() -> Command:
     )
 
 
-def make_status() -> Command:
-    """把这个循环现在的样子摊开：在哪儿跑、什么档位、fork 开没开、历史多长、接的哪次会话。
+def make_sandbox() -> Command:
+    """看当前命令执行沙箱；带参数就切 docker / host。
 
-    报的全是**循环自己手里**的东西。**不印模型名**：那是 provider 的，而 Provider 协议
-    （providers/base.py）故意只声明了 complete 这一个方法——为了一行状态去扩那个接口，等于
-    让所有假 provider（测试里那些）都跟着多背一个字段，不值当。真要看模型，命令行和 .env
-    里就是。
+    **不二次确认**：用户自己敲的命令就是确认。切到 host 会打一行红色警告，因为那等于
+    把命令直接放到宿主机上；但仍照切。
+    """
+
+    def run(ctx: CommandContext, arg: str) -> CommandOutcome:
+        current = ctx.state.sandbox
+        name = arg.strip()
+        if not name:
+            ctx.console.print(f"当前的沙箱：{current}", markup=False)
+            ctx.console.print(
+                f"  {SANDBOX_GLOSS.get(current, '')}", style="dim", markup=False
+            )
+            ctx.console.print(
+                "  /sandbox docker|host 切换（下一轮起生效）", style="dim", markup=False
+            )
+            if not ctx.allow_shell:
+                ctx.console.print(
+                    "（命令执行这次没开（--shell 是启动开关）；沙箱设置暂时不生效。）",
+                    style="dim",
+                    markup=False,
+                )
+            return "handled"
+
+        try:
+            sandbox = parse_sandbox(name)
+        except ValueError as exc:
+            ctx.console.print(str(exc), style="red", markup=False)
+            return "handled"
+
+        if sandbox == current:
+            ctx.console.print(f"已经是 {sandbox} 了。", style="dim", markup=False)
+            return "handled"
+
+        ctx.state.sandbox = sandbox
+        if sandbox == "host":
+            ctx.console.print(
+                "⚠ 沙箱切到 host：命令将直接跑在宿主机上——没有容器隔离，"
+                "能访问整个用户环境、网络和凭据，也能改项目目录以外的文件。",
+                style="bold red",
+                markup=False,
+            )
+        ctx.console.print(
+            f"沙箱换成 {sandbox}：{SANDBOX_GLOSS.get(sandbox, '')}（下一轮起生效）",
+            markup=False,
+        )
+        ctx.console.print(
+            "  提示词里的沙箱说明变了，下一轮的前缀缓存会从头算——那一发按原价。",
+            style="dim",
+            markup=False,
+        )
+        if not ctx.allow_shell:
+            ctx.console.print(
+                "  （命令执行这次没开（--shell 是启动开关）；这个设置暂时不生效。）",
+                style="dim",
+                markup=False,
+            )
+        if ctx.tasks is not None and ctx.tasks.running() > 0:
+            ctx.console.print(
+                "  有后台任务在跑：它们启动时已经定下沙箱，仍按旧模式执行；"
+                "新派的任务用新设置。",
+                style="dim",
+                markup=False,
+            )
+        return "handled"
+
+    return Command(
+        name="sandbox",
+        run=run,
+        summary="看当前命令执行沙箱，或者切到 docker / host（会重建前缀缓存）",
+        usage="[docker|host]",
+    )
+
+
+def _print_model(ctx: CommandContext, name: str, *, prefix: str = "") -> None:
+    """打印模型、当前窗口和压缩阈值；未知模型说清楚按默认窗口算。"""
+    window = ctx.state.window
+    note = (
+        ""
+        if name in CONTEXT_WINDOWS
+        else f"，窗口表里没有，按默认 {UNKNOWN_MODEL_WINDOW:,} 算"
+    )
+    ctx.console.print(
+        f"{prefix}模型：{name}（窗口 {window:,}，到 {int(window * COMPACT_AT):,} 才压{note}）",
+        markup=False,
+    )
+
+
+def make_model() -> Command:
+    """看当前模型；带参数就换一个。
+
+    **模型名和窗口必须一起改**：前者决定下一发请求，后者决定压缩阈值和 `/status`。
+    两行写在同一个地方，就是为了不让它们漂开。
+    """
+
+    def run(ctx: CommandContext, arg: str) -> CommandOutcome:
+        current = ctx.state.provider.model
+        name = arg.strip()
+        if not name:
+            if not current:
+                ctx.console.print("当前模型还没有定下来。", markup=False)
+            else:
+                _print_model(ctx, current)
+            ctx.console.print("  /model <模型id> 换一个", style="dim", markup=False)
+            return "handled"
+
+        if name == current:
+            ctx.console.print(f"已经是 {name} 了。", style="dim", markup=False)
+            return "handled"
+
+        # 这两行必须成对：只改 model 会让 window 停在旧模型上。
+        ctx.state.provider.model = name
+        ctx.state.window = window_for(name)
+        ctx.console.print(f"模型换成 {name}（下一轮起生效）", markup=False)
+        _print_model(ctx, name, prefix="  ")
+        ctx.console.print(
+            "  请求的 model 字段和系统提示都变了，下一发的前缀缓存会从头算——那一发按原价。",
+            style="dim",
+            markup=False,
+        )
+        if ctx.tasks is not None and ctx.tasks.running() > 0:
+            ctx.console.print(
+                "  有后台任务在跑：它们后续的请求会用新模型，但已经发出的 system prompt "
+                "仍是旧快照。",
+                style="dim",
+                markup=False,
+            )
+        return "handled"
+
+    return Command(
+        name="model",
+        run=run,
+        summary="看当前模型，或者换一个（会重建前缀缓存）",
+        usage="[模型id]",
+    )
+
+
+def make_status() -> Command:
+    """把这个循环现在的样子摊开：在哪儿跑、什么模型、什么档位、沙箱、fork 开没开、
+    历史多长、接的哪次会话。
+
+    报的全是**循环自己手里**的东西。模型和窗口都在 `ChatState` 里（`/model` 会改它们），
+    所以能直接印；不需要为了这一行去问 provider 的请求方法。
     """
 
     def run(ctx: CommandContext, arg: str) -> CommandOutcome:
         session = ctx.session
         mode = ctx.state.permission_mode
-        shell = "开（跑在一次性容器里，跑完就删）" if ctx.allow_shell else "关（--shell 才打开）"
+        model = ctx.state.provider.model
+        shell = "开" if ctx.allow_shell else "关（--shell 才打开）"
+        sandbox = ctx.state.sandbox
+        where = (
+            "一次性容器里，跑完就删"
+            if sandbox == "docker"
+            else "直接跑在宿主机上，没有隔离"
+        )
         fork = (
             "开（可以派继承当前对话的子 agent）"
             if ctx.state.allow_fork
@@ -237,8 +378,16 @@ def make_status() -> Command:
         compacted = "；前面那段已经压成摘要了" if session.has_summary else ""
 
         ctx.console.print(f"工作目录：{ctx.cwd}", markup=False)
+        if model:
+            note = "" if model in CONTEXT_WINDOWS else "（窗口表里没有，按默认窗口算）"
+            ctx.console.print(f"模型：{model}{note}", markup=False)
+        else:
+            ctx.console.print("模型：（未指定）", markup=False)
         ctx.console.print(f"权限档位：{mode}（{GLOSS.get(mode, '')}）", markup=False)
         ctx.console.print(f"命令执行：{shell}", markup=False)
+        ctx.console.print(
+            f"沙箱：{sandbox}（{where}；只在命令执行开着时生效）", markup=False
+        )
         ctx.console.print(f"fork：{fork}", markup=False)
         if ctx.tasks is not None:
             records = ctx.tasks.list()
@@ -264,13 +413,14 @@ def make_status() -> Command:
         ctx.console.print(f"会话文件：{where}", markup=False)
         ctx.console.print(
             f"历史大小：{len(ctx.state.messages)} 条 / 约 {used:,} token（{how}）"
-            f"（窗口 {ctx.window:,}，到 {int(ctx.window * COMPACT_AT):,} 才压）{compacted}",
+            f"（窗口 {ctx.state.window:,}，到 {int(ctx.state.window * COMPACT_AT):,} 才压）"
+            f"{compacted}",
             markup=False,
         )
         return "handled"
 
     return Command(
-        name="status", run=run, summary="看在哪儿跑、什么档位、fork 开没开、历史多长"
+        name="status", run=run, summary="看在哪儿跑、什么模型、什么档位、沙箱、fork、历史"
     )
 
 
