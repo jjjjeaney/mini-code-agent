@@ -403,6 +403,7 @@ def test_the_cli_does_not_print_a_streamed_answer_twice(monkeypatch, tmp_path, c
         allow_shell=False,
         permission_mode="default",
         sandbox="docker",
+        results="full",
         prompter=NullPrompter(),
         grants=Grants(),
     )
@@ -428,6 +429,7 @@ def test_a_streamed_answer_also_prints_usage_after_it(monkeypatch, tmp_path, cap
         allow_shell=False,
         permission_mode="default",
         sandbox="docker",
+        results="full",
         prompter=NullPrompter(),
         grants=Grants(),
     )

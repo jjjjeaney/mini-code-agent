@@ -25,6 +25,7 @@ from mini_code_agent.core.agent import CANCELLED_ERROR, AgentResult
 from mini_code_agent.core.tasks import TaskManager
 from mini_code_agent.interaction import PermissionBroker
 from mini_code_agent.permissions import Grants, PermissionRequest
+from mini_code_agent.results import DEFAULT_RESULTS
 from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.sessions import SESSIONS_DIR, Session, start
 from mini_code_agent.summarizing import COMPACT_AT
@@ -48,6 +49,7 @@ def make_ctx(
     compact: Callable[[], str | None] | None = None,
     model: str | None = None,
     sandbox: str = DEFAULT_SANDBOX,
+    results: str = DEFAULT_RESULTS,
     context_tokens: int | None = None,
     context_covered: int = 0,
     tasks: TaskManager | None = None,
@@ -65,6 +67,7 @@ def make_ctx(
         provider=StubProvider(model),
         window=window_for(model),
         sandbox=sandbox,
+        results=results,
     )
     if context_tokens is not None:
         state.remember_context(context_tokens, context_covered)
@@ -419,6 +422,14 @@ class TestStatus:
         out = capsys.readouterr().out
         assert "沙箱：host" in out
         assert "宿主机" in out
+
+    def test_it_reports_the_tool_result_policy(self, capsys):
+        """结果被藏起来时用户得能确认这个设置——否则"结果没打印"看着像工具没跑。"""
+        default_commands().dispatch("/status", make_ctx(results="hidden"))
+
+        out = capsys.readouterr().out
+        assert "工具结果：hidden" in out
+        assert "出错的结果仍会完整打印" in out
 
     def test_it_reports_the_current_model(self, capsys):
         default_commands().dispatch("/status", make_ctx(model="qwen-max"))

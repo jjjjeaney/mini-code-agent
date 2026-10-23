@@ -10,6 +10,7 @@ from collections.abc import Sequence
 
 import pytest
 
+from mini_code_agent.core.agent import AgentResult
 from mini_code_agent.core.subagent import (
     AGENT_SCHEMA,
     AGENT_TYPES,
@@ -393,6 +394,23 @@ class TestRunningASubagent:
         call_the_tool(the_tool(provider), ToolContext(cwd=tmp_path, sandbox="host"))
 
         assert "宿主机" in provider.calls[0]["system"]
+
+    def test_it_inherits_the_parents_result_display_policy(self, tmp_path, monkeypatch):
+        """子 agent 跟主 agent 用同一个显示策略——它打出来的行也带 label，属于同一条屏幕。"""
+        seen: dict = {}
+
+        def fake_runagent(*args, **kwargs):
+            seen.update(kwargs)
+            return AgentResult(final="结论", trace=[], messages=[])
+
+        monkeypatch.setattr("mini_code_agent.core.subagent.runagent", fake_runagent)
+
+        call_the_tool(
+            the_tool(ScriptedProvider([])),
+            ToolContext(cwd=tmp_path, results="hidden"),
+        )
+
+        assert seen["results"] == "hidden"
 
     def test_its_requests_go_into_the_parents_turn_meter(self, tmp_path):
         """子 agent 花的是另一串请求，但记的是主 agent 这一轮的账。"""

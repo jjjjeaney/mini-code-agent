@@ -33,6 +33,7 @@ from mini_code_agent.prompting import TerminalPrompter, make_ask_user
 from mini_code_agent.prompts import Answer, NullPrompter, Prompter
 from mini_code_agent.providers.anthropic import DEFAULT_MODEL, AnthropicProvider
 from mini_code_agent.providers.base import Provider
+from mini_code_agent.results import DEFAULT_RESULTS, parse_results
 from mini_code_agent.sandbox import DEFAULT_SANDBOX, parse_sandbox
 from mini_code_agent.sessions import Session, delete_session, load, start, summary_message
 from mini_code_agent.skills import sync_skill_index
@@ -172,6 +173,7 @@ def _chat(
     allow_shell: bool,
     permission_mode: str,
     sandbox: str,
+    results: str,
     prompter: Prompter,
     grants: Grants,
     allow_fork: bool = False,
@@ -184,7 +186,8 @@ def _chat(
     一条），拼一次用到底的话，这一轮记下的东西要重启进程才看得见。档位、模型、沙箱和历史
     同理——`/permission_mode`、`/model` 和 `/sandbox` 能换前三个，`/status` 要报历史多长，
     所以它们都放进 `state`，和提示词一起每轮现读。传进来的 `permission_mode`、`messages` 和
-    `sandbox` 只是起始值；模型名直接读 `provider.model`。
+    `sandbox` 只是起始值；模型名直接读 `provider.model`。`results` 只决定工具结果上不上屏，
+    不进提示词也不进请求，固定在 `state` 里供 `/status` 报。
 
     这一行先过命令表（见 commands/）：认出来的命令就地办掉、**不发给模型**，也不落盘——
     命令是用户对程序说的话，不是对话的一部分，接上历史时不该看见它。
@@ -203,6 +206,7 @@ def _chat(
         window=window_for(provider.model),
         allow_fork=allow_fork,
         sandbox=sandbox,
+        results=results,
     )
     # harness 才有的三个工具都在这儿装：ask_user 需要有人可问，agent 需要 provider /
     # tasks / broker，切档工具需要 state 这个活对象。它们不在 default_tools() 里。
@@ -332,6 +336,7 @@ def _chat(
             allow_shell=allow_shell,
             permission_mode=state.permission_mode,
             sandbox=state.sandbox,
+            results=state.results,
             prompter=prompter,
             grants=grants,
             messages=state.messages,
@@ -415,6 +420,7 @@ def _chat(
             allow_shell=allow_shell,
             permission_mode=state.permission_mode,
             sandbox=state.sandbox,
+            results=state.results,
             prompter=NullPrompter(),
             grants=grants,
             messages=state.messages,
@@ -600,6 +606,14 @@ def main_command(
         "--sandbox",
         help="命令执行环境：docker（一次性容器，默认）/ host（直接跑在宿主机上，没有隔离）",
     ),
+    results: str = typer.Option(
+        DEFAULT_RESULTS,
+        "--results",
+        help=(
+            "工具结果：full（完整打印，默认）/ hidden（只打调用，结果不打印；"
+            "出错的结果仍会完整打印）"
+        ),
+    ),
     fork: bool = typer.Option(
         False,
         "--fork",
@@ -644,6 +658,20 @@ def main_command(
         sandbox = parse_sandbox(sandbox)
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--sandbox") from None
+    try:
+        results = parse_results(results)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--results") from None
+
+    if results == "hidden":
+        # 结果被藏起来时，用户看到一串调用没有下文，容易以为卡住了。说一声，并且点明
+        # 出错的结果不受影响——那不是显示噪音，是判断依据。
+        console.print(
+            "（tool results hidden：工具调用照常打印，结果不打印；"
+            "出错的结果仍会完整打印，/status 可确认）",
+            style="dim",
+            markup=False,
+        )
 
     if permission_mode == "bypass permissions":
         # 唯一一档把用户从回路里拿掉。开的时候说一声，别让它悄悄生效——它不是常驻设置，
@@ -734,6 +762,7 @@ def main_command(
         allow_shell=shell,
         permission_mode=permission_mode,
         sandbox=sandbox,
+        results=results,
         prompter=prompter,
         grants=grants,
         # 模型名由 provider 自己带着，_chat 每轮现读 provider.model；`/model` 改的也是它。

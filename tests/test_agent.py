@@ -355,6 +355,46 @@ def test_a_failing_tool_shows_up_as_an_error_line(registry):
     assert result.final == "换个办法"
 
 
+def test_hidden_results_keep_the_call_lines_and_the_full_trace(registry):
+    """hidden 只挡结果上屏：调用行照打，trace 一个字都不少。
+
+    trace 是这一轮的流水（错误时靠它数调用次数），不是屏幕的副本——所以不能跟着藏。
+    """
+    seen: list[tuple[str, str]] = []
+    provider = ScriptedProvider([tool_turn("toolu_1", "add", {"a": 1, "b": 2}), text_turn("3")])
+
+    result = runagent(
+        "1+2",
+        provider,
+        registry,
+        results="hidden",
+        emit=lambda text, style: seen.append((text, style)),
+    )
+
+    printed = [text for text, _ in seen]
+    assert '→ add({"a": 1, "b": 2})' in printed
+    assert "← add: 3" not in printed
+    assert result.trace == ['→ add({"a": 1, "b": 2})', "← add: 3", "3"]
+    assert result.final == "3"
+
+
+def test_an_error_result_is_printed_even_when_results_are_hidden(registry):
+    """失败原因是判断依据，不是显示噪音——藏了它会让人以为工具跑成了。"""
+    seen: list[tuple[str, str]] = []
+    provider = ScriptedProvider([tool_turn("toolu_1", "nope", {}), text_turn("换个办法")])
+
+    runagent(
+        "调用一个不存在的工具",
+        provider,
+        registry,
+        results="hidden",
+        emit=lambda text, style: seen.append((text, style)),
+    )
+
+    printed = [text for text, _ in seen]
+    assert any(text.startswith("✗ nope: ") and "KeyError" in text for text in printed)
+
+
 def test_running_out_of_steps_asks_the_model_to_wrap_up(registry):
     """用满步数后不再打一句固定话，而是再问一次模型、把它的回复当 final。"""
     script = [tool_turn(f"toolu_{i}", "add", {"a": i, "b": i}) for i in range(3)]

@@ -437,6 +437,7 @@ def make_agent_tool(
             background_prompter=background_prompter,
             usage=ctx.usage,
             sandbox=ctx.sandbox,
+            results=ctx.results,
         )
         if result.handoff is not None:
             console.print(f"◀ {label}转到后台：{result.handoff}", style="dim", markup=False)

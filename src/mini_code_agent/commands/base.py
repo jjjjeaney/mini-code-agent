@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal
 from rich.console import Console
 
 from mini_code_agent.permissions import Grants
+from mini_code_agent.results import DEFAULT_RESULTS
 from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.sessions import Session
 
@@ -67,6 +68,11 @@ class ChatState:
     # 命令执行在哪儿跑（docker / host）。`/sandbox` 会改它，`_chat` 每轮现读：下一轮的
     # 系统提示、权限预览和 ToolContext 都跟着它走。切它会重建提示词里这一段之后的前缀。
     sandbox: str = DEFAULT_SANDBOX
+
+    # 工具结果在终端上打不打（full / hidden，见 results.py）。启动时定死，没有中途切换的
+    # 命令；`/status` 读它。**它不进系统提示**——显示策略和模型无关，读了只会白改缓存，
+    # 也不影响请求和花费。
+    results: str = DEFAULT_RESULTS
 
     # 上一次**真请求**报的输入总量，以及那一发当时装了多少条 messages。压缩阈值拿这两个算
     # （见 summarizing.context_size）。

@@ -85,6 +85,7 @@ def run_loop(
     grants: Grants | None = None,
     allow_fork: bool = False,
     sandbox: str = "docker",
+    results: str = "full",
     tasks: TaskManager | None = None,
     broker: PermissionBroker | None = None,
     prompter: Prompter | None = None,
@@ -102,6 +103,7 @@ def run_loop(
         allow_shell=False,
         permission_mode="default",
         sandbox=sandbox,
+        results=results,
         prompter=prompter if prompter is not None else NullPrompter(),
         grants=grants if grants is not None else Grants(),
         allow_fork=allow_fork,
@@ -160,6 +162,26 @@ def test_a_tool_turn_ends_with_its_total(monkeypatch, tmp_path, capsys):
     assert "本次任务共 2 发" in out
     # 答案之后是先这一发、再总和；工具那一步的用量行还在更前面。
     assert out.index("答案") < out.rindex("这一发 token") < out.index("本次任务共 2 发")
+
+
+def test_hidden_results_keep_the_call_line_but_drop_the_result(monkeypatch, tmp_path, capsys):
+    """hidden 下终端上只剩调用行：没有结果正文，也没有摘要或字符数。"""
+    registry = ToolRegistry([Tool(name="echo", description="", fn=lambda kwargs, ctx: "结果正文")])
+    provider = ScriptedProvider([tool_turn("t1", "echo", {}), text_turn("答案")])
+
+    run_loop(
+        monkeypatch,
+        provider,
+        ["你好", "/exit"],
+        tmp_path,
+        registry=registry,
+        results="hidden",
+    )
+
+    out = capsys.readouterr().out
+    assert "→ echo()" in out
+    assert "← echo" not in out
+    assert "结果正文" not in out
 
 
 def test_the_system_prompt_goes_out_on_every_turn(monkeypatch, tmp_path):
@@ -507,6 +529,7 @@ def test_the_list_flag_prints_the_sessions_and_stops(tmp_path, capsys):
             base_url="",
             shell=False,
             sandbox="docker",
+            results="full",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -541,6 +564,7 @@ def run_delete(tmp_path, session_id: str) -> None:
             base_url="",
             shell=False,
             sandbox="docker",
+            results="full",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -598,6 +622,7 @@ def test_deleting_an_unknown_id_is_a_bad_parameter(tmp_path):
             base_url="",
             shell=False,
             sandbox="docker",
+            results="full",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -676,6 +701,7 @@ def run_main(
         base_url="",
         shell=False,
         sandbox=sandbox,
+        results="full",
         fork=fork,
         permission_mode="default",
         continue_=False,
@@ -721,6 +747,7 @@ def test_the_sandbox_option_reaches_the_loop(monkeypatch, tmp_path):
         base_url="",
         shell=False,
         sandbox="host",
+        results="full",
         fork=False,
         permission_mode="default",
         continue_=False,
@@ -744,6 +771,7 @@ def test_host_sandbox_warns_at_startup(monkeypatch, tmp_path, capsys):
         base_url="",
         shell=False,
         sandbox="host",
+        results="full",
         fork=False,
         permission_mode="default",
         continue_=False,
@@ -767,6 +795,78 @@ def test_a_bad_sandbox_is_a_bad_parameter(tmp_path):
             base_url="",
             shell=False,
             sandbox="podman",
+            results="full",
+            fork=False,
+            permission_mode="default",
+            continue_=False,
+            resume="",
+            list_=False,
+            delete_="",
+        )
+
+
+def test_the_results_option_reaches_the_loop(monkeypatch, tmp_path):
+    seen: dict = {}
+    provider = FakeProvider([])
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
+    monkeypatch.setattr(cli, "_chat", lambda *args, **kwargs: seen.update(kwargs))
+
+    cli.main_command(
+        cwd=tmp_path,
+        model="",
+        api_key="",
+        base_url="",
+        shell=False,
+        sandbox="docker",
+        results="hidden",
+        fork=False,
+        permission_mode="default",
+        continue_=False,
+        resume="",
+        list_=False,
+        delete_="",
+    )
+
+    assert seen["results"] == "hidden"
+
+
+def test_hidden_results_are_announced_at_startup(monkeypatch, tmp_path, capsys):
+    """一串调用没有下文看着像卡死；启动时说清楚，并点明出错的结果照打。"""
+    provider = FakeProvider([])
+    monkeypatch.setattr(cli, "AnthropicProvider", lambda **kwargs: provider)
+    monkeypatch.setattr(cli, "_chat", lambda *args, **kwargs: None)
+
+    cli.main_command(
+        cwd=tmp_path,
+        model="",
+        api_key="",
+        base_url="",
+        shell=False,
+        sandbox="docker",
+        results="hidden",
+        fork=False,
+        permission_mode="default",
+        continue_=False,
+        resume="",
+        list_=False,
+        delete_="",
+    )
+
+    out = capsys.readouterr().out
+    assert "tool results hidden" in out
+    assert "出错的结果仍会完整打印" in out
+
+
+def test_a_bad_results_mode_is_a_bad_parameter(tmp_path):
+    with pytest.raises(typer.BadParameter, match="不是结果显示模式"):
+        cli.main_command(
+            cwd=tmp_path,
+            model="",
+            api_key="",
+            base_url="",
+            shell=False,
+            sandbox="docker",
+            results="brief",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -792,6 +892,7 @@ def test_resume_reports_the_recorded_sandbox(monkeypatch, tmp_path, capsys):
         base_url="",
         shell=False,
         sandbox="docker",
+        results="full",
         fork=False,
         permission_mode="default",
         continue_=False,
@@ -824,6 +925,7 @@ def test_the_model_option_reaches_the_provider(monkeypatch, tmp_path, capsys):
             base_url="",
             shell=False,
             sandbox="docker",
+            results="full",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -859,6 +961,7 @@ def test_the_endpoint_options_reach_the_provider(monkeypatch, tmp_path, capsys):
             base_url=base_url,
             shell=False,
             sandbox="docker",
+            results="full",
             fork=False,
             permission_mode="default",
             continue_=False,
@@ -1237,6 +1340,7 @@ class TestBackgroundReporting:
             allow_shell=False,
             permission_mode="default",
             sandbox="docker",
+            results="full",
             prompter=NullPrompter(),
             grants=Grants(),
             tasks=manager,

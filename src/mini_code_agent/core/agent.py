@@ -21,6 +21,7 @@ from mini_code_agent.providers.base import (
     ToolCall,
     TransientProviderError,
 )
+from mini_code_agent.results import DEFAULT_RESULTS
 from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.tools import (
     ForkContext,
@@ -344,6 +345,7 @@ def runagent(
     defer_final_usage: bool = False,
     usage: UsageMeter | None = None,
     sandbox: str = DEFAULT_SANDBOX,
+    results: str = DEFAULT_RESULTS,
 ) -> AgentResult:
     """跑一轮对话，模型要求用工具时自动执行并把结果交回去。
 
@@ -358,6 +360,10 @@ def runagent(
 
     sandbox 决定 `bash` 跑在一次性容器里还是宿主机上（见 tools/shell.py）。它只是起始环境：
     子 agent 通过 `ctx.sandbox` 继承；权限判定不看它，但权限预览会用它说明命令在哪儿跑。
+
+    `results` 决定工具结果打不打到终端（full / hidden，见 results.py）。**只影响屏幕**：
+    trace 永远记完整结果，模型拿到的、落盘的、会话里记的一概不变。hidden 下出错的结果
+    仍然完整打印。子 agent 通过 `ctx.results` 继承。
 
     `refresh_system` 可选：收当前档位、返回一份新 system。模型切档之后，**下一次请求前**用它
     重拼，让提示词里的档位说明立刻跟上；档位没变就不调用。它会重读 AGENTS.md、记忆和 git，
@@ -443,6 +449,7 @@ def runagent(
         allow_background=allow_background,
         usage=usage,
         sandbox=sandbox,
+        results=results,
     )
     tools = tool_schemas if tool_schemas is not None else registry.schemas(ctx)
     if fork_ctx is not None:
@@ -703,7 +710,7 @@ def runagent(
                         result = registry.dispatch(ctx, call)
                     return result
 
-                results: list[ToolResult] = []
+                tool_results: list[ToolResult] = []
                 for segment in _segments(response.tool_calls, registry):
                     # 先把这一段的调用行按顺序打出来。并行段里这些行会全部出现在结果之前——
                     # 这就是"它们是一起跑的"在终端上的样子。
@@ -721,16 +728,23 @@ def runagent(
                     # 结果按原顺序拼：tool_result 虽然按 id 配对，但 trace、终端和测试都依赖
                     # 稳定顺序。
                     for result in segment_results:
+                        # trace 永远记完整结果——它是这一轮的流水（出错时靠它数调用次数），
+                        # 不是给人实时看的。要不要上屏只看 results，**出错的结果两种情况
+                        # 都打**：藏掉失败原因，用户会以为工具跑成了。
                         trace.append(_render_result(result))
-                        emit(
-                            f"{label}{_render_result(result)}",
-                            "red" if result.is_error else "green",
-                        )
-                        results.append(result)
+                        if results == "full" or result.is_error:
+                            emit(
+                                f"{label}{_render_result(result)}",
+                                "red" if result.is_error else "green",
+                            )
+                        tool_results.append(result)
 
                 # 同一条回复里可能有多个 tool_use，对应的 tool_result 必须合成一条 user 消息发回去。
                 msgs.append(
-                    {"role": "user", "content": [r.to_anthropic_block() for r in results]}
+                    {
+                        "role": "user",
+                        "content": [r.to_anthropic_block() for r in tool_results],
+                    }
                 )
             if final is None:
                 instruction = "调用工具次数达到上限，不要再调用工具了，根据已有结果直接输出结果"

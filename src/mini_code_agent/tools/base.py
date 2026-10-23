@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mini_code_agent.results import DEFAULT_RESULTS
 from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.usage import UsageMeter
 
@@ -191,6 +192,11 @@ class ToolContext:
     # host 没有隔离，生产代码里只有 core/agent.py 一处构造 ToolContext；默认值落在安全
     # 一侧。追加在最后，同样是为了不影响按位置构造的测试。
     sandbox: str = DEFAULT_SANDBOX
+
+    # 工具结果在终端上打不打（full / hidden，见 results.py）。**只影响屏幕**：模型拿到的
+    # 结果、落盘文件和会话记录都原样不动。子 agent 通过 ctx.results 继承；默认 full
+    # 落在"照旧"那一侧。追加在最后，按位置构造 ToolContext 的测试不受影响。
+    results: str = DEFAULT_RESULTS
 
 
 def _always_available(_: ToolContext) -> bool:

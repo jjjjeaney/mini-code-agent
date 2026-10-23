@@ -14,6 +14,7 @@ from mini_code_agent.commands.base import Command, CommandContext, CommandOutcom
 from mini_code_agent.context_window import CONTEXT_WINDOWS, UNKNOWN_MODEL_WINDOW, window_for
 from mini_code_agent.core.tasks import format_duration
 from mini_code_agent.permissions import BYPASS_WARNING, PERMISSION_MODES, parse_permission_mode
+from mini_code_agent.results import RESULTS_GLOSS
 from mini_code_agent.sandbox import SANDBOX_GLOSS, parse_sandbox
 from mini_code_agent.sessions import SESSIONS_DIR, list_sessions
 from mini_code_agent.summarizing import COMPACT_AT, context_size
@@ -388,6 +389,10 @@ def make_status() -> Command:
         ctx.console.print(
             f"沙箱：{sandbox}（{where}；只在命令执行开着时生效）", markup=False
         )
+        ctx.console.print(
+            f"工具结果：{ctx.state.results}（{RESULTS_GLOSS.get(ctx.state.results, '')}）",
+            markup=False,
+        )
         ctx.console.print(f"fork：{fork}", markup=False)
         if ctx.tasks is not None:
             records = ctx.tasks.list()
@@ -420,7 +425,9 @@ def make_status() -> Command:
         return "handled"
 
     return Command(
-        name="status", run=run, summary="看在哪儿跑、什么模型、什么档位、沙箱、fork、历史"
+        name="status",
+        run=run,
+        summary="看在哪儿跑、什么模型、什么档位、沙箱、工具结果、fork、历史",
     )
 
 
