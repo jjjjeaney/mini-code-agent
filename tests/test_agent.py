@@ -216,6 +216,43 @@ def test_permission_mode_reaches_the_tools(tmp_path):
     assert seen["mode"] == "plan"
 
 
+def test_sandbox_reaches_tools_and_permission_requests(tmp_path):
+    """沙箱模式要同时到工具层和权限预览：前者决定命令在哪儿跑，后者决定用户看到什么。"""
+    seen = {}
+
+    def peek(kwargs: dict, ctx: ToolContext) -> str:
+        seen["sandbox"] = ctx.sandbox
+        return "看到了"
+
+    registry = ToolRegistry(
+        [
+            Tool(name="peek", fn=peek),
+            Tool(name="bash", fn=lambda kwargs, ctx: "ok", params=SHELL_SCHEMA),
+        ]
+    )
+    prompter = RecordingPrompter()
+    provider = ScriptedProvider(
+        [
+            tool_turn("t1", "peek", {}),
+            tool_turn("t2", "bash", {"description": "看看", "command": "ls"}),
+            text_turn("好"),
+        ]
+    )
+
+    runagent(
+        "看一眼",
+        provider,
+        registry,
+        cwd=tmp_path,
+        allow_shell=True,
+        prompter=prompter,
+        sandbox="host",
+    )
+
+    assert seen["sandbox"] == "host"
+    assert prompter.tools[-1].sandbox == "host"
+
+
 def test_permission_mode_defaults_to_the_asking_one(tmp_path):
     """不传就跟 runagent 自己的默认走。
 

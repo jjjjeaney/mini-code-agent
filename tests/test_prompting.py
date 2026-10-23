@@ -24,8 +24,8 @@ from mini_code_agent.providers.base import ToolCall
 from mini_code_agent.tools import ToolContext, ToolRegistry
 
 
-def request(tool_name: str, **tool_args) -> PermissionRequest:
-    return PermissionRequest(tool_name=tool_name, tool_args=tool_args)
+def request(tool_name: str, *, sandbox: str = "docker", **tool_args) -> PermissionRequest:
+    return PermissionRequest(tool_name=tool_name, tool_args=tool_args, sandbox=sandbox)
 
 
 def aborting(*args, **kwargs):
@@ -54,6 +54,13 @@ class TestPreviewCommand:
 
         assert "容器" in text
         assert "没有网络" in text
+
+    def test_host_mode_says_the_command_runs_on_the_host(self):
+        text = preview_command("rm -rf /tmp/x", sandbox="host")
+
+        assert "宿主机" in text
+        assert "没有容器隔离" in text
+        assert "一次性容器" not in text
 
     def test_the_models_own_description_rides_above_the_command(self):
         """模型写的那句说明单独占一行，而且摆在**命令上面**。
@@ -202,6 +209,15 @@ class TestTerminalPrompter:
         )
 
         assert "跑一遍测试" in capsys.readouterr().err
+
+    def test_host_mode_warns_in_the_permission_prompt(self, monkeypatch, capsys):
+        monkeypatch.setattr(prompting.typer, "prompt", answering("y"))
+
+        TerminalPrompter().confirm_tool(request("bash", command="ls", sandbox="host"))
+
+        err = capsys.readouterr().err
+        assert "宿主机" in err
+        assert "没有容器隔离" in err
 
     def test_the_preview_goes_to_stderr_not_stdout(self, monkeypatch, capsys):
         """stdout 留给最终答案：`mca "..." > out.txt` 不该收到提示。"""

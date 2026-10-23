@@ -14,12 +14,14 @@ from typing import TYPE_CHECKING, Literal
 from rich.console import Console
 
 from mini_code_agent.permissions import Grants
+from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.sessions import Session
 
 if TYPE_CHECKING:
     # 只在标注里用。命令层只调任务表的几个公开方法，不需要它的实现。
     from mini_code_agent.core.tasks import TaskManager
     from mini_code_agent.interaction import PermissionBroker
+    from mini_code_agent.providers.base import Provider
 
 # 一条命令跑完只有两种结果：办完了接着读下一行，或者该退出循环了。
 CommandOutcome = Literal["handled", "stop"]
@@ -32,8 +34,8 @@ Outcome = Literal["not_a_command", "handled", "stop"]
 class ChatState:
     """交互循环里**会变**的东西。
 
-    命令读写的就是这里，循环每轮从这儿现读一次。不变的东西不放进来：cwd、provider、
-    registry 都是启动时定死的，命令碰不到、也不该碰。
+    命令读写的就是这里，循环每轮从这儿现读一次。cwd 和 registry 是启动时定死的，不放进来；
+    provider 放进来是因为 `/model` 要直接改它的 `model`——那个属性一改，后续请求就换模型。
 
     为什么要有这么个盒子：档位和 messages 原来是 `_chat` 的两个局部量，命令够不着——参数
     是传值的，改了手边那份外面不动。要让它俩改得动、也读得到，就得有个两边都指着的对象。
@@ -44,12 +46,27 @@ class ChatState:
     # 这一轮要发出去的那份历史（**内存里这份**，不是文件里那份：压过之后前缀换成了摘要）。
     messages: list[dict]
 
+    # 正在用的 provider。命令改它的 `model` 就是改全局——子 agent 和后台任务用的是同一个
+    # 对象（见 core/subagent.py 的 make_agent_tool）。它和 `window` 必须一起改，见 /model。
+    provider: Provider
+
+    # 当前模型的上下文窗口（token）。`_chat` 初始化时用 `window_for(provider.model)` 算，
+    # `/model` 切模型时同步更新。压缩阈值和 `/status` 都读它。
+    #
+    # 它和 `provider.model` 是一对：只改一个，另一处就会停在旧模型上。`/model` 命令里
+    # 两行一起写（见 commands/builtin.py）。
+    window: int
+
     # fork 开没开（它是 `agent` 的 type 之一，见 core/subagent.py）。放这儿是因为 `/fork` 能
     # 中途换它，而换完下一轮就得按新的拼提示词——和档位同一个道理。
     #
     # **切它会重建缓存前缀**：提示词里有没有那段说明，属于请求开头的一部分。工具表不变
     # （type 枚举是静态的），但前缀照样从头算。所以命令那边会把代价说清楚，不是悄悄换掉。
     allow_fork: bool = False
+
+    # 命令执行在哪儿跑（docker / host）。`/sandbox` 会改它，`_chat` 每轮现读：下一轮的
+    # 系统提示、权限预览和 ToolContext 都跟着它走。切它会重建提示词里这一段之后的前缀。
+    sandbox: str = DEFAULT_SANDBOX
 
     # 上一次**真请求**报的输入总量，以及那一发当时装了多少条 messages。压缩阈值拿这两个算
     # （见 summarizing.context_size）。
@@ -101,18 +118,12 @@ class CommandContext:
     分两类：`state` 和 `grants` 指的是**循环里那两个活着的对象**，命令改了它们，下一轮就按
     新的走；其余几个是这次运行的环境，命令只读。
 
-    命令不碰 provider，也不碰工具注册表：注册表是给模型的，跟命令没关系；后端是 provider
-    自己的实现——`/status` 连模型名都不印，就是为了不去扩 Provider 那个只声明了 complete
-    的协议（见 builtin.make_status）。
+    命令层平时不碰 provider 的请求流程；只有 `/model` 直接改 `state.provider.model` 和
+    `state.window`（两者必须一起改）。注册表仍然不给命令碰：那是给模型的。
     """
 
     console: Console
     state: ChatState
-    # 这个模型的上下文窗口（token），压缩阈值和 `/status` 都要用它。一次运行里定死，所以放
-    # 在这边（"这次运行的环境，只读"），不放 ChatState。
-    #
-    # 走这条路是为了不碰 provider：同一个约定见下面的注释。
-    window: int
     # 这次运行的环境，只读
     cwd: Path
     allow_shell: bool
@@ -121,9 +132,9 @@ class CommandContext:
     grants: Grants
     # 就地压一次历史（别管现在多长），返回该跟用户补的一句话；None = 没什么可说的。
     #
-    # 是个**动作**、不是某个对象：闭包里已经抓好了 provider，命令层因此到现在都不认识后端。
-    # 这里不塞 provider 是有意的——Provider 协议（providers/base.py）只声明了 complete 一个
-    # 方法，为了 commands/ 方便就去扩它，等于让所有假 provider 跟着多背字段。
+    # 是个**动作**、不是某个对象：闭包里已经抓好了 provider，命令层不需要认识它的请求方法。
+    # Provider 协议现在有 `model` 属性（`/model` 要用），但 `complete` / `stream` 仍然不暴露
+    # 给命令。
     compact: Callable[[], str | None]
 
     # 后台子 agent 的任务表（见 core/tasks.py）。`/tasks` 看状态/取消、`/status` 报个数。

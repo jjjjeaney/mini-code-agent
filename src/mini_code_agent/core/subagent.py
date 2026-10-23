@@ -292,7 +292,6 @@ def make_agent_tool(
     provider: Provider,
     prompter: Prompter,
     grants: Grants,
-    model: str | None = None,
     tasks: TaskManager | None = None,
     background_after: float = BACKGROUND_AFTER_SECONDS,
     broker: PermissionBroker | None = None,
@@ -300,12 +299,13 @@ def make_agent_tool(
     """造出 `agent` 工具——主 agent 拿它派子 agent。
 
     **照抄 `prompting.make_ask_user(prompter)` 那个范式**：闭包捕获那几样 `ToolContext` 里
-    没有的东西（provider / prompter / grants / model），在 CLI 层 `registry.register()`
+    没有的东西（provider / prompter / grants），在 CLI 层 `registry.register()`
     装进注册表。工具层一行都不用改，`ToolContext` 也不必认识"provider"这个概念。
 
     闭包抓的是**对象**，不是值——`prompter` 和 `grants` 都要求是全程活着的那一份（前者记着
     用户"本会话别再问"的答案，后者是本会话批过什么）。`permission_mode` 不在这儿抓，它走
-    `ctx`：那个会被 `/permission_mode` 中途改掉，抓在闭包里会过期。
+    `ctx`：那个会被 `/permission_mode` 中途改掉，抓在闭包里会过期。模型名同理，派子 agent
+    时现读 `provider.model`——`/model` 会在会话中途改它。
     """
 
     def run_subagent(kwargs: dict[str, Any], ctx: ToolContext) -> str:
@@ -373,7 +373,9 @@ def make_agent_tool(
             child_name = "fork"
             allow_fork = True
         else:
-            system = build_subagent_prompt(ctx.cwd, name, ctx.permission_mode, model)
+            system = build_subagent_prompt(
+                ctx.cwd, name, ctx.permission_mode, provider.model, sandbox=ctx.sandbox
+            )
             registry_for_subagent = _pool(agent_type)
             max_steps = agent_type.max_steps
             read_state = None
@@ -434,6 +436,7 @@ def make_agent_tool(
             handoff=start_background,
             background_prompter=background_prompter,
             usage=ctx.usage,
+            sandbox=ctx.sandbox,
         )
         if result.handoff is not None:
             console.print(f"◀ {label}转到后台：{result.handoff}", style="dim", markup=False)

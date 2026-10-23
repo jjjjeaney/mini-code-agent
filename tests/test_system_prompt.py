@@ -231,6 +231,44 @@ def test_a_bad_mode_raises(tmp_path):
         build_system_prompt(tmp_path, "yolo")
 
 
+def test_the_container_sandbox_is_described(tmp_path):
+    text = build_system_prompt(tmp_path, "default")
+
+    assert "一次性容器" in text
+    assert "/workspace" in text
+
+
+def test_the_host_sandbox_is_described(tmp_path):
+    text = build_system_prompt(tmp_path, "default", sandbox="host")
+
+    assert "宿主机" in text
+    assert "没有容器隔离" in text
+    assert "一次性容器" not in text
+
+
+def test_the_static_part_does_not_hardcode_the_sandbox():
+    assert "一次性容器" not in _STATIC
+    assert "/workspace" not in _STATIC
+
+
+def test_the_sandbox_note_sits_after_the_mode_note(tmp_path):
+    text = build_system_prompt(tmp_path, "default", sandbox="host")
+
+    assert text.index("当前权限档位") < text.index("命令执行的沙箱")
+
+
+def test_the_subagent_prompt_gets_the_sandbox_note(tmp_path):
+    text = build_subagent_prompt(tmp_path, "general-purpose", "default", sandbox="host")
+
+    assert "命令执行的沙箱" in text
+    assert "宿主机" in text
+
+
+def test_a_bad_sandbox_raises(tmp_path):
+    with pytest.raises(ValueError, match="不是沙箱模式"):
+        build_system_prompt(tmp_path, "default", sandbox="podman")
+
+
 def test_the_projects_rules_are_pulled_in(tmp_path):
     (tmp_path / "AGENTS.md").write_text("测试一律用 uv run --no-sync\n", encoding="utf-8")
 

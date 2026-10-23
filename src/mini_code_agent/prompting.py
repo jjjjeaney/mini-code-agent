@@ -22,6 +22,7 @@ import typer
 
 from mini_code_agent.permissions import PermissionRequest
 from mini_code_agent.prompts import Answer, NobodyToAskError, Prompter
+from mini_code_agent.sandbox import DEFAULT_SANDBOX, parse_sandbox
 from mini_code_agent.tools.base import Tool, ToolContext
 from mini_code_agent.tools.safety import truncate_text
 
@@ -52,23 +53,33 @@ def _mark(text: str, sign: str) -> str:
     return "\n".join(f"{sign} {line}" for line in lines)
 
 
-def preview_command(command: str, description: str = "") -> str:
+def preview_command(
+    command: str, description: str = "", sandbox: str = DEFAULT_SANDBOX
+) -> str:
     """一条命令的预览。
 
     沙箱那几行要写全：用户判的就是"这条命令会碰到什么"，光给一条命令是判不动的。
+    host 模式必须说清它没有隔离——同一行命令在宿主机上能做的事和容器里不是一回事。
 
     `description` 是模型自己写的"这条命令要做什么"。它跟命令正文**分开摆、不拼进一行**，
     这是有意的：说明可能跟命令实际做的事对不上，而用户要放的其实是**命令**——两样分开，
     对不上才看得出来。也别指望它准，它只是给用户一个起点，命令原文还在下面摆着。
     """
+    sandbox = parse_sandbox(sandbox)
     head = "要跑这条命令："
     if description:
         head += f"\n\n{INDENT}模型说这条是用来：{description}"
-    return (
-        f"{head}\n\n{_block(command)}\n\n"
-        f"{INDENT}（跑在一次性容器里：只有项目目录挂进去、可写；根文件系统只读；没有网络；"
-        f"跑完就删）"
-    )
+    if sandbox == "docker":
+        where = (
+            "跑在一次性容器里：只有项目目录挂进去、可写；根文件系统只读；没有网络；"
+            "跑完就删"
+        )
+    else:
+        where = (
+            "⚠ 直接跑在宿主机上：能访问整个用户环境、网络和凭据；能改项目目录以外的"
+            "文件；没有容器隔离"
+        )
+    return f"{head}\n\n{_block(command)}\n\n{INDENT}（{where}）"
 
 
 def preview_tool(request: PermissionRequest) -> str:
@@ -170,6 +181,7 @@ class TerminalPrompter:
                 preview_command(
                     str(request.tool_args.get("command", "")),
                     str(request.tool_args.get("description", "")),
+                    request.sandbox,
                 )
             )
         return self._ask(preview_tool(request))

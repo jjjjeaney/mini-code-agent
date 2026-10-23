@@ -62,9 +62,19 @@ def test_the_file_appears_with_its_meta_when_the_first_messages_land(tmp_path):
     _, meta, messages = load(tmp_path, session.id)
     assert meta["permission_mode"] == "plan"
     assert meta["allow_shell"] is True
+    assert meta["sandbox"] == "docker"
     assert meta["cwd"] == str(tmp_path)
     assert messages == [{"role": "user", "content": "第一句"}]
     assert session.path.name == f"{session.id}.jsonl"
+
+
+def test_the_sandbox_mode_is_recorded_in_meta(tmp_path):
+    session = a_session(tmp_path, sandbox="host")
+
+    session.append([{"role": "user", "content": "第一句"}])
+
+    _, meta, _ = load(tmp_path, session.id)
+    assert meta["sandbox"] == "host"
 
 
 def test_appended_messages_come_back_whole(tmp_path):

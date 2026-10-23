@@ -2,8 +2,8 @@
 
 几条定下来的规矩，都是有意选的：
 
-- **一行一条**：第一行是 meta（cwd / 档位 / allow_shell / 开始时间），之后每行是一条 message，
-  原样存——就是发给 API 的那个结构，不做任何加工。
+- **一行一条**：第一行是 meta（cwd / 档位 / allow_shell / 沙箱 / 开始时间），之后每行是一条
+  message，原样存——就是发给 API 的那个结构，不做任何加工。
 - **没说过话就不建文件**：`start()` 只算不写，第一轮真落了消息才建（见 `Session._open`）。
   以前是启动即建，于是"打开看了一眼就退出"也留下一个空文件——它们会攒起来，而 `--continue`
   取的是最新的那个名字，很容易接到空壳上。**但名字（=id）在 `start()` 那一刻就定死了**
@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from mini_code_agent.console import console
+from mini_code_agent.sandbox import DEFAULT_SANDBOX
 from mini_code_agent.tools import spill
 
 # 和改前备份共用 .agent/：它已经在 .gitignore 里，也被挡在模型的视野之外（EXCLUDED_DIRS +
@@ -151,7 +152,13 @@ def _fresh_id(stamp: str) -> str:
     return f"{stamp}-{_sequence:04x}{uuid.uuid4().hex[:4]}"
 
 
-def start(cwd: Path, *, permission_mode: str, allow_shell: bool) -> Session:
+def start(
+    cwd: Path,
+    *,
+    permission_mode: str,
+    allow_shell: bool,
+    sandbox: str = DEFAULT_SANDBOX,
+) -> Session:
     """开一次新会话。**不碰磁盘**——第一轮真攒下消息才建文件（见 Session._open）。
 
     **名字在这一刻就定死了**（`_fresh_id`），文件还是等真写的时候才建：推迟的只是"写"。
@@ -166,6 +173,7 @@ def start(cwd: Path, *, permission_mode: str, allow_shell: bool) -> Session:
         "cwd": str(cwd),
         "permission_mode": permission_mode,
         "allow_shell": allow_shell,
+        "sandbox": sandbox,
         "started": started.isoformat(timespec="seconds"),
     }
     return Session(id=session_id, path=cwd / SESSIONS_DIR / f"{session_id}.jsonl", meta=meta)
